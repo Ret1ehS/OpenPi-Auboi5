@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""
+Unified OpenPI policy loader for local and remote inference.
+
+Local mode loads an OpenPI checkpoint in-process.
+Remote mode starts kubectl port-forward and forwards inference over WebSocket.
+"""
+
+from __future__ import annotations
+
+import atexit
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+OPENPI_ROOT = SCRIPT_DIR.parent.parent
+
+DEFAULT_REPO_ROOT = OPENPI_ROOT / "repo"
+DEFAULT_CONFIG_NAME = "pi05_aubo_agv_lora"
+DEFAULT_CHECKPOINT_DIR = DEFAULT_REPO_ROOT / "checkpoints" / "pi05_aubo_agv_lora" / "my_first_run" / "9999"
+
+KUBECONFIG_PATH = SCRIPT_DIR / "kubeconfig.yaml"
+DEFAULT_NAMESPACE = "wangrui"
+DEFAULT_LOCAL_PORT = 8000
+DEFAULT_REMOTE_PORT = 8000
+
+
+def _ensure_openpi_repo_paths(repo_root: Path = DEFAULT_REPO_ROOT) -> None:
+    paths = [
+        repo_root / "src",
+        repo_root / "packages" / "openpi-client" / "src",
+    ]
+    for path in paths:
+        path_str = str(path)
+        if path_str not in sys.path:
+            sys.path.insert(0, path_str)
+
+
+_ensure_openpi_repo_paths()
+
+
+@dataclass(frozen=True)
+class PolicyLoadSpec:
+    remote: bool = False
+    config_name: str = DEFAULT_CONFIG_NAME
+    checkpoint_dir: Path = DEFAULT_CHECKPOINT_DIR
+    default_prompt: str | None = None
+    action_horizon: int | None = None
+    pytorch_device: str | None = None
+    kubeconfig: Path = KUBECONFIG_PATH
+    namespace: str = DEFAULT_NAMESPACE
+    pod_label: str = "app=openpi"
+    local_port: int = DEFAULT_LOCAL_PORT
+    remote_port: int = DEFAULT_REMOTE_PORT
+
+
+class LocalPolicyRunner:
+    def __init__(self, policy: Any, *, metadata: dict[str, Any] | None = None) -> None:
+        self._policy = policy
+        self._metadata = metadata or {}
+
+    def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
+        return self._policy.infer(obs)
+
+    def reset(self) -> None:
+        if hasattr(self._policy, "reset"):
+            self._policy.reset()
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        return self._metadata
+
+
+class RemotePolicyRunner:
+    """Policy runner that forwards inference to a remote server."""
+
+    def __init__(
+        self,
+        *,
+        kubeconfig: Path = KUBECONFIG_PATH,
+        namespace: str = DEFAULT_NAMESPACE,
+        pod_label: str = "app=openpi",
+        local_port: int = DEFAULT_LOCAL_PORT,
+        remote_port: int = DEFAULT_REMOTE_PORT,
+    ) -> None:
+        self._kubeconfig = Path(kubeconfig)
+        self._namespace = namespace
+        self._pod_label = pod_label
+        self._local_port = int(local_port)
+        self._remote_port = int(remote_port)
+        self._port_forward_proc: subprocess.Popen | None = None
+        self._client: Any = None
+        self._metadata: dict[str, Any] = {}
+
+    def connect(self, timeout: float = 30.0) -> None:
+        self._start_port_forward()
+        self._connect_ws(timeout=timeout)
+
+    def close(self) -> None:
+        self._client = None
+        self._stop_port_forward()
+
+    def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
+        if self._client is None:
+            raise RuntimeError("RemotePolicyRunner not connected. Call connect() first.")
+        try:
+            return self._client.infer(obs)
+        except Exception as exc:
+            print(f"  [remote] infer failed ({type(exc).__name__}: {exc}), reconnecting...")
+            self._reconnect_ws()
+            return self._client.infer(obs)
+
+    def reset(self) -> None:
+        if self._client is not None:
+            try:
+                self._client.reset()
+            except Exception:
+                pass
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        return self._metadata
+
+    def _start_port_forward(self) -> None:
+        if self._port_forward_proc is not None and self._port_forward_proc.poll() is None:
+            return
+        if not self._kubeconfig.exists():
+            raise FileNotFoundError(f"kubeconfig not found: {self._kubeconfig}")
+
+        pod_name = self._find_pod()
+        print(f"  Port-forwarding to pod {pod_name} ({self._local_port}:{self._remote_port})...")
+        cmd = [
+            "kubectl",
+            "--kubeconfig",
+            str(self._kubeconfig),
+            "-n",
+            self._namespace,
+            "port-forward",
+            pod_name,
+            f"{self._local_port}:{self._remote_port}",
+        ]
+        self._port_forward_proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        atexit.register(self._stop_port_forward)
+        time.sleep(2.0)
+        if self._port_forward_proc.poll() is not None:
+            stderr = self._port_forward_proc.stderr.read().decode() if self._port_forward_proc.stderr else ""
+            raise RuntimeError(f"kubectl port-forward exited immediately: {stderr}")
+        print("  Port-forward established.")
+
+    def _find_pod(self) -> str:
+        cmd = [
+            "kubectl",
+            "--kubeconfig",
+            str(self._kubeconfig),
+            "-n",
+            self._namespace,
+            "get",
+            "pods",
+            "-l",
+            self._pod_label,
+            "--field-selector=status.phase=Running",
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if result.returncode != 0 or not result.stdout.strip():
+            raise RuntimeError(
+                f"Cannot find running pod with label '{self._pod_label}' "
+                f"in namespace '{self._namespace}'.\n"
+                f"kubectl stderr: {result.stderr.strip()}"
+            )
+        return result.stdout.strip()
+
+    def _stop_port_forward(self) -> None:
+        if self._port_forward_proc is not None and self._port_forward_proc.poll() is None:
+            self._port_forward_proc.terminate()
+            try:
+                self._port_forward_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._port_forward_proc.kill()
+        self._port_forward_proc = None
+
+    def _connect_ws(self, timeout: float = 30.0) -> None:
+        del timeout  # reserved for future use
+        from openpi_client.websocket_client_policy import WebsocketClientPolicy
+
+        print(f"  Connecting to ws://localhost:{self._local_port} ...")
+        self._client = WebsocketClientPolicy(host="localhost", port=self._local_port)
+        self._metadata = self._client.get_server_metadata()
+        print(f"  Connected. Server metadata keys: {list(self._metadata.keys())}")
+
+    def _reconnect_ws(self) -> None:
+        if self._port_forward_proc is None or self._port_forward_proc.poll() is not None:
+            print("  [remote] port-forward is dead, restarting...")
+            self._stop_port_forward()
+            self._start_port_forward()
+        self._connect_ws()
+
+
+def create_local_policy(spec: PolicyLoadSpec | None = None) -> LocalPolicyRunner:
+    spec = spec or PolicyLoadSpec()
+    checkpoint_dir = Path(spec.checkpoint_dir).resolve()
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"checkpoint directory not found: {checkpoint_dir}")
+
+    try:
+        from openpi.training.config import get_config
+        from openpi.policies.policy_config import create_trained_policy
+        from openpi_client.action_chunk_broker import ActionChunkBroker
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "OpenPI local inference dependencies are not available in the current Python environment. "
+            "Please run under an environment with the OpenPI repo dependencies installed."
+        ) from exc
+
+    train_cfg = get_config(spec.config_name)
+    policy = create_trained_policy(
+        train_cfg,
+        checkpoint_dir,
+        default_prompt=spec.default_prompt,
+        pytorch_device=spec.pytorch_device,
+    )
+    if spec.action_horizon is not None:
+        policy = ActionChunkBroker(policy, action_horizon=int(spec.action_horizon))
+    metadata = getattr(policy, "metadata", {})
+    return LocalPolicyRunner(policy, metadata=metadata)
+
+
+def create_remote_policy(spec: PolicyLoadSpec | None = None) -> RemotePolicyRunner:
+    spec = spec or PolicyLoadSpec(remote=True)
+    runner = RemotePolicyRunner(
+        kubeconfig=spec.kubeconfig,
+        namespace=spec.namespace,
+        pod_label=spec.pod_label,
+        local_port=spec.local_port,
+        remote_port=spec.remote_port,
+    )
+    runner.connect()
+    return runner
+
+
+_cached_policy: LocalPolicyRunner | RemotePolicyRunner | None = None
+_cached_spec: PolicyLoadSpec | None = None
+
+
+def load_policy(spec: PolicyLoadSpec | None = None, *, force_reload: bool = False) -> LocalPolicyRunner | RemotePolicyRunner:
+    global _cached_policy, _cached_spec
+    spec = spec or PolicyLoadSpec()
+    if _cached_policy is not None and _cached_spec == spec and not force_reload:
+        return _cached_policy
+
+    if _cached_policy is not None and hasattr(_cached_policy, "close"):
+        try:
+            _cached_policy.close()
+        except Exception:
+            pass
+
+    _cached_policy = create_remote_policy(spec) if spec.remote else create_local_policy(spec)
+    _cached_spec = spec
+    return _cached_policy
+
+
+def close_policy() -> None:
+    global _cached_policy, _cached_spec
+    if _cached_policy is not None and hasattr(_cached_policy, "close"):
+        try:
+            _cached_policy.close()
+        except Exception:
+            pass
+    _cached_policy = None
+    _cached_spec = None
+
+
+atexit.register(close_policy)
+
+
+__all__ = [
+    "DEFAULT_REPO_ROOT",
+    "DEFAULT_CONFIG_NAME",
+    "DEFAULT_CHECKPOINT_DIR",
+    "KUBECONFIG_PATH",
+    "DEFAULT_NAMESPACE",
+    "DEFAULT_LOCAL_PORT",
+    "DEFAULT_REMOTE_PORT",
+    "PolicyLoadSpec",
+    "LocalPolicyRunner",
+    "RemotePolicyRunner",
+    "create_local_policy",
+    "create_remote_policy",
+    "load_policy",
+    "close_policy",
+]
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Load OpenPI policy locally or via remote websocket.")
+    parser.add_argument("--remote", action="store_true")
+    parser.add_argument("--pod-label", type=str, default="app=openpi")
+    args = parser.parse_args()
+
+    spec = PolicyLoadSpec(remote=args.remote, pod_label=args.pod_label)
+    if spec.remote:
+        print(f"Kubeconfig: {KUBECONFIG_PATH}")
+        print("Connecting to remote inference server...")
+    else:
+        print(f"PYTHON={sys.executable}")
+        print(f"CHECKPOINT_DIR={DEFAULT_CHECKPOINT_DIR}")
+        print("Loading policy ...")
+
+    t0 = time.monotonic()
+    runner = load_policy(spec)
+    elapsed = time.monotonic() - t0
+    print(f"POLICY_READY  class={type(runner).__name__}  load_time={elapsed:.3f}s")

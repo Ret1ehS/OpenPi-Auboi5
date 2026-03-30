@@ -110,6 +110,17 @@ class TUIConfig:
     quit: bool = False     # True if user pressed q
 
 
+@dataclass
+class CollectTUIConfig:
+    mode: str              # "manual" | "auto"
+    auto_episodes: int
+    resume_mode: str       # "continue" | "reset"
+    task: str              # "pick_and_place" | "open_and_close"
+    save_fps: int          # 30 | 50
+    state_mode: str        # "yaw" | "j6"
+    quit: bool = False
+
+
 # ---------------------------------------------------------------------------
 # Key reading
 # ---------------------------------------------------------------------------
@@ -141,10 +152,17 @@ def _read_key(fd: int) -> str:
 # Renderer
 # ---------------------------------------------------------------------------
 
-def _render(rows: list[MenuRow], cursor: int, status_line: str = "") -> str:
+def _render(
+    rows: list[MenuRow],
+    cursor: int,
+    status_line: str = "",
+    *,
+    title: str = "=== OpenPI Robot Controller ===",
+    help_line: str = "Up/Down: navigate  Left/Right/Enter: toggle  Enter on Start: go  q: quit",
+) -> str:
     """Build the full screen content string."""
     lines: list[str] = []
-    lines.append(f"{BOLD}{FG_CYAN}=== OpenPI Robot Controller ==={RESET}")
+    lines.append(f"{BOLD}{FG_CYAN}{title}{RESET}")
     lines.append("")
 
     selectable_idx = 0
@@ -196,7 +214,7 @@ def _render(rows: list[MenuRow], cursor: int, status_line: str = "") -> str:
         selectable_idx += 1
 
     lines.append("")
-    lines.append(f"  {DIM}Up/Down: navigate  Left/Right/Enter: toggle  Enter on Start: go  q: quit{RESET}")
+    lines.append(f"  {DIM}{help_line}{RESET}")
     if status_line:
         lines.append(f"  {FG_YELLOW}{status_line}{RESET}")
 
@@ -360,6 +378,14 @@ def _get_float(rows: list[MenuRow], label: str, default: float = 0.0) -> float:
         return default
 
 
+def _get_int(rows: list[MenuRow], label: str, default: int = 0) -> int:
+    val = _get_text(rows, label)
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
 def _get_env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -377,3 +403,159 @@ def _snapshot_config(rows: list[MenuRow]) -> TUIConfig:
         exec_speed_mps=_get_float(rows, "Exec Speed (m/s)", 0.05),
         record=_get_toggle(rows, "Record") == "true",
     )
+
+
+def _choice_index(choices: list[str], value: str, default: int = 0) -> int:
+    try:
+        return choices.index(value)
+    except ValueError:
+        return default
+
+
+def _snapshot_collect_config(rows: list[MenuRow]) -> CollectTUIConfig:
+    return CollectTUIConfig(
+        mode=_get_toggle(rows, "Mode"),
+        auto_episodes=_get_int(rows, "Auto Episodes", 10),
+        resume_mode=_get_toggle(rows, "Resume"),
+        task=_get_toggle(rows, "Task"),
+        save_fps=_get_int(rows, "Save FPS", 30),
+        state_mode=_get_toggle(rows, "State Mode"),
+    )
+
+
+def run_collect_tui_config(
+    *,
+    default_mode: str = "manual",
+    default_auto_episodes: int = 10,
+    default_resume_mode: str = "continue",
+    default_task: str = "pick_and_place",
+    default_save_fps: int = 30,
+    default_state_mode: str = "j6",
+) -> CollectTUIConfig:
+    rows: list[MenuRow] = [
+        ToggleItem("Mode", ["manual", "auto"], selected=_choice_index(["manual", "auto"], default_mode, 0)),
+        TextItem("Auto Episodes", str(max(1, int(default_auto_episodes)))),
+        ToggleItem("Resume", ["continue", "reset"], selected=_choice_index(["continue", "reset"], default_resume_mode, 0)),
+        ToggleItem(
+            "Task",
+            ["pick_and_place", "open_and_close"],
+            selected=_choice_index(["pick_and_place", "open_and_close"], default_task, 0),
+        ),
+        ToggleItem("Save FPS", ["30", "50"], selected=_choice_index(["30", "50"], str(default_save_fps), 0)),
+        ToggleItem("State Mode", ["j6", "yaw"], selected=_choice_index(["j6", "yaw"], default_state_mode, 0)),
+        SeparatorItem(),
+        StartItem(">>> Start Collection <<<"),
+    ]
+
+    selectable_rows = [r for r in rows if not isinstance(r, SeparatorItem)]
+    n_selectable = len(selectable_rows)
+    cursor = 0
+    status_line = ""
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        sys.stdout.write(HIDE_CURSOR)
+        sys.stdout.write(
+            _render(
+                rows,
+                cursor,
+                status_line,
+                title="=== OpenPI Data Collector ===",
+                help_line="Up/Down: navigate  Left/Right/Enter: toggle  Enter on Start: go  q: quit",
+            )
+        )
+        sys.stdout.flush()
+
+        while True:
+            key = _read_key(fd)
+            if not key:
+                continue
+
+            current_row = selectable_rows[cursor]
+
+            if key == "CTRL_C" or key == "q":
+                cfg = _snapshot_collect_config(rows)
+                cfg.quit = True
+                return cfg
+
+            if key == "UP":
+                cursor = (cursor - 1) % n_selectable
+                status_line = ""
+            elif key == "DOWN":
+                cursor = (cursor + 1) % n_selectable
+                status_line = ""
+            elif key in ("LEFT", "RIGHT"):
+                if isinstance(current_row, ToggleItem):
+                    if key == "RIGHT":
+                        current_row.selected = (current_row.selected + 1) % len(current_row.choices)
+                    else:
+                        current_row.selected = (current_row.selected - 1) % len(current_row.choices)
+                    status_line = ""
+            elif key == "ENTER":
+                if isinstance(current_row, ToggleItem):
+                    current_row.selected = (current_row.selected + 1) % len(current_row.choices)
+                    status_line = ""
+                elif isinstance(current_row, TextItem):
+                    current_row.editing = True
+                    current_row._edit_buf = current_row.value
+                    status_line = "Type new value, Enter to confirm, Esc to cancel"
+                    sys.stdout.write(
+                        _render(
+                            rows,
+                            cursor,
+                            status_line,
+                            title="=== OpenPI Data Collector ===",
+                            help_line="Up/Down: navigate  Left/Right/Enter: toggle  Enter on Start: go  q: quit",
+                        )
+                    )
+                    sys.stdout.flush()
+                    while True:
+                        ekey = _read_key(fd)
+                        if ekey == "ENTER":
+                            current_row.value = current_row._edit_buf
+                            break
+                        elif ekey in ("CTRL_C", "ESC"):
+                            break
+                        elif ekey == "BACKSPACE":
+                            if current_row._edit_buf:
+                                current_row._edit_buf = current_row._edit_buf[:-1]
+                        elif len(ekey) == 1 and ekey.isprintable():
+                            current_row._edit_buf += ekey
+                        else:
+                            continue
+                        sys.stdout.write(
+                            _render(
+                                rows,
+                                cursor,
+                                status_line,
+                                title="=== OpenPI Data Collector ===",
+                                help_line="Up/Down: navigate  Left/Right/Enter: toggle  Enter on Start: go  q: quit",
+                            )
+                        )
+                        sys.stdout.flush()
+                    current_row.editing = False
+                    status_line = ""
+                elif isinstance(current_row, StartItem):
+                    cfg = _snapshot_collect_config(rows)
+                    if cfg.mode == "auto" and cfg.auto_episodes <= 0:
+                        status_line = "Auto Episodes must be > 0"
+                    else:
+                        return cfg
+
+            sys.stdout.write(
+                _render(
+                    rows,
+                    cursor,
+                    status_line,
+                    title="=== OpenPI Data Collector ===",
+                    help_line="Up/Down: navigate  Left/Right/Enter: toggle  Enter on Start: go  q: quit",
+                )
+            )
+            sys.stdout.flush()
+
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        sys.stdout.write(SHOW_CURSOR)
+        sys.stdout.write(CLEAR_SCREEN)
+        sys.stdout.flush()

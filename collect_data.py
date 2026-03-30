@@ -10,9 +10,11 @@ Workflow (each episode):
   4. Save the recorded episode with auto-generated prompt "pick up the <color> cube"
 
 Saved format for the AUBO OpenPI pipeline:
-  states.npy     (N, 8) float32  [x, y, z, aa_x, aa_y, aa_z, gripper, j6] in sim frame
-  actions.npy    (N, 7) float32  [dx, dy, dz, droll, dpitch, dj6, gripper_next]
-  timestamps.npy (N,)   float32  env_step / 50
+  states.npy     (N, 7|8) float32  yaw: [x, y, z, aa_x, aa_y, aa_z, gripper]
+                                   j6 : [x, y, z, aa_x, aa_y, aa_z, gripper, j6]
+  actions.npy    (N, 7) float32    yaw: [dx, dy, dz, droll, dpitch, dyaw, gripper_next]
+                                   j6 : [dx, dy, dz, droll, dpitch, dj6, gripper_next]
+  timestamps.npy (N,)   float32  env_step / saved_fps
   env_steps.npy  (N,)   int64
   images.npz             contains main_images (N,224,224,3) and wrist_images (N,224,224,3)
   metadata.json
@@ -92,7 +94,12 @@ def _maybe_reexec_into_repo_venv() -> None:
     os.execv(str(target), [str(target), *sys.argv])
 
 
-from support.get_obs import CameraPair, preprocess_image_for_openpi as preprocess_image
+from support.get_obs import (
+    CameraPair,
+    STATE_MODE_J6,
+    STATE_MODE_YAW,
+    preprocess_image_for_openpi as preprocess_image,
+)
 from task.pick_and_place import (
     APPLE_NAME,
     OBJECT_ORDER,
@@ -138,11 +145,33 @@ def _wrap_angle(angle: float) -> float:
     return float(np.arctan2(np.sin(angle), np.cos(angle)))
 
 
-def build_state8(pose6_zyx: np.ndarray, gripper: float, joint6: float) -> np.ndarray:
-    """Build one AUBO state row [x, y, z, aa_x, aa_y, aa_z, gripper, j6]."""
+def _normalize_state_mode(state_mode: str) -> str:
+    mode = str(state_mode).strip().lower()
+    if mode not in (STATE_MODE_YAW, STATE_MODE_J6):
+        raise ValueError(f"invalid state_mode={state_mode!r}, expected '{STATE_MODE_YAW}' or '{STATE_MODE_J6}'")
+    return mode
+
+
+def build_state_row(pose6_zyx: np.ndarray, gripper: float, joint6: float, *, state_mode: str) -> np.ndarray:
+    """Build one state row for the selected collect-data mode."""
+    mode = _normalize_state_mode(state_mode)
     pose = np.asarray(pose6_zyx, dtype=np.float64).reshape(6)
     quat = _euler_zyx_to_quat_wxyz(pose[3:6])
     aa = _quat_to_axis_angle_wxyz(quat)
+    if mode == STATE_MODE_J6:
+        return np.array(
+            [
+                pose[0],
+                pose[1],
+                pose[2],
+                aa[0],
+                aa[1],
+                aa[2],
+                float(gripper),
+                float(joint6),
+            ],
+            dtype=np.float32,
+        )
     return np.array(
         [
             pose[0],
@@ -152,7 +181,6 @@ def build_state8(pose6_zyx: np.ndarray, gripper: float, joint6: float) -> np.nda
             aa[1],
             aa[2],
             float(gripper),
-            float(joint6),
         ],
         dtype=np.float32,
     )
@@ -176,8 +204,15 @@ def quat_to_euler_wxyz(quat: np.ndarray) -> np.ndarray:
     return np.array([roll, pitch, yaw], dtype=np.float64)
 
 
-def compute_delta_actions(pose6: np.ndarray, gripper: np.ndarray, joint6: np.ndarray) -> np.ndarray:
-    """Compute (N, 7) delta actions from resampled pose6 / gripper / j6 sequences."""
+def compute_delta_actions(
+    pose6: np.ndarray,
+    gripper: np.ndarray,
+    joint6: np.ndarray,
+    *,
+    state_mode: str,
+) -> np.ndarray:
+    """Compute (N, 7) delta actions for yaw-mode or j6-mode datasets."""
+    mode = _normalize_state_mode(state_mode)
     pose6 = np.asarray(pose6, dtype=np.float32)
     gripper = np.asarray(gripper, dtype=np.float32).reshape(-1)
     joint6 = np.asarray(joint6, dtype=np.float32).reshape(-1)
@@ -198,12 +233,29 @@ def compute_delta_actions(pose6: np.ndarray, gripper: np.ndarray, joint6: np.nda
             euler_next = pose6[idx + 1, 3:6]
             deuler = np.arctan2(np.sin(euler_next - euler_curr), np.cos(euler_next - euler_curr))
             actions[idx, 3:5] = deuler[:2]
-            actions[idx, 5] = _wrap_angle(float(joint6[idx + 1] - joint6[idx]))
+            if mode == STATE_MODE_J6:
+                actions[idx, 5] = _wrap_angle(float(joint6[idx + 1] - joint6[idx]))
+            else:
+                actions[idx, 5] = deuler[2]
             actions[idx, 6] = gripper[idx + 1]
         else:
             actions[idx, :6] = 0.0
             actions[idx, 6] = gripper[idx]
     return actions
+
+
+def state_schema_for_mode(state_mode: str) -> list[str]:
+    mode = _normalize_state_mode(state_mode)
+    if mode == STATE_MODE_J6:
+        return ["x", "y", "z", "aa_x", "aa_y", "aa_z", "gripper_open", "j6"]
+    return ["x", "y", "z", "aa_x", "aa_y", "aa_z", "gripper_open"]
+
+
+def action_schema_for_mode(state_mode: str) -> list[str]:
+    mode = _normalize_state_mode(state_mode)
+    if mode == STATE_MODE_J6:
+        return ["dx", "dy", "dz", "droll", "dpitch", "dj6", "gripper_next"]
+    return ["dx", "dy", "dz", "droll", "dpitch", "dyaw", "gripper_next"]
 
 
 def _canonicalize_quat_wxyz(quat: np.ndarray) -> np.ndarray:
@@ -643,10 +695,12 @@ def prepare_episode_for_save(
     frames: list[RecordedFrame],
     *,
     save_fps: int,
+    state_mode: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Convert raw episode frames onto the target save grid."""
     if not frames:
         raise RuntimeError("no frames to resample")
+    mode = _normalize_state_mode(state_mode)
     if save_fps not in (RAW_CAPTURE_FPS, UPSAMPLED_SAVE_FPS):
         raise ValueError(f"unsupported save_fps={save_fps}, expected {RAW_CAPTURE_FPS} or {UPSAMPLED_SAVE_FPS}")
 
@@ -661,15 +715,21 @@ def prepare_episode_for_save(
         target_count = len(frames)
         env_steps = np.arange(target_count, dtype=np.int64)
         target_times = env_steps.astype(np.float32) * np.float32(1.0 / RAW_CAPTURE_FPS)
-        states = np.zeros((target_count, 8), dtype=np.float32)
+        state_dim = len(state_schema_for_mode(mode))
+        states = np.zeros((target_count, state_dim), dtype=np.float32)
         pose6_saved = raw_pose6.astype(np.float32, copy=True)
         gripper_saved = raw_gripper.astype(np.float32, copy=True)
         joint6_saved = raw_joint6.astype(np.float32, copy=True)
         main_images = raw_main_images.copy()
         wrist_images = raw_wrist_images.copy()
         for out_idx in range(target_count):
-            states[out_idx] = build_state8(pose6_saved[out_idx], gripper_saved[out_idx], joint6_saved[out_idx])
-        actions = compute_delta_actions(pose6_saved, gripper_saved, joint6_saved)
+            states[out_idx] = build_state_row(
+                pose6_saved[out_idx],
+                gripper_saved[out_idx],
+                joint6_saved[out_idx],
+                state_mode=mode,
+            )
+        actions = compute_delta_actions(pose6_saved, gripper_saved, joint6_saved, state_mode=mode)
         return states, actions, target_times.astype(np.float32), env_steps, main_images, wrist_images
 
     save_control_dt = 1.0 / float(save_fps)
@@ -677,7 +737,8 @@ def prepare_episode_for_save(
     env_steps = np.arange(target_count, dtype=np.int64)
     target_times = env_steps.astype(np.float32) * np.float32(save_control_dt)
 
-    states = np.zeros((target_count, 8), dtype=np.float32)
+    state_dim = len(state_schema_for_mode(mode))
+    states = np.zeros((target_count, state_dim), dtype=np.float32)
     pose6_resampled = np.zeros((target_count, 6), dtype=np.float32)
     gripper_resampled = np.zeros((target_count,), dtype=np.float32)
     joint6_resampled = np.zeros((target_count,), dtype=np.float32)
@@ -723,11 +784,16 @@ def prepare_episode_for_save(
         pose6_resampled[out_idx] = interp_pose6.astype(np.float32)
         gripper_resampled[out_idx] = float(raw_gripper[grip_idx])
         joint6_resampled[out_idx] = np.float32(interp_joint6)
-        states[out_idx] = build_state8(interp_pose6, gripper_resampled[out_idx], joint6_resampled[out_idx])
+        states[out_idx] = build_state_row(
+            interp_pose6,
+            gripper_resampled[out_idx],
+            joint6_resampled[out_idx],
+            state_mode=mode,
+        )
         main_images[out_idx] = raw_main_images[image_idx]
         wrist_images[out_idx] = raw_wrist_images[image_idx]
 
-    actions = compute_delta_actions(pose6_resampled, gripper_resampled, joint6_resampled)
+    actions = compute_delta_actions(pose6_resampled, gripper_resampled, joint6_resampled, state_mode=mode)
     return states, actions, target_times.astype(np.float32), env_steps, main_images, wrist_images
 
 
@@ -735,7 +801,14 @@ def prepare_episode_for_save(
 # Saving
 # ---------------------------------------------------------------------------
 
-def save_episode(frames: list[RecordedFrame], save_dir: Path, prompt: str, *, save_fps: int) -> Path:
+def save_episode(
+    frames: list[RecordedFrame],
+    save_dir: Path,
+    prompt: str,
+    *,
+    save_fps: int,
+    state_mode: str,
+) -> Path:
     """Save a recorded episode to disk."""
     from support.pose_align import get_alignment_mode
 
@@ -753,7 +826,10 @@ def save_episode(frames: list[RecordedFrame], save_dir: Path, prompt: str, *, sa
     states, actions, timestamps, env_steps, main_images, wrist_images = prepare_episode_for_save(
         frames,
         save_fps=save_fps,
+        state_mode=state_mode,
     )
+    state_schema = state_schema_for_mode(state_mode)
+    action_schema = action_schema_for_mode(state_mode)
 
     np.save(episode_dir / "states.npy", states)
     np.save(episode_dir / "actions.npy", actions)
@@ -779,10 +855,11 @@ def save_episode(frames: list[RecordedFrame], save_dir: Path, prompt: str, *, sa
         "timestamp_mode": "env_step_times_control_dt",
         "timestamps_file": "timestamps.npy",
         "env_steps_file": "env_steps.npy",
-        "state_dim": 8,
+        "state_dim": len(state_schema),
         "action_dim": 7,
-        "state_schema": ["x", "y", "z", "aa_x", "aa_y", "aa_z", "gripper_open", "j6"],
-        "action_schema": ["dx", "dy", "dz", "droll", "dpitch", "dj6", "gripper_next"],
+        "state_schema": state_schema,
+        "action_schema": action_schema,
+        "state_mode": _normalize_state_mode(state_mode),
         "pose_frame": get_alignment_mode(),
     }
     with open(episode_dir / "metadata.json", "w", encoding="utf-8") as handle:
@@ -807,6 +884,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-episodes", type=int, default=0)
     parser.add_argument("--speed", type=float, default=LINEAR_SPEED)
     parser.add_argument("--save-fps", type=int, choices=(RAW_CAPTURE_FPS, UPSAMPLED_SAVE_FPS), default=DEFAULT_SAVE_FPS)
+    parser.add_argument("--state-mode", type=str, choices=(STATE_MODE_YAW, STATE_MODE_J6), default=STATE_MODE_J6)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--gripper-timeout", type=float, default=10.0)
     parser.add_argument("--pose-frame", type=str, choices=("sim", "real"), default="sim")
@@ -826,6 +904,7 @@ def main() -> int:
         set_runtime_alignment,
     )
     from support.tcp_control import build_helper as build_tcp_helper, get_robot_snapshot, _get_motion_daemon
+    from support.tui_config import run_collect_tui_config
 
     args = parse_args()
     set_alignment_mode(args.pose_frame)
@@ -837,23 +916,39 @@ def main() -> int:
         raise ValueError(f"--speed must be positive, got {args.speed}")
     LINEAR_SPEED = args.speed
 
-    # --- Interactive mode selection ---
-    print("\nSelect mode:")
-    print("  [m] manual - press ENTER each episode, q to quit")
-    print("  [N] auto   - enter a number to auto-collect N episodes")
-    mode_choice = input("Enter m or a number (default: m): ").strip().lower()
-    auto_episodes = 0
-    if mode_choice not in ("", "m", "manual"):
-        try:
-            auto_episodes = int(mode_choice)
-            if auto_episodes <= 0:
-                raise ValueError
-            print(f"Auto mode: will collect {auto_episodes} episodes without pause.")
-        except ValueError:
-            print(f"Invalid input '{mode_choice}', using manual mode.")
-            auto_episodes = 0
-    if auto_episodes == 0:
-        print("Manual mode: press ENTER each episode.")
+    saved_state_preview = load_collect_state(save_dir)
+    tui_cfg = run_collect_tui_config(
+        default_mode="auto" if args.max_episodes > 0 else "manual",
+        default_auto_episodes=max(1, args.max_episodes) if args.max_episodes > 0 else 10,
+        default_resume_mode="continue" if saved_state_preview is not None else "reset",
+        default_task="pick_and_place",
+        default_save_fps=args.save_fps,
+        default_state_mode=args.state_mode,
+    )
+    if tui_cfg.quit:
+        print("Exiting.")
+        return 0
+
+    auto_episodes = 0 if tui_cfg.mode == "manual" else int(tui_cfg.auto_episodes)
+    save_fps = int(tui_cfg.save_fps)
+    collect_state_mode = _normalize_state_mode(tui_cfg.state_mode)
+    selected_task = str(tui_cfg.task)
+    resume_mode = str(tui_cfg.resume_mode)
+
+    print("\nConfiguration:")
+    print(f"  Mode:       {tui_cfg.mode}")
+    if tui_cfg.mode == "auto":
+        print(f"  Episodes:   {auto_episodes}")
+    print(f"  Resume:     {resume_mode}")
+    print(f"  Task:       {selected_task}")
+    print(f"  Save FPS:   {save_fps}")
+    print(f"  State Mode: {collect_state_mode}")
+    print(f"  Pose Frame: {get_alignment_mode()}")
+    print(f"  Speed:      {LINEAR_SPEED} m/s")
+    print(f"  Dry-run:    {args.dry_run}")
+    if selected_task != "pick_and_place":
+        print(f"Task '{selected_task}' is reserved but not implemented yet.")
+        return 1
 
     planner_config = PlannerConfig(
         workspace_x_min=WORKSPACE_X_MIN,
@@ -869,11 +964,12 @@ def main() -> int:
     print("\nTask: random pick/place")
     print(f"Data dir: {save_dir}")
     print(f"Raw capture FPS: {RAW_CAPTURE_FPS}")
-    print(f"Saved dataset FPS: {args.save_fps}")
-    print(f"Resample mode: {'off' if args.save_fps == RAW_CAPTURE_FPS else f'{RAW_CAPTURE_FPS}->{args.save_fps}'}")
+    print(f"Saved dataset FPS: {save_fps}")
+    print(f"Resample mode: {'off' if save_fps == RAW_CAPTURE_FPS else f'{RAW_CAPTURE_FPS}->{save_fps}'}")
     print(f"Speed: {LINEAR_SPEED} m/s")
     print(f"Dry-run: {args.dry_run}")
     print(f"Pose frame: {get_alignment_mode()}")
+    print(f"State mode: {collect_state_mode}")
     print(f"Objects:      {list(OBJECT_ORDER)}")
     print("Prompt mode:  auto random ('pick up ...' / 'put ... on ...')")
     print("Task mix:     20% pick / 80% place")
@@ -918,7 +1014,7 @@ def main() -> int:
     skip_prep = False
 
     # --- Check for saved state ---
-    saved = load_collect_state(save_dir)
+    saved = saved_state_preview
     if saved is not None:
         print("\n  Found saved object states from previous run:")
         for name, state in saved["scene_state"].items():
@@ -932,8 +1028,7 @@ def main() -> int:
                 f"is_rotate={is_rotate}, deg={deg:.1f}, upper={upper}, lower={lower}"
             )
         print(f"    task_index={saved['color_index']}, episode_count={saved['episode_count']}")
-        choice = input("  [c]ontinue from saved / [r]eset (default: continue): ").strip().lower()
-        if choice in ("r", "reset", "clear"):
+        if resume_mode == "reset":
             clear_collect_state(save_dir)
             print("  State cleared. Starting fresh.")
         else:
@@ -942,6 +1037,8 @@ def main() -> int:
             episode_count = saved["episode_count"]
             skip_prep = True
             print("  Resuming from saved state.")
+    elif resume_mode == "continue":
+        print("\n  Resume selected, but no saved state exists. Starting fresh.")
 
     def refresh_home_pose() -> np.ndarray:
         nonlocal home_real, origin_xy
@@ -1284,7 +1381,13 @@ def main() -> int:
             if not all_frames:
                 raise RuntimeError("recorded episode produced no frames")
 
-            save_episode(all_frames, save_dir, plan.prompt, save_fps=args.save_fps)
+            save_episode(
+                all_frames,
+                save_dir,
+                plan.prompt,
+                save_fps=save_fps,
+                state_mode=collect_state_mode,
+            )
             episode_count += 1
             task_index += 1
 

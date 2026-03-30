@@ -25,7 +25,6 @@ from typing import Any
 import numpy as np
 
 
-STATE_DIM = 8
 ACTION_DIM = 7
 DEFAULT_RAW_CAPTURE_FPS = 30.0
 UNIQUE_RATIO_WARN = 0.90
@@ -51,6 +50,10 @@ class EpisodeReport:
     metrics: dict[str, Any]
 
 
+def _wrap_angle(angle: float) -> float:
+    return float(np.arctan2(np.sin(angle), np.cos(angle)))
+
+
 def quat_to_euler_wxyz(quat: np.ndarray) -> np.ndarray:
     w, x, y, z = np.asarray(quat, dtype=np.float64).reshape(4)
     sinr_cosp = 2.0 * (w * x + y * z)
@@ -69,19 +72,37 @@ def quat_to_euler_wxyz(quat: np.ndarray) -> np.ndarray:
     return np.array([roll, pitch, yaw], dtype=np.float64)
 
 
-def expected_actions_from_states(states: np.ndarray) -> np.ndarray:
+def axis_angle_to_quat_wxyz(axis_angle: np.ndarray) -> np.ndarray:
+    aa = np.asarray(axis_angle, dtype=np.float64).reshape(3)
+    angle = float(np.linalg.norm(aa))
+    if angle <= 1e-12:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    axis = aa / angle
+    half = 0.5 * angle
+    return np.array(
+        [np.cos(half), axis[0] * np.sin(half), axis[1] * np.sin(half), axis[2] * np.sin(half)],
+        dtype=np.float64,
+    )
+
+
+def expected_actions_from_states(states: np.ndarray, *, state_mode: str) -> np.ndarray:
     states = np.asarray(states, dtype=np.float64)
     actions = np.zeros((states.shape[0], ACTION_DIM), dtype=np.float64)
     if len(states) == 0:
         return actions
 
     pos = states[:, :3]
-    quat = states[:, 3:7]
-    grip = states[:, 7]
-    eulers = np.stack([quat_to_euler_wxyz(q) for q in quat], axis=0)
+    axis_angle = states[:, 3:6]
+    grip = states[:, 6]
+    eulers = np.stack([quat_to_euler_wxyz(axis_angle_to_quat_wxyz(aa)) for aa in axis_angle], axis=0)
 
     actions[:-1, :3] = pos[1:] - pos[:-1]
-    actions[:-1, 3:6] = np.arctan2(np.sin(eulers[1:] - eulers[:-1]), np.cos(eulers[1:] - eulers[:-1]))
+    deulers = np.arctan2(np.sin(eulers[1:] - eulers[:-1]), np.cos(eulers[1:] - eulers[:-1]))
+    actions[:-1, 3:5] = deulers[:, :2]
+    if state_mode == "j6" and states.shape[1] >= 8:
+        actions[:-1, 5] = np.array([_wrap_angle(v) for v in states[1:, 7] - states[:-1, 7]], dtype=np.float64)
+    else:
+        actions[:-1, 5] = deulers[:, 2]
     actions[:-1, 6] = grip[1:]
     actions[-1, 6] = grip[-1]
     return actions
@@ -172,10 +193,17 @@ def inspect_episode(ep_dir: Path, *, raw_capture_fps: float) -> EpisodeReport:
     metrics["task"] = task
     metrics["n_frames"] = n_frames
 
-    if states.ndim != 2 or states.shape[1] != STATE_DIM:
-        errors.append(f"states shape invalid: {states.shape}")
-    if actions.ndim != 2 or actions.shape[1] != ACTION_DIM:
-        errors.append(f"actions shape invalid: {actions.shape}")
+    state_dim = int(metadata.get("state_dim", states.shape[1] if states.ndim == 2 else 0))
+    action_dim = int(metadata.get("action_dim", ACTION_DIM))
+    state_mode = str(metadata.get("state_mode", "j6" if state_dim >= 8 else "yaw")).strip().lower()
+    metrics["state_dim"] = state_dim
+    metrics["action_dim"] = action_dim
+    metrics["state_mode"] = state_mode
+
+    if states.ndim != 2 or states.shape[1] != state_dim:
+        errors.append(f"states shape invalid: {states.shape}, expected (*, {state_dim})")
+    if actions.ndim != 2 or actions.shape[1] != action_dim:
+        errors.append(f"actions shape invalid: {actions.shape}, expected (*, {action_dim})")
     if timestamps.shape != (n_frames,):
         errors.append(f"timestamps shape invalid: {timestamps.shape} vs ({n_frames},)")
     if env_steps.shape != (n_frames,):
@@ -202,15 +230,9 @@ def inspect_episode(ep_dir: Path, *, raw_capture_fps: float) -> EpisodeReport:
             if nan_count or inf_count:
                 errors.append(f"{name} contains nan/inf: nan={nan_count}, inf={inf_count}")
 
-    if states.ndim == 2 and states.shape[1] == STATE_DIM:
-        quat = states[:, 3:7].astype(np.float64)
-        quat_norm = np.linalg.norm(quat, axis=1)
-        max_quat_err = float(np.max(np.abs(quat_norm - 1.0))) if len(quat_norm) else 0.0
-        metrics["quat_norm_err_max"] = max_quat_err
-        if max_quat_err > QUAT_NORM_FAIL:
-            errors.append(f"quaternion norm error too large: {max_quat_err:.6g}")
-        elif max_quat_err > QUAT_NORM_WARN:
-            warnings.append(f"quaternion norm error elevated: {max_quat_err:.6g}")
+    if states.ndim == 2 and states.shape[1] >= 6:
+        axis_angle_norm = np.linalg.norm(states[:, 3:6].astype(np.float64), axis=1)
+        metrics["axis_angle_norm_max"] = float(np.max(axis_angle_norm)) if len(axis_angle_norm) else 0.0
 
     saved_fps = float(metadata.get("fps", 0.0) or 0.0)
     if saved_fps <= 0:
@@ -232,8 +254,8 @@ def inspect_episode(ep_dir: Path, *, raw_capture_fps: float) -> EpisodeReport:
         elif grid_err > TIMESTAMP_GRID_WARN_S:
             warnings.append(f"timestamps slightly deviate from grid: {grid_err:.6g}s")
 
-    if states.shape == (n_frames, STATE_DIM) and actions.shape == (n_frames, ACTION_DIM):
-        expected_actions = expected_actions_from_states(states)
+    if states.shape == (n_frames, state_dim) and actions.shape == (n_frames, action_dim) and action_dim == ACTION_DIM:
+        expected_actions = expected_actions_from_states(states, state_mode=state_mode)
         action_err = np.abs(actions.astype(np.float64) - expected_actions)
         max_action_err = np.max(action_err, axis=0)
         metrics["action_err_max"] = max_action_err.tolist()

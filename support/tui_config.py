@@ -161,9 +161,11 @@ def _render(
     title: str = "=== OpenPI Robot Controller ===",
     help_line: str = "Up/Down: navigate  Left/Right/Enter: toggle  Enter on Start: go  q: quit",
     disabled_labels: set[str] | None = None,
+    nonselectable_labels: set[str] | None = None,
 ) -> str:
     """Build the full screen content string."""
     disabled = disabled_labels or set()
+    nonselectable = nonselectable_labels or set()
     lines: list[str] = []
     lines.append(f"{BOLD}{FG_CYAN}{title}{RESET}")
     lines.append("")
@@ -174,7 +176,8 @@ def _render(
             lines.append(f"  {DIM}{'─' * 50}{RESET}")
             continue
 
-        is_disabled_row = isinstance(row, TextItem) and row.label in disabled
+        row_label = row.label if hasattr(row, "label") else ""
+        is_disabled_row = bool(row_label and row_label in nonselectable)
         is_focused = (not is_disabled_row) and selectable_idx == cursor
         prefix = f"  {FG_GREEN}>{RESET} " if is_focused else "    "
 
@@ -432,11 +435,17 @@ def _choice_index(choices: list[str], value: str, default: int = 0) -> int:
 
 
 def _snapshot_collect_config(rows: list[MenuRow]) -> CollectTUIConfig:
+    task = _get_toggle(rows, "Task")
+    mode = _get_toggle(rows, "Mode")
+    auto_episodes = _get_int(rows, "Auto Episodes", 10)
+    if task == "open_and_close":
+        mode = "manual"
+        auto_episodes = 1
     return CollectTUIConfig(
-        mode=_get_toggle(rows, "Mode"),
-        auto_episodes=_get_int(rows, "Auto Episodes", 10),
+        mode=mode,
+        auto_episodes=auto_episodes,
         resume_mode=_get_toggle(rows, "Resume"),
-        task=_get_toggle(rows, "Task"),
+        task=task,
         save_fps=_get_int(rows, "Save FPS", 30),
         state_mode=_get_toggle(rows, "State Mode"),
     )
@@ -444,21 +453,43 @@ def _snapshot_collect_config(rows: list[MenuRow]) -> CollectTUIConfig:
 
 def _collect_disabled_labels(rows: list[MenuRow]) -> set[str]:
     disabled: set[str] = set()
-    if _get_toggle(rows, "Mode") != "auto":
+    task = _get_toggle(rows, "Task")
+    if _get_toggle(rows, "Mode") != "auto" or task == "open_and_close":
         disabled.add("Auto Episodes")
     return disabled
 
 
+def _is_open_and_close_task(rows: list[MenuRow]) -> bool:
+    return _get_toggle(rows, "Task") == "open_and_close"
+
+
+def _enforce_collect_task_constraints(rows: list[MenuRow]) -> None:
+    if not _is_open_and_close_task(rows):
+        return
+    for row in rows:
+        if isinstance(row, ToggleItem) and row.label == "Mode":
+            row.selected = _choice_index(row.choices, "manual", 0)
+        elif isinstance(row, TextItem) and row.label == "Auto Episodes":
+            row.value = "1"
+
+
 def _collect_selectable_rows(rows: list[MenuRow]) -> list[MenuRow]:
-    disabled = _collect_disabled_labels(rows)
+    nonselectable = _collect_nonselectable_labels(rows)
     selectable: list[MenuRow] = []
     for row in rows:
         if isinstance(row, SeparatorItem):
             continue
-        if isinstance(row, TextItem) and row.label in disabled:
+        if isinstance(row, (ToggleItem, TextItem)) and row.label in nonselectable:
             continue
         selectable.append(row)
     return selectable
+
+
+def _collect_nonselectable_labels(rows: list[MenuRow]) -> set[str]:
+    labels = _collect_disabled_labels(rows)
+    if _is_open_and_close_task(rows):
+        labels.add("Mode")
+    return labels
 
 
 def run_collect_tui_config(
@@ -484,6 +515,7 @@ def run_collect_tui_config(
         SeparatorItem(),
         StartItem(">>> Start Collection <<<"),
     ]
+    _enforce_collect_task_constraints(rows)
 
     cursor = 0
     status_line = ""
@@ -498,6 +530,7 @@ def run_collect_tui_config(
             title="=== OpenPI Data Collector ===",
             help_line="Up/Down: navigate  Left/Right/Enter: toggle  Enter on Start: go  q: quit",
             disabled_labels=_collect_disabled_labels(rows),
+            nonselectable_labels=_collect_nonselectable_labels(rows),
         )
 
     try:
@@ -533,10 +566,12 @@ def run_collect_tui_config(
                         current_row.selected = (current_row.selected + 1) % len(current_row.choices)
                     else:
                         current_row.selected = (current_row.selected - 1) % len(current_row.choices)
+                    _enforce_collect_task_constraints(rows)
                     status_line = ""
             elif key == "ENTER":
                 if isinstance(current_row, ToggleItem):
                     current_row.selected = (current_row.selected + 1) % len(current_row.choices)
+                    _enforce_collect_task_constraints(rows)
                     status_line = ""
                 elif isinstance(current_row, TextItem):
                     current_row.editing = True

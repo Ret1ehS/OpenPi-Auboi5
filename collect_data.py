@@ -53,7 +53,7 @@ WORKSPACE_Y_MAX = 0.26
 # Heights
 GRASP_HEIGHT_MM = 180.0
 MIN_TCP_Z = GRASP_HEIGHT_MM / 1000.0
-PLACE_HEIGHT_OFFSET_M = 0.005
+PLACE_HEIGHT_OFFSET_M = 0.0
 APPROACH_HEIGHT = 0.15
 
 # Object placement
@@ -109,6 +109,12 @@ from task.pick_and_place import (
     TaskStep,
     build_random_episode_plan,
     load_scene_state,
+)
+from task.open_and_close import (
+    MoveStep as OpenCloseMoveStep,
+    OpenCloseReference,
+    build_open_and_close_episode_plan,
+    build_reference_from_tcp_pose,
 )
 
 
@@ -325,15 +331,42 @@ def save_collect_state(
     scene_state: dict[str, dict[str, object]],
     color_index: int,
     episode_count: int,
+    *,
+    open_close_reference: OpenCloseReference | None = None,
 ) -> None:
     payload = {
         "object_states": scene_state,
         "color_index": int(color_index),
         "episode_count": int(episode_count),
     }
+    if open_close_reference is not None:
+        payload["open_close_reference"] = {
+            "x_start": float(open_close_reference.x_start),
+            "y_start": float(open_close_reference.y_start),
+            "z_base": float(open_close_reference.z_base),
+            "reference_pose6": [
+                float(v)
+                for v in np.asarray(open_close_reference.reference_pose6, dtype=np.float64).reshape(6).tolist()
+            ],
+        }
     path = _state_file_path(data_dir)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
+
+
+def _load_state_counter(payload: dict, key: str) -> int | None:
+    value = payload.get(key)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed < 0:
+        return None
+    return parsed
 
 
 def load_collect_state(data_dir: Path) -> dict | None:
@@ -343,16 +376,36 @@ def load_collect_state(data_dir: Path) -> dict | None:
     try:
         with open(path, "r", encoding="utf-8") as fh:
             payload = json.load(fh)
+        if not isinstance(payload, dict):
+            return None
         scene_payload = payload.get("object_states")
         if scene_payload is None:
             scene_payload = payload
         scene_state = load_scene_state(scene_payload)
-        if not scene_state:
+        open_close_reference: OpenCloseReference | None = None
+        open_close_payload = payload.get("open_close_reference")
+        if isinstance(open_close_payload, dict):
+            try:
+                ref_pose = np.asarray(open_close_payload.get("reference_pose6", []), dtype=np.float64).reshape(6).copy()
+                open_close_reference = OpenCloseReference(
+                    x_start=float(open_close_payload.get("x_start", ref_pose[0])),
+                    y_start=float(open_close_payload.get("y_start", ref_pose[1])),
+                    z_base=float(open_close_payload.get("z_base", ref_pose[2])),
+                    reference_pose6=ref_pose,
+                )
+            except Exception:
+                open_close_reference = None
+        color_index = _load_state_counter(payload, "color_index")
+        episode_count = _load_state_counter(payload, "episode_count")
+        has_valid_counters = color_index is not None and episode_count is not None
+        if scene_state is None and open_close_reference is None and not has_valid_counters:
             return None
         return {
-            "scene_state": scene_state,
-            "color_index": int(payload.get("color_index", 0)),
-            "episode_count": int(payload.get("episode_count", 0)),
+            "scene_state": scene_state or {},
+            "color_index": 0 if color_index is None else color_index,
+            "episode_count": 0 if episode_count is None else episode_count,
+            "has_valid_counters": has_valid_counters,
+            "open_close_reference": open_close_reference,
         }
     except Exception:
         return None
@@ -930,10 +983,13 @@ def main() -> int:
         print("Exiting.")
         return 0
 
+    selected_task = str(tui_cfg.task)
+    if selected_task == "open_and_close":
+        tui_cfg.mode = "manual"
+        tui_cfg.auto_episodes = 1
     auto_episodes = 0 if tui_cfg.mode == "manual" else int(tui_cfg.auto_episodes)
     save_fps = int(tui_cfg.save_fps)
     collect_state_mode = _normalize_state_mode(tui_cfg.state_mode)
-    selected_task = str(tui_cfg.task)
     resume_mode = str(tui_cfg.resume_mode)
 
     print("\nConfiguration:")
@@ -947,8 +1003,8 @@ def main() -> int:
     print(f"  Pose Frame: {get_alignment_mode()}")
     print(f"  Speed:      {LINEAR_SPEED} m/s")
     print(f"  Dry-run:    {args.dry_run}")
-    if selected_task != "pick_and_place":
-        print(f"Task '{selected_task}' is reserved but not implemented yet.")
+    if selected_task not in {"pick_and_place", "open_and_close"}:
+        print(f"Unsupported task '{selected_task}'.")
         return 1
 
     planner_config = PlannerConfig(
@@ -962,7 +1018,7 @@ def main() -> int:
         rotate_deg_max=ROTATE_ABS_DEG_MAX,
     )
 
-    print("\nTask: random pick/place")
+    print(f"\nTask: {selected_task}")
     print(f"Data dir: {save_dir}")
     print(f"Raw capture FPS: {RAW_CAPTURE_FPS}")
     print(f"Saved dataset FPS: {save_fps}")
@@ -971,9 +1027,13 @@ def main() -> int:
     print(f"Dry-run: {args.dry_run}")
     print(f"Pose frame: {get_alignment_mode()}")
     print(f"State mode: {collect_state_mode}")
-    print(f"Objects:      {list(OBJECT_ORDER)}")
-    print("Prompt mode:  auto random ('pick up ...' / 'put ... on ...')")
-    print("Task mix:     20% pick / 80% place")
+    if selected_task == "pick_and_place":
+        print(f"Objects:      {list(OBJECT_ORDER)}")
+        print("Prompt mode:  auto random ('pick up ...' / 'put ... on ...')")
+        print("Task mix:     20% pick / 80% place")
+    else:
+        print("Prompt mode:  alternating ('open the storage box' / 'close the storage box')")
+        print("Task mix:     open / close alternating by episode")
 
     print("Compiling C++ helpers...")
     build_joint_helper()
@@ -982,6 +1042,8 @@ def main() -> int:
     print("Initializing cameras...")
     cameras = CameraPair()
     daemon = _get_motion_daemon()
+    startup_snap = get_robot_snapshot()
+    startup_tcp_pose = np.asarray(startup_snap.tcp_pose, dtype=np.float64).reshape(6).copy()
 
     print("Moving to initial joint position...")
     ensure_joint_move_ok(
@@ -1010,6 +1072,7 @@ def main() -> int:
     z_above = z_grasp + APPROACH_HEIGHT
     episode_count = 0
     scene_state: dict[str, dict[str, object]] = {}
+    open_close_reference: OpenCloseReference | None = None
     task_index = 0
     skip_prep = False
     default_joint6_rad = float(DEFAULT_J6_HOME_RAD)
@@ -1017,30 +1080,63 @@ def main() -> int:
 
     # --- Check for saved state ---
     saved = saved_state_preview
-    if saved is not None:
-        print("\n  Found saved object states from previous run:")
-        for name, state in saved["scene_state"].items():
-            xy = get_object_xy(saved["scene_state"], name)
-            is_rotate = get_object_is_rotate(saved["scene_state"], name)
-            deg = get_object_deg(saved["scene_state"], name)
-            upper = state.get("upper")
-            lower = state.get("lower")
-            print(
-                f"    {name}: xy=({xy[0]:.4f}, {xy[1]:.4f}), "
-                f"is_rotate={is_rotate}, deg={deg:.1f}, upper={upper}, lower={lower}"
-            )
-        print(f"    task_index={saved['color_index']}, episode_count={saved['episode_count']}")
+    if selected_task == "pick_and_place":
+        saved_scene_state = saved.get("scene_state", {}) if saved is not None else {}
+        if saved is not None and saved_scene_state:
+            print("\n  Found saved object states from previous run:")
+            for name, state in saved_scene_state.items():
+                xy = get_object_xy(saved_scene_state, name)
+                is_rotate = get_object_is_rotate(saved_scene_state, name)
+                deg = get_object_deg(saved_scene_state, name)
+                upper = state.get("upper")
+                lower = state.get("lower")
+                print(
+                    f"    {name}: xy=({xy[0]:.4f}, {xy[1]:.4f}), "
+                    f"is_rotate={is_rotate}, deg={deg:.1f}, upper={upper}, lower={lower}"
+                )
+            print(f"    task_index={saved['color_index']}, episode_count={saved['episode_count']}")
+            if resume_mode == "reset":
+                clear_collect_state(save_dir)
+                print("  State cleared. Starting fresh.")
+            else:
+                scene_state = saved_scene_state
+                task_index = saved["color_index"]
+                episode_count = saved["episode_count"]
+                skip_prep = True
+                print("  Resuming from saved state.")
+        elif resume_mode == "continue":
+            print("\n  Resume selected, but no saved state exists. Starting fresh.")
+    else:
         if resume_mode == "reset":
-            clear_collect_state(save_dir)
-            print("  State cleared. Starting fresh.")
-        else:
-            scene_state = saved["scene_state"]
-            task_index = saved["color_index"]
-            episode_count = saved["episode_count"]
-            skip_prep = True
-            print("  Resuming from saved state.")
-    elif resume_mode == "continue":
-        print("\n  Resume selected, but no saved state exists. Starting fresh.")
+            if saved is not None:
+                clear_collect_state(save_dir)
+                print("\n  State cleared. Open/close reference will be re-captured from current TCP.")
+        elif resume_mode == "continue":
+            if saved is None:
+                print("\n  Resume selected, but no saved state exists. Open/close reference will use startup TCP.")
+            else:
+                task_index = int(saved.get("color_index", 0))
+                episode_count = int(saved.get("episode_count", 0))
+                saved_reference = saved.get("open_close_reference")
+                if isinstance(saved_reference, OpenCloseReference):
+                    open_close_reference = saved_reference
+                    print(
+                        "\n  Found saved open/close reference: "
+                        f"x_start={open_close_reference.x_start:.4f}, "
+                        f"y_start={open_close_reference.y_start:.4f}, "
+                        f"z_base={open_close_reference.z_base:.4f}"
+                    )
+                    print(f"  Resuming with saved open/close reference (episode_count={episode_count}).")
+                else:
+                    if saved.get("has_valid_counters", False):
+                        print(
+                            "\n  Restored open/close counters from saved state: "
+                            f"task_index={task_index}, episode_count={episode_count}."
+                        )
+                    print(
+                        "  Saved state has no reusable open/close reference. "
+                        "Open/close reference will use startup TCP."
+                    )
 
     def refresh_home_pose() -> np.ndarray:
         nonlocal home_real, origin_xy
@@ -1310,53 +1406,138 @@ def main() -> int:
                 raise RuntimeError(f"unknown step kind: {step.kind}")
         return frames, held_object
 
-    if skip_prep:
-        print("\n=== Skipping Preparation (resumed from saved state) ===")
+    def build_pose_from_reference_orientation(reference_pose6: np.ndarray, x: float, y: float, z: float) -> np.ndarray:
+        return build_pose_at_xy(reference_pose6, x, y, z)
+
+    def execute_move_step(step: OpenCloseMoveStep, *, record: bool, frame_idx: int, base_pose6: np.ndarray) -> tuple[list[RecordedFrame], int]:
+        step_frames: list[RecordedFrame] = []
+        target_pose = build_pose_from_reference_orientation(base_pose6, float(step.x), float(step.y), float(step.z))
+        if args.dry_run:
+            dummy_count = 6
+            sim_pose = real_pose_to_sim(target_pose)
+            for idx in range(dummy_count):
+                step_frames.append(
+                    RecordedFrame(
+                        sim_pose6=sim_pose.copy(),
+                        gripper=1.0,
+                        joint6=float(DEFAULT_J6_HOME_RAD),
+                        main_image=np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8),
+                        wrist_image=np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8),
+                        timestamp=(frame_idx + idx) * CONTROL_DT,
+                    )
+                )
+            return step_frames, frame_idx + len(step_frames)
+
+        print(f"    [move] ({step.x:.4f}, {step.y:.4f}, {step.z:.4f})  {step.note}")
+        seg = execute_and_record(
+            daemon,
+            cameras,
+            target_pose,
+            gripper=1.0,
+            start_frame_idx=frame_idx,
+            speed_mps=LINEAR_SPEED,
+        )
+        if record:
+            step_frames.extend(seg)
+        frame_idx += len(seg)
+        return step_frames, frame_idx
+
+    def execute_move_step_sequence(
+        steps: list[OpenCloseMoveStep],
+        *,
+        record: bool,
+        base_pose6: np.ndarray,
+    ) -> list[RecordedFrame]:
+        frames: list[RecordedFrame] = []
+        frame_idx = 0
+        for step in steps:
+            step_frames, frame_idx = execute_move_step(step, record=record, frame_idx=frame_idx, base_pose6=base_pose6)
+            frames.extend(step_frames)
+        return frames
+
+    if selected_task == "pick_and_place":
+        if skip_prep:
+            print("\n=== Skipping Preparation (resumed from saved state) ===")
+        else:
+            print("\n=== Preparation Phase ===")
+            print(f"Seed order: {list(OBJECT_ORDER)}")
+            for object_name in OBJECT_ORDER:
+                placed_state = sample_initial_object_state(object_name)
+                print(
+                    f"[prep] {object_name}: origin -> ({placed_state['xy'][0]:.4f}, {placed_state['xy'][1]:.4f}), "
+                    f"is_rotate={placed_state['is_rotate']}, deg={placed_state['deg']:.1f}"
+                )
+                if not args.dry_run:
+                    pick_step = TaskStep(
+                        kind="pick",
+                        object_name=object_name,
+                        xy=(float(origin_xy[0]), float(origin_xy[1])),
+                        level=0,
+                        is_rotate=False,
+                        deg=0.0,
+                        align_j6=False,
+                        note=f"prep pick {object_name}",
+                    )
+                    place_step = TaskStep(
+                        kind="place",
+                        object_name=object_name,
+                        xy=(float(placed_state["xy"][0]), float(placed_state["xy"][1])),
+                        level=0,
+                        is_rotate=bool(placed_state["is_rotate"]),
+                        deg=float(placed_state["deg"]),
+                        align_j6=bool(object_name != APPLE_NAME and bool(placed_state["is_rotate"])),
+                        note=f"prep place {object_name}",
+                    )
+                    _, held_after_prep = execute_step_sequence([pick_step, place_step], record=False)
+                    if held_after_prep is not None:
+                        raise RuntimeError(f"prep sequence ended while still holding {held_after_prep}")
+                    return_home(f"[prep {object_name}] return home")
+                scene_state[object_name] = placed_state
+            save_collect_state(save_dir, scene_state, task_index, episode_count)
     else:
-        print("\n=== Preparation Phase ===")
-        print(f"Seed order: {list(OBJECT_ORDER)}")
-        for object_name in OBJECT_ORDER:
-            placed_state = sample_initial_object_state(object_name)
+        print("\n=== Open/Close Reference Setup ===")
+        if open_close_reference is None:
+            print("Auto-capturing startup TCP as OPEN start point (x/y source).")
+            set_runtime_alignment(startup_tcp_pose)
+            open_close_reference = build_reference_from_tcp_pose(startup_tcp_pose)
             print(
-                f"[prep] {object_name}: origin -> ({placed_state['xy'][0]:.4f}, {placed_state['xy'][1]:.4f}), "
-                f"is_rotate={placed_state['is_rotate']}, deg={placed_state['deg']:.1f}"
+                "  Captured open reference: "
+                f"x_start={open_close_reference.x_start:.4f}, "
+                f"y_start={open_close_reference.y_start:.4f}, "
+                f"z_base={open_close_reference.z_base:.4f}"
+            )
+            save_collect_state(
+                save_dir,
+                {},
+                task_index,
+                episode_count,
+                open_close_reference=open_close_reference,
             )
             if not args.dry_run:
-                pick_step = TaskStep(
-                    kind="pick",
-                    object_name=object_name,
-                    xy=(float(origin_xy[0]), float(origin_xy[1])),
-                    level=0,
-                    is_rotate=False,
-                    deg=0.0,
-                    align_j6=False,
-                    note=f"prep pick {object_name}",
-                )
-                place_step = TaskStep(
-                    kind="place",
-                    object_name=object_name,
-                    xy=(float(placed_state["xy"][0]), float(placed_state["xy"][1])),
-                    level=0,
-                    is_rotate=bool(placed_state["is_rotate"]),
-                    deg=float(placed_state["deg"]),
-                    align_j6=bool(object_name != APPLE_NAME and bool(placed_state["is_rotate"])),
-                    note=f"prep place {object_name}",
-                )
-                _, held_after_prep = execute_step_sequence([pick_step, place_step], record=False)
-                if held_after_prep is not None:
-                    raise RuntimeError(f"prep sequence ended while still holding {held_after_prep}")
-                return_home(f"[prep {object_name}] return home")
-            scene_state[object_name] = placed_state
-        save_collect_state(save_dir, scene_state, task_index, episode_count)
+                return_home("post-reference return home")
+        else:
+            print(
+                "Using saved open reference: "
+                f"x_start={open_close_reference.x_start:.4f}, "
+                f"y_start={open_close_reference.y_start:.4f}, "
+                f"z_base={open_close_reference.z_base:.4f}"
+            )
 
-    max_ep = auto_episodes if auto_episodes > 0 else args.max_episodes
+    if selected_task == "open_and_close":
+        max_ep = episode_count + 1
+    else:
+        max_ep = auto_episodes if auto_episodes > 0 else args.max_episodes
 
     print("\n=== Ready For Episodes ===")
     if auto_episodes > 0:
         print(f"Auto mode: {auto_episodes} episodes, no pause between episodes.")
     else:
         print("Manual mode: press ENTER to collect the next random episode.")
-    print("Task policy: 20% pick / 80% place")
+    if selected_task == "pick_and_place":
+        print("Task policy: 20% pick / 80% place")
+    else:
+        print("Task policy: open, close, open, close ...")
+        print("Gripper policy: always open (no close/open action during episode)")
     print("Quit with q / quit / exit.\n")
 
     try:
@@ -1365,19 +1546,35 @@ def main() -> int:
                 print(f"\nReached {episode_count} episodes. Done.")
                 break
 
-            if not scene_state:
-                raise RuntimeError("scene_state is empty; cannot plan next episode")
+            if selected_task == "pick_and_place":
+                if not scene_state:
+                    raise RuntimeError("scene_state is empty; cannot plan next episode")
 
-            plan = build_random_episode_plan(scene_state, config=planner_config)
-            episode_label = f"Episode {episode_count} [{plan.task_kind}]"
+                plan = build_random_episode_plan(scene_state, config=planner_config)
+                episode_label = f"Episode {episode_count} [{plan.task_kind}]"
 
-            print(f"\n--- {episode_label} ---")
-            print(f"  Prompt: \"{plan.prompt}\"")
-            print(f"  Source: {plan.source_name}")
-            if plan.target_name is not None:
-                print(f"  Target: {plan.target_name}")
-            print(f"  Recorded steps: {len(plan.recorded_steps)}")
-            print(f"  Post steps: {len(plan.post_steps)}")
+                print(f"\n--- {episode_label} ---")
+                print(f"  Prompt: \"{plan.prompt}\"")
+                print(f"  Source: {plan.source_name}")
+                if plan.target_name is not None:
+                    print(f"  Target: {plan.target_name}")
+                print(f"  Recorded steps: {len(plan.recorded_steps)}")
+                print(f"  Post steps: {len(plan.post_steps)}")
+            else:
+                if open_close_reference is None:
+                    raise RuntimeError("open/close reference is not initialized")
+                plan = build_open_and_close_episode_plan(
+                    reference=open_close_reference,
+                    episode_index=episode_count,
+                    workspace_x_min=WORKSPACE_X_MIN,
+                    workspace_x_max=WORKSPACE_X_MAX,
+                    workspace_y_min=WORKSPACE_Y_MIN,
+                    workspace_y_max=WORKSPACE_Y_MAX,
+                )
+                episode_label = f"Episode {episode_count} [{plan.task_kind}]"
+                print(f"\n--- {episode_label} ---")
+                print(f"  Prompt: \"{plan.prompt}\"")
+                print(f"  Recorded move steps: {len(plan.recorded_steps)}")
 
             if auto_episodes > 0:
                 print(f"  Auto: recording ({episode_count + 1}/{auto_episodes})")
@@ -1397,7 +1594,15 @@ def main() -> int:
                     "open gripper before episode",
                 )
 
-            all_frames, held_after_recorded = execute_step_sequence(plan.recorded_steps, record=True)
+            if selected_task == "pick_and_place":
+                all_frames, held_after_recorded = execute_step_sequence(plan.recorded_steps, record=True)
+            else:
+                all_frames = execute_move_step_sequence(
+                    plan.recorded_steps,
+                    record=True,
+                    base_pose6=open_close_reference.reference_pose6,
+                )
+                held_after_recorded = None
             if not all_frames:
                 raise RuntimeError("recorded episode produced no frames")
 
@@ -1411,23 +1616,33 @@ def main() -> int:
             episode_count += 1
             task_index += 1
 
-            if plan.post_steps:
-                _, held_after_post = execute_step_sequence(
-                    plan.post_steps,
-                    record=False,
-                    initial_held_object=held_after_recorded,
-                )
-            else:
-                held_after_post = held_after_recorded
+            if selected_task == "pick_and_place":
+                if plan.post_steps:
+                    _, held_after_post = execute_step_sequence(
+                        plan.post_steps,
+                        record=False,
+                        initial_held_object=held_after_recorded,
+                    )
+                else:
+                    held_after_post = held_after_recorded
 
-            if held_after_post is not None:
-                raise RuntimeError(f"episode ended while still holding {held_after_post}")
+                if held_after_post is not None:
+                    raise RuntimeError(f"episode ended while still holding {held_after_post}")
 
             if not args.dry_run:
                 return_home("post-episode return home")
 
-            scene_state = plan.scene_after
-            save_collect_state(save_dir, scene_state, task_index, episode_count)
+            if selected_task == "pick_and_place":
+                scene_state = plan.scene_after
+                save_collect_state(save_dir, scene_state, task_index, episode_count)
+            else:
+                save_collect_state(
+                    save_dir,
+                    {},
+                    task_index,
+                    episode_count,
+                    open_close_reference=open_close_reference,
+                )
             continue
     except KeyboardInterrupt:
         print(f"\n\nCollection stopped after {episode_count} episodes.")
@@ -1435,8 +1650,17 @@ def main() -> int:
         print(f"\nERROR: {exc}")
         return 1
     finally:
-        if scene_state:
+        if selected_task == "pick_and_place" and scene_state:
             save_collect_state(save_dir, scene_state, task_index, episode_count)
+            print(f"  State saved to {_state_file_path(save_dir)}")
+        elif selected_task == "open_and_close" and open_close_reference is not None:
+            save_collect_state(
+                save_dir,
+                {},
+                task_index,
+                episode_count,
+                open_close_reference=open_close_reference,
+            )
             print(f"  State saved to {_state_file_path(save_dir)}")
         try:
             stop_motion_and_confirm(daemon, "collect_data cleanup")

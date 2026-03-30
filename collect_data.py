@@ -773,7 +773,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Real-robot data collection for OpenPI.")
     # task is selected interactively at startup, not via CLI
     parser.add_argument("--prompt", type=str, default="", help=argparse.SUPPRESS)
-    parser.add_argument("--data-dir", type=str, default=str(SCRIPT_DIR / "collected_data"))
+    parser.add_argument("--data-dir", type=str, default=str(SCRIPT_DIR / "data"))
     parser.add_argument("--max-episodes", type=int, default=0)
     parser.add_argument("--speed", type=float, default=LINEAR_SPEED)
     parser.add_argument("--dry-run", action="store_true")

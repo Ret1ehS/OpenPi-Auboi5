@@ -2,9 +2,9 @@ __pycache__/
 *.pyc
 .build/
 Log/
-collected_data/*
-!collected_data/
-!collected_data/check_dataset_health.py
+data/*
+!data/
+!data/check_dataset_health.py
 *.bak_*
 support/kubeconfig.yaml
 task/__pycache__/

@@ -81,12 +81,12 @@
 
 当前采集主入口为：
 
-- [collect_data_cube.py](/home/orin/openpi/scripts/collect_data_cube.py)
+- [collect_data.py](/home/orin/openpi/scripts/collect_data.py)
 
 
 ### 3.3 数据质量检查
 
-系统提供数据集健康检查脚本，对 `collected_data/episode_*` 自动执行结构检查、数值检查与图像健康检查。
+系统提供数据集健康检查脚本，对 `data/episode_*` 自动执行结构检查、数值检查与图像健康检查。
 
 当前检测项包括：
 
@@ -109,7 +109,7 @@
 
 脚本路径：
 
-- [check_dataset_health.py](/home/orin/openpi/scripts/collected_data/check_dataset_health.py)
+- [check_dataset_health.py](/home/orin/openpi/scripts/data/check_dataset_health.py)
 
 
 ### 3.4 坐标系对齐
@@ -149,7 +149,7 @@
 
 数据采集使用：
 
-- [collect_data_cube.py](/home/orin/openpi/scripts/collect_data_cube.py) 中的 `CameraPair`
+- [collect_data.py](/home/orin/openpi/scripts/collect_data.py) 中的 `CameraPair`
 
 
 ### 3.6 夹爪控制
@@ -197,7 +197,7 @@
 
 ### 4.2 数据采集流程
 
-数据采集由 [collect_data_cube.py](/home/orin/openpi/scripts/collect_data_cube.py) 负责，当前业务流程如下：
+数据采集由 [collect_data.py](/home/orin/openpi/scripts/collect_data.py) 负责，当前业务流程如下：
 
 1. 读取断点状态文件 `.collect_state.json`
 2. 若存在历史状态，则选择继续或清空后重置
@@ -221,9 +221,9 @@
 
 ### 4.3 数据质检流程
 
-数据质检由 [check_dataset_health.py](/home/orin/openpi/scripts/collected_data/check_dataset_health.py) 负责，当前流程如下：
+数据质检由 [check_dataset_health.py](/home/orin/openpi/scripts/data/check_dataset_health.py) 负责，当前流程如下：
 
-1. 扫描 `collected_data/episode_*`
+1. 扫描 `data/episode_*`
 2. 逐个读取数组与 metadata
 3. 执行结构、数值与图像检查
 4. 对异常样本标记结果
@@ -452,7 +452,7 @@
 
 文件：
 
-- [collect_data_cube.py](/home/orin/openpi/scripts/collect_data_cube.py)
+- [collect_data.py](/home/orin/openpi/scripts/collect_data.py)
 
 职责：
 
@@ -486,7 +486,7 @@
 
 文件：
 
-- [check_dataset_health.py](/home/orin/openpi/scripts/collected_data/check_dataset_health.py)
+- [check_dataset_health.py](/home/orin/openpi/scripts/data/check_dataset_health.py)
 
 职责：
 

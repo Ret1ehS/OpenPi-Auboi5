@@ -918,7 +918,7 @@ def main() -> int:
 
     saved_state_preview = load_collect_state(save_dir)
     tui_cfg = run_collect_tui_config(
-        default_mode="auto" if args.max_episodes > 0 else "manual",
+        default_mode="auto",
         default_auto_episodes=max(1, args.max_episodes) if args.max_episodes > 0 else 10,
         default_resume_mode="continue" if saved_state_preview is not None else "reset",
         default_task="pick_and_place",

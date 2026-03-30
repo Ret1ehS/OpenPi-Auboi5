@@ -175,14 +175,22 @@ def _render(
         prefix = f"  {FG_GREEN}>{RESET} " if is_focused else "    "
 
         if isinstance(row, ToggleItem):
-            parts = []
-            for i, choice in enumerate(row.choices):
-                if i == row.selected:
-                    parts.append(f"{BOLD}{BG_BLUE}{FG_WHITE} {choice} {RESET}")
-                else:
-                    parts.append(f"{DIM} {choice} {RESET}")
             label = f"{row.label:<20s}"
-            line = f"{prefix}{label}{''.join(parts)}"
+            if row.label == "Task":
+                current = row.choices[row.selected]
+                if is_focused:
+                    value = f"{BOLD}{BG_BLUE}{FG_WHITE}< {current} >{RESET}"
+                else:
+                    value = f"{DIM}< {current} >{RESET}"
+                line = f"{prefix}{label}{value}"
+            else:
+                parts = []
+                for i, choice in enumerate(row.choices):
+                    if i == row.selected:
+                        parts.append(f"{BOLD}{BG_BLUE}{FG_WHITE} {choice} {RESET}")
+                    else:
+                        parts.append(f"{DIM} {choice} {RESET}")
+                line = f"{prefix}{label}{''.join(parts)}"
             lines.append(line)
 
         elif isinstance(row, TextItem):
@@ -425,7 +433,7 @@ def _snapshot_collect_config(rows: list[MenuRow]) -> CollectTUIConfig:
 
 def run_collect_tui_config(
     *,
-    default_mode: str = "manual",
+    default_mode: str = "auto",
     default_auto_episodes: int = 10,
     default_resume_mode: str = "continue",
     default_task: str = "pick_and_place",

@@ -1514,7 +1514,7 @@ def main() -> int:
                         level=0,
                         is_rotate=False,
                         deg=0.0,
-                        align_j6=False,
+                        align_j6=bool(object_name != APPLE_NAME),
                         note=f"prep pick {object_name}",
                     )
                     place_step = TaskStep(
@@ -1524,7 +1524,7 @@ def main() -> int:
                         level=0,
                         is_rotate=bool(placed_state["is_rotate"]),
                         deg=float(placed_state["deg"]),
-                        align_j6=bool(object_name != APPLE_NAME and bool(placed_state["is_rotate"])),
+                        align_j6=bool(object_name != APPLE_NAME),
                         note=f"prep place {object_name}",
                     )
                     _, held_after_prep = execute_step_sequence([pick_step, place_step], record=False)

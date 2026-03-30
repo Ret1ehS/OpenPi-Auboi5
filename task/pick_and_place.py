@@ -453,7 +453,9 @@ def _make_place_step(
 
 
 def _should_align_j6(object_name: str, *, is_rotate: bool) -> bool:
-    return bool(object_name != APPLE_NAME and is_rotate)
+    _ = is_rotate
+    # Non-apple objects always align J6 to step.deg; deg=0 means return to the default baseline angle.
+    return bool(object_name != APPLE_NAME)
 
 
 def _resolve_place_orientation(scene: SceneState, source_name: str, support_name: str) -> tuple[bool, float]:

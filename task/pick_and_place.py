@@ -56,6 +56,18 @@ class TaskStep:
     deg: float
     note: str
     support_name: str | None = None
+    align_j6: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.align_j6 is None:
+            if self.kind == "pick":
+                self.align_j6 = True
+            elif self.kind == "place":
+                self.align_j6 = self.object_name != APPLE_NAME
+            else:
+                self.align_j6 = False
+        else:
+            self.align_j6 = bool(self.align_j6)
 
 
 @dataclass

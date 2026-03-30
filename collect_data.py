@@ -1109,7 +1109,7 @@ def main() -> int:
         step_frames: list[RecordedFrame] = []
         target_joint6_rad = j6_target_from_deg(step.deg)
         should_align_joint6 = bool(
-            abs(_wrap_angle(current_joint6_rad() - target_joint6_rad)) > JOINT6_ALIGN_DEADBAND_RAD
+            step.align_j6 and abs(_wrap_angle(current_joint6_rad() - target_joint6_rad)) > JOINT6_ALIGN_DEADBAND_RAD
         )
 
         if args.dry_run:
@@ -1194,17 +1194,9 @@ def main() -> int:
         target_z = z_for_place_level(step.level)
         above_z = target_z + APPROACH_HEIGHT
         step_frames: list[RecordedFrame] = []
-        must_align_support = step.support_name is not None and step.object_name != APPLE_NAME
-        must_reset_table_joint6 = (
-            step.object_name != APPLE_NAME
-            and step.support_name is None
-            and (not step.is_rotate)
-            and abs(float(step.deg)) <= 1e-6
-        )
         target_joint6_rad = j6_target_from_deg(step.deg)
-        align_requested = bool(step.is_rotate or must_align_support or must_reset_table_joint6)
         should_align_joint6 = bool(
-            align_requested and abs(_wrap_angle(current_joint6_rad() - target_joint6_rad)) > JOINT6_ALIGN_DEADBAND_RAD
+            step.align_j6 and abs(_wrap_angle(current_joint6_rad() - target_joint6_rad)) > JOINT6_ALIGN_DEADBAND_RAD
         )
 
         if args.dry_run:

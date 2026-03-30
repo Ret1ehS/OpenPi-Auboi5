@@ -45,10 +45,10 @@ REPO_VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
 # ---------------------------------------------------------------------------
 
 # Workspace bounds (real robot TCP frame)
-WORKSPACE_X_MIN = 0.30
-WORKSPACE_X_MAX = 0.70
-WORKSPACE_Y_MIN = -0.30
-WORKSPACE_Y_MAX = 0.30
+WORKSPACE_X_MIN = 0.34
+WORKSPACE_X_MAX = 0.66
+WORKSPACE_Y_MIN = -0.26
+WORKSPACE_Y_MAX = 0.26
 
 # Heights
 GRASP_HEIGHT_MM = 180.0
@@ -76,6 +76,7 @@ DEFAULT_ASYNC_MOVE_TIMEOUT_S = 30.0
 DEFAULT_J6_SPEED_RADPS = float(np.deg2rad(10.0))
 DEFAULT_J6_MOVE_SPEED_DEG = 10.0
 DEFAULT_J6_MOVE_ACC_DEG = 20.0
+JOINT6_ALIGN_DEADBAND_RAD = float(np.deg2rad(1.0))
 ROTATE_ABS_DEG_MIN = 12.0
 ROTATE_ABS_DEG_MAX = 22.5
 
@@ -1072,6 +1073,12 @@ def main() -> int:
     def j6_target_from_deg(deg: float) -> float:
         return float(default_joint6_rad + np.deg2rad(float(deg)))
 
+    def current_joint6_rad() -> float:
+        joint_q = np.asarray(get_robot_snapshot().joint_q, dtype=np.float64).reshape(-1)
+        if joint_q.size >= 6:
+            return float(joint_q[5])
+        return float(default_joint6_rad)
+
     def sample_initial_object_state(name: str) -> dict[str, object]:
         occupied = [origin_xy.copy()]
         for existing_name in scene_state.keys():
@@ -1100,11 +1107,15 @@ def main() -> int:
         target_z = z_for_pick_level(step.level)
         above_z = target_z + APPROACH_HEIGHT
         step_frames: list[RecordedFrame] = []
+        target_joint6_rad = j6_target_from_deg(step.deg)
+        should_align_joint6 = bool(
+            abs(_wrap_angle(current_joint6_rad() - target_joint6_rad)) > JOINT6_ALIGN_DEADBAND_RAD
+        )
 
         if args.dry_run:
-            dummy_count = 12 + (3 if step.is_rotate else 0)
+            dummy_count = 12 + (3 if should_align_joint6 else 0)
             sim_pose = real_pose_to_sim(home_real)
-            joint6 = j6_target_from_deg(step.deg) if step.is_rotate else default_joint6_rad
+            joint6 = target_joint6_rad if should_align_joint6 else default_joint6_rad
             for idx in range(dummy_count):
                 step_frames.append(
                     RecordedFrame(
@@ -1135,10 +1146,10 @@ def main() -> int:
             step_frames.extend(seg)
         frame_idx += len(seg)
 
-        if step.is_rotate:
+        if should_align_joint6:
             seg = execute_joint6_rotation_and_record(
                 cameras,
-                target_joint6=j6_target_from_deg(step.deg),
+                target_joint6=target_joint6_rad,
                 gripper=1.0,
                 start_frame_idx=frame_idx,
             )
@@ -1184,9 +1195,17 @@ def main() -> int:
         above_z = target_z + APPROACH_HEIGHT
         step_frames: list[RecordedFrame] = []
         must_align_support = step.support_name is not None and step.object_name != APPLE_NAME
-        must_reset_table_joint6 = step.support_name is None and (not step.is_rotate) and abs(float(step.deg)) <= 1e-6
-        should_align_joint6 = bool(step.is_rotate or must_align_support or must_reset_table_joint6)
+        must_reset_table_joint6 = (
+            step.object_name != APPLE_NAME
+            and step.support_name is None
+            and (not step.is_rotate)
+            and abs(float(step.deg)) <= 1e-6
+        )
         target_joint6_rad = j6_target_from_deg(step.deg)
+        align_requested = bool(step.is_rotate or must_align_support or must_reset_table_joint6)
+        should_align_joint6 = bool(
+            align_requested and abs(_wrap_angle(current_joint6_rad() - target_joint6_rad)) > JOINT6_ALIGN_DEADBAND_RAD
+        )
 
         if args.dry_run:
             dummy_count = 10 + (3 if should_align_joint6 else 0)

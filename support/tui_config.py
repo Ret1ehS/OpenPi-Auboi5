@@ -39,6 +39,7 @@ FG_GREEN = f"{_ESC}32m"
 FG_YELLOW = f"{_ESC}33m"
 FG_WHITE = f"{_ESC}37m"
 FG_RED = f"{_ESC}31m"
+FG_BLACK = f"{_ESC}30m"
 BG_BLUE = f"{_ESC}44m"
 BG_DEFAULT = f"{_ESC}49m"
 
@@ -159,8 +160,10 @@ def _render(
     *,
     title: str = "=== OpenPI Robot Controller ===",
     help_line: str = "Up/Down: navigate  Left/Right/Enter: toggle  Enter on Start: go  q: quit",
+    disabled_labels: set[str] | None = None,
 ) -> str:
     """Build the full screen content string."""
+    disabled = disabled_labels or set()
     lines: list[str] = []
     lines.append(f"{BOLD}{FG_CYAN}{title}{RESET}")
     lines.append("")
@@ -171,7 +174,8 @@ def _render(
             lines.append(f"  {DIM}{'─' * 50}{RESET}")
             continue
 
-        is_focused = selectable_idx == cursor
+        is_disabled_row = isinstance(row, TextItem) and row.label in disabled
+        is_focused = (not is_disabled_row) and selectable_idx == cursor
         prefix = f"  {FG_GREEN}>{RESET} " if is_focused else "    "
 
         if isinstance(row, ToggleItem):
@@ -181,7 +185,7 @@ def _render(
                 if is_focused:
                     value = f"{BOLD}{BG_BLUE}{FG_WHITE}< {current} >{RESET}"
                 else:
-                    value = f"{DIM}< {current} >{RESET}"
+                    value = f"{FG_BLACK}< {current} >{RESET}"
                 line = f"{prefix}{label}{value}"
             else:
                 parts = []
@@ -195,9 +199,15 @@ def _render(
 
         elif isinstance(row, TextItem):
             label = f"{row.label:<20s}"
+            is_disabled = row.label in disabled
             if row.editing:
                 # Show edit buffer with a block cursor
                 val_display = f"{BOLD}{FG_YELLOW}{row._edit_buf}{RESET}{BG_BLUE} {RESET}"
+            elif is_disabled:
+                val_display = f"{DIM}{row.value}{RESET}" if row.value else f"{DIM}(empty){RESET}"
+                line = f"{prefix}{DIM}{label}{RESET}{val_display}"
+                lines.append(line)
+                continue
             elif is_focused:
                 val_display = f"{UNDERLINE}{row.value}{RESET}" if row.value else f"{DIM}(empty){RESET}"
             else:
@@ -219,7 +229,8 @@ def _render(
                 line = f"{prefix}{FG_GREEN}{row.label}{RESET}"
             lines.append(line)
 
-        selectable_idx += 1
+        if not is_disabled_row:
+            selectable_idx += 1
 
     lines.append("")
     lines.append(f"  {DIM}{help_line}{RESET}")
@@ -431,6 +442,25 @@ def _snapshot_collect_config(rows: list[MenuRow]) -> CollectTUIConfig:
     )
 
 
+def _collect_disabled_labels(rows: list[MenuRow]) -> set[str]:
+    disabled: set[str] = set()
+    if _get_toggle(rows, "Mode") != "auto":
+        disabled.add("Auto Episodes")
+    return disabled
+
+
+def _collect_selectable_rows(rows: list[MenuRow]) -> list[MenuRow]:
+    disabled = _collect_disabled_labels(rows)
+    selectable: list[MenuRow] = []
+    for row in rows:
+        if isinstance(row, SeparatorItem):
+            continue
+        if isinstance(row, TextItem) and row.label in disabled:
+            continue
+        selectable.append(row)
+    return selectable
+
+
 def run_collect_tui_config(
     *,
     default_mode: str = "auto",
@@ -441,41 +471,45 @@ def run_collect_tui_config(
     default_state_mode: str = "j6",
 ) -> CollectTUIConfig:
     rows: list[MenuRow] = [
-        ToggleItem("Mode", ["manual", "auto"], selected=_choice_index(["manual", "auto"], default_mode, 0)),
-        TextItem("Auto Episodes", str(max(1, int(default_auto_episodes)))),
+        ToggleItem("Mode", ["auto", "manual"], selected=_choice_index(["auto", "manual"], default_mode, 0)),
         ToggleItem("Resume", ["continue", "reset"], selected=_choice_index(["continue", "reset"], default_resume_mode, 0)),
+        ToggleItem("Save FPS", ["30", "50"], selected=_choice_index(["30", "50"], str(default_save_fps), 0)),
+        ToggleItem("State Mode", ["j6", "yaw"], selected=_choice_index(["j6", "yaw"], default_state_mode, 0)),
         ToggleItem(
             "Task",
             ["pick_and_place", "open_and_close"],
             selected=_choice_index(["pick_and_place", "open_and_close"], default_task, 0),
         ),
-        ToggleItem("Save FPS", ["30", "50"], selected=_choice_index(["30", "50"], str(default_save_fps), 0)),
-        ToggleItem("State Mode", ["j6", "yaw"], selected=_choice_index(["j6", "yaw"], default_state_mode, 0)),
+        TextItem("Auto Episodes", str(max(1, int(default_auto_episodes)))),
         SeparatorItem(),
         StartItem(">>> Start Collection <<<"),
     ]
 
-    selectable_rows = [r for r in rows if not isinstance(r, SeparatorItem)]
-    n_selectable = len(selectable_rows)
     cursor = 0
     status_line = ""
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
+
+    def _render_collect(status: str) -> str:
+        return _render(
+            rows,
+            cursor,
+            status,
+            title="=== OpenPI Data Collector ===",
+            help_line="Up/Down: navigate  Left/Right/Enter: toggle  Enter on Start: go  q: quit",
+            disabled_labels=_collect_disabled_labels(rows),
+        )
+
     try:
         tty.setraw(fd)
         sys.stdout.write(HIDE_CURSOR)
-        sys.stdout.write(
-            _render(
-                rows,
-                cursor,
-                status_line,
-                title="=== OpenPI Data Collector ===",
-                help_line="Up/Down: navigate  Left/Right/Enter: toggle  Enter on Start: go  q: quit",
-            )
-        )
+        sys.stdout.write(_render_collect(status_line))
         sys.stdout.flush()
 
         while True:
+            selectable_rows = _collect_selectable_rows(rows)
+            n_selectable = len(selectable_rows)
+            cursor = min(cursor, max(0, n_selectable - 1))
             key = _read_key(fd)
             if not key:
                 continue
@@ -508,15 +542,7 @@ def run_collect_tui_config(
                     current_row.editing = True
                     current_row._edit_buf = current_row.value
                     status_line = "Type new value, Enter to confirm, Esc to cancel"
-                    sys.stdout.write(
-                        _render(
-                            rows,
-                            cursor,
-                            status_line,
-                            title="=== OpenPI Data Collector ===",
-                            help_line="Up/Down: navigate  Left/Right/Enter: toggle  Enter on Start: go  q: quit",
-                        )
-                    )
+                    sys.stdout.write(_render_collect(status_line))
                     sys.stdout.flush()
                     while True:
                         ekey = _read_key(fd)
@@ -532,15 +558,7 @@ def run_collect_tui_config(
                             current_row._edit_buf += ekey
                         else:
                             continue
-                        sys.stdout.write(
-                            _render(
-                                rows,
-                                cursor,
-                                status_line,
-                                title="=== OpenPI Data Collector ===",
-                                help_line="Up/Down: navigate  Left/Right/Enter: toggle  Enter on Start: go  q: quit",
-                            )
-                        )
+                        sys.stdout.write(_render_collect(status_line))
                         sys.stdout.flush()
                     current_row.editing = False
                     status_line = ""
@@ -551,15 +569,10 @@ def run_collect_tui_config(
                     else:
                         return cfg
 
-            sys.stdout.write(
-                _render(
-                    rows,
-                    cursor,
-                    status_line,
-                    title="=== OpenPI Data Collector ===",
-                    help_line="Up/Down: navigate  Left/Right/Enter: toggle  Enter on Start: go  q: quit",
-                )
-            )
+            selectable_rows = _collect_selectable_rows(rows)
+            n_selectable = len(selectable_rows)
+            cursor = min(cursor, max(0, n_selectable - 1))
+            sys.stdout.write(_render_collect(status_line))
             sys.stdout.flush()
 
     finally:

@@ -4,7 +4,8 @@ Real-robot data collection script for OpenPI pick-up training.
 
 Workflow (each episode):
   1. [NOT recorded] Preparation phase: seed red/green/blue cubes from origin to random non-overlapping (x, y)
-  2. [RECORDED raw @ 30Hz, saved @ 50Hz] Pick one cube in red->green->blue order: move above, lower, grasp, lift
+  2. [RECORDED raw @ 30Hz, saved @ 30Hz or optionally resampled to 50Hz] Pick one cube in red->green->blue order:
+     move above, lower, grasp, lift
   3. [NOT recorded] Randomly place the held cube back into the workspace, then return home
   4. Save the recorded episode with auto-generated prompt "pick up the <color> cube"
 
@@ -63,10 +64,9 @@ STATE_FILE_NAME = ".collect_state.json"
 # Data collection parameters
 RAW_CAPTURE_FPS = 30
 CONTROL_DT = 1.0 / RAW_CAPTURE_FPS
-SAVE_FPS = 50
-SAVE_CONTROL_DT = 1.0 / SAVE_FPS
 IMAGE_SIZE = 224
-BASE_FPS = SAVE_FPS
+DEFAULT_SAVE_FPS = RAW_CAPTURE_FPS
+UPSAMPLED_SAVE_FPS = 50
 
 # Motion speed (Cartesian linear velocity, m/s)
 LINEAR_SPEED = 0.10
@@ -74,6 +74,8 @@ DEFAULT_ASYNC_MOVE_TIMEOUT_S = 30.0
 DEFAULT_J6_SPEED_RADPS = float(np.deg2rad(10.0))
 DEFAULT_J6_MOVE_SPEED_DEG = 10.0
 DEFAULT_J6_MOVE_ACC_DEG = 20.0
+ROTATE_ABS_DEG_MIN = 12.0
+ROTATE_ABS_DEG_MAX = 22.5
 
 
 def _maybe_reexec_into_repo_venv() -> None:
@@ -637,12 +639,16 @@ def execute_joint6_rotation(
     ensure_joint_move_ok(result, f"rotate joint6 to {float(target_joint6):.6f}rad")
 
 
-def resample_episode_to_50hz(
+def prepare_episode_for_save(
     frames: list[RecordedFrame],
+    *,
+    save_fps: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Resample raw 30Hz episode frames onto a uniform 50Hz grid."""
+    """Convert raw episode frames onto the target save grid."""
     if not frames:
         raise RuntimeError("no frames to resample")
+    if save_fps not in (RAW_CAPTURE_FPS, UPSAMPLED_SAVE_FPS):
+        raise ValueError(f"unsupported save_fps={save_fps}, expected {RAW_CAPTURE_FPS} or {UPSAMPLED_SAVE_FPS}")
 
     raw_times = np.array([float(frame.timestamp) for frame in frames], dtype=np.float64)
     raw_pose6 = np.stack([np.asarray(frame.sim_pose6, dtype=np.float64).reshape(6) for frame in frames], axis=0)
@@ -651,9 +657,25 @@ def resample_episode_to_50hz(
     raw_main_images = np.stack([frame.main_image for frame in frames], axis=0)
     raw_wrist_images = np.stack([frame.wrist_image for frame in frames], axis=0)
 
-    target_count = max(1, int(round((len(frames) - 1) * SAVE_FPS / RAW_CAPTURE_FPS)) + 1)
+    if save_fps == RAW_CAPTURE_FPS:
+        target_count = len(frames)
+        env_steps = np.arange(target_count, dtype=np.int64)
+        target_times = env_steps.astype(np.float32) * np.float32(1.0 / RAW_CAPTURE_FPS)
+        states = np.zeros((target_count, 8), dtype=np.float32)
+        pose6_saved = raw_pose6.astype(np.float32, copy=True)
+        gripper_saved = raw_gripper.astype(np.float32, copy=True)
+        joint6_saved = raw_joint6.astype(np.float32, copy=True)
+        main_images = raw_main_images.copy()
+        wrist_images = raw_wrist_images.copy()
+        for out_idx in range(target_count):
+            states[out_idx] = build_state8(pose6_saved[out_idx], gripper_saved[out_idx], joint6_saved[out_idx])
+        actions = compute_delta_actions(pose6_saved, gripper_saved, joint6_saved)
+        return states, actions, target_times.astype(np.float32), env_steps, main_images, wrist_images
+
+    save_control_dt = 1.0 / float(save_fps)
+    target_count = max(1, int(round((len(frames) - 1) * save_fps / RAW_CAPTURE_FPS)) + 1)
     env_steps = np.arange(target_count, dtype=np.int64)
-    target_times = env_steps.astype(np.float32) * np.float32(SAVE_CONTROL_DT)
+    target_times = env_steps.astype(np.float32) * np.float32(save_control_dt)
 
     states = np.zeros((target_count, 8), dtype=np.float32)
     pose6_resampled = np.zeros((target_count, 6), dtype=np.float32)
@@ -713,7 +735,7 @@ def resample_episode_to_50hz(
 # Saving
 # ---------------------------------------------------------------------------
 
-def save_episode(frames: list[RecordedFrame], save_dir: Path, prompt: str) -> Path:
+def save_episode(frames: list[RecordedFrame], save_dir: Path, prompt: str, *, save_fps: int) -> Path:
     """Save a recorded episode to disk."""
     from support.pose_align import get_alignment_mode
 
@@ -728,7 +750,10 @@ def save_episode(frames: list[RecordedFrame], save_dir: Path, prompt: str) -> Pa
     episode_dir = save_dir / f"episode_{episode_id:04d}"
     episode_dir.mkdir(parents=True, exist_ok=True)
 
-    states, actions, timestamps, env_steps, main_images, wrist_images = resample_episode_to_50hz(frames)
+    states, actions, timestamps, env_steps, main_images, wrist_images = prepare_episode_for_save(
+        frames,
+        save_fps=save_fps,
+    )
 
     np.save(episode_dir / "states.npy", states)
     np.save(episode_dir / "actions.npy", actions)
@@ -742,14 +767,15 @@ def save_episode(frames: list[RecordedFrame], save_dir: Path, prompt: str) -> Pa
 
     metadata = {
         "task": prompt,
-        "fps": BASE_FPS,
-        "nominal_fps": float(BASE_FPS),
+        "fps": int(save_fps),
+        "nominal_fps": float(save_fps),
         "n_frames": int(states.shape[0]),
         "image_size": [IMAGE_SIZE, IMAGE_SIZE],
         "record_every": 1,
-        "base_fps": BASE_FPS,
+        "base_fps": int(save_fps),
+        "source_fps": int(RAW_CAPTURE_FPS),
         "image_format": "npz",
-        "sampling_mode": "global_env_step_with_event_frames",
+        "sampling_mode": "raw_capture_no_resample" if save_fps == RAW_CAPTURE_FPS else "resampled_global_env_step_with_event_frames",
         "timestamp_mode": "env_step_times_control_dt",
         "timestamps_file": "timestamps.npy",
         "env_steps_file": "env_steps.npy",
@@ -762,7 +788,10 @@ def save_episode(frames: list[RecordedFrame], save_dir: Path, prompt: str) -> Pa
     with open(episode_dir / "metadata.json", "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
 
-    print(f"  Episode {episode_id} saved: {episode_dir} (raw {len(frames)} -> saved {states.shape[0]} frames)")
+    print(
+        f"  Episode {episode_id} saved: {episode_dir} "
+        f"(raw {len(frames)} -> saved {states.shape[0]} frames @ {save_fps}Hz)"
+    )
     return episode_dir
 
 
@@ -777,6 +806,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=str, default=str(SCRIPT_DIR / "data"))
     parser.add_argument("--max-episodes", type=int, default=0)
     parser.add_argument("--speed", type=float, default=LINEAR_SPEED)
+    parser.add_argument("--save-fps", type=int, choices=(RAW_CAPTURE_FPS, UPSAMPLED_SAVE_FPS), default=DEFAULT_SAVE_FPS)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--gripper-timeout", type=float, default=10.0)
     parser.add_argument("--pose-frame", type=str, choices=("sim", "real"), default="sim")
@@ -832,14 +862,15 @@ def main() -> int:
         workspace_y_max=WORKSPACE_Y_MAX,
         min_spacing_m=MIN_CUBE_SPACING_M,
         object_height_m=CUBE_HEIGHT_M,
-        rotate_deg_min=-22.5,
-        rotate_deg_max=22.5,
+        rotate_deg_min=ROTATE_ABS_DEG_MIN,
+        rotate_deg_max=ROTATE_ABS_DEG_MAX,
     )
 
     print("\nTask: random pick/place")
     print(f"Data dir: {save_dir}")
     print(f"Raw capture FPS: {RAW_CAPTURE_FPS}")
-    print(f"Saved dataset FPS: {BASE_FPS}")
+    print(f"Saved dataset FPS: {args.save_fps}")
+    print(f"Resample mode: {'off' if args.save_fps == RAW_CAPTURE_FPS else f'{RAW_CAPTURE_FPS}->{args.save_fps}'}")
     print(f"Speed: {LINEAR_SPEED} m/s")
     print(f"Dry-run: {args.dry_run}")
     print(f"Pose frame: {get_alignment_mode()}")
@@ -878,6 +909,7 @@ def main() -> int:
             "open gripper before collection",
         )
 
+    default_joint6_rad = float(REAL_INIT_QPOS_RAD[5])
     z_grasp = MIN_TCP_Z
     z_above = z_grasp + APPROACH_HEIGHT
     episode_count = 0
@@ -940,6 +972,9 @@ def main() -> int:
     def z_for_place_level(level: int) -> float:
         return float(z_for_pick_level(level) + PLACE_HEIGHT_OFFSET_M)
 
+    def j6_target_from_deg(deg: float) -> float:
+        return float(default_joint6_rad + np.deg2rad(float(deg)))
+
     def sample_initial_object_state(name: str) -> dict[str, object]:
         occupied = [origin_xy.copy()]
         for existing_name in scene_state.keys():
@@ -953,7 +988,8 @@ def main() -> int:
             deg = 0.0
         else:
             is_rotate = True
-            deg = float(np.random.uniform(planner_config.rotate_deg_min, planner_config.rotate_deg_max))
+            abs_deg = float(np.random.uniform(planner_config.rotate_deg_min, planner_config.rotate_deg_max))
+            deg = -abs_deg if np.random.random() < 0.5 else abs_deg
         return {
             "xy": [float(xy[0]), float(xy[1])],
             "is_rotate": bool(is_rotate),
@@ -971,7 +1007,7 @@ def main() -> int:
         if args.dry_run:
             dummy_count = 12 + (3 if step.is_rotate else 0)
             sim_pose = real_pose_to_sim(home_real)
-            joint6 = np.deg2rad(step.deg) if step.is_rotate else 0.0
+            joint6 = j6_target_from_deg(step.deg) if step.is_rotate else default_joint6_rad
             for idx in range(dummy_count):
                 step_frames.append(
                     RecordedFrame(
@@ -1005,7 +1041,7 @@ def main() -> int:
         if step.is_rotate:
             seg = execute_joint6_rotation_and_record(
                 cameras,
-                target_joint6=float(np.deg2rad(step.deg)),
+                target_joint6=j6_target_from_deg(step.deg),
                 gripper=1.0,
                 start_frame_idx=frame_idx,
             )
@@ -1052,12 +1088,12 @@ def main() -> int:
         step_frames: list[RecordedFrame] = []
         must_align_support = step.support_name is not None
         should_align_joint6 = step.object_name != APPLE_NAME and (step.is_rotate or must_align_support)
-        target_joint6_rad = float(np.deg2rad(step.deg))
+        target_joint6_rad = j6_target_from_deg(step.deg)
 
         if args.dry_run:
             dummy_count = 10 + (3 if should_align_joint6 else 0)
             sim_pose = real_pose_to_sim(home_real)
-            joint6 = target_joint6_rad if should_align_joint6 else 0.0
+            joint6 = target_joint6_rad if should_align_joint6 else default_joint6_rad
             for idx in range(dummy_count):
                 step_frames.append(
                     RecordedFrame(
@@ -1248,7 +1284,7 @@ def main() -> int:
             if not all_frames:
                 raise RuntimeError("recorded episode produced no frames")
 
-            save_episode(all_frames, save_dir, plan.prompt)
+            save_episode(all_frames, save_dir, plan.prompt, save_fps=args.save_fps)
             episode_count += 1
             task_index += 1
 

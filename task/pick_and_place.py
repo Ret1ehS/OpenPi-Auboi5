@@ -10,7 +10,7 @@ APPLE_NAME = "apple"
 OBJECT_ORDER = ("red", "green", "blue", APPLE_NAME)
 PICK_TASK_PROBABILITY = 0.20
 NON_ROTATED_TABLE_PLACE_PROBABILITY = 0.70
-DEFAULT_ROTATE_DEG_MIN = -22.5
+DEFAULT_ROTATE_DEG_MIN = 12.0
 DEFAULT_ROTATE_DEG_MAX = 22.5
 LOCAL_CLEAR_INITIAL_RADIUS_M = 0.10
 LOCAL_CLEAR_RADIUS_EXPAND_M = 0.15
@@ -469,7 +469,9 @@ def sample_random_orientation(object_name: str, *, config: PlannerConfig) -> tup
         return False, 0.0
     if np.random.random() < float(config.non_rotated_table_place_probability):
         return False, 0.0
-    return True, float(np.random.uniform(config.rotate_deg_min, config.rotate_deg_max))
+    abs_deg = float(np.random.uniform(config.rotate_deg_min, config.rotate_deg_max))
+    sign = -1.0 if np.random.random() < 0.5 else 1.0
+    return True, sign * abs_deg
 
 
 def sample_global_xy(

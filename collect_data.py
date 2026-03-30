@@ -76,7 +76,6 @@ DEFAULT_ASYNC_MOVE_TIMEOUT_S = 30.0
 DEFAULT_J6_SPEED_RADPS = float(np.deg2rad(10.0))
 DEFAULT_J6_MOVE_SPEED_DEG = 10.0
 DEFAULT_J6_MOVE_ACC_DEG = 20.0
-JOINT6_ALIGN_DEADBAND_RAD = float(np.deg2rad(1.0))
 ROTATE_ABS_DEG_MIN = 12.0
 ROTATE_ABS_DEG_MAX = 22.5
 
@@ -1006,13 +1005,14 @@ def main() -> int:
             "open gripper before collection",
         )
 
-    default_joint6_rad = float(REAL_INIT_QPOS_RAD[5])
     z_grasp = MIN_TCP_Z
     z_above = z_grasp + APPROACH_HEIGHT
     episode_count = 0
     scene_state: dict[str, dict[str, object]] = {}
     task_index = 0
     skip_prep = False
+    joint_q_init = np.asarray(snap.joint_q, dtype=np.float64).reshape(-1)
+    default_joint6_rad = float(joint_q_init[5]) if joint_q_init.size >= 6 else float(REAL_INIT_QPOS_RAD[5])
 
     # --- Check for saved state ---
     saved = saved_state_preview
@@ -1042,10 +1042,13 @@ def main() -> int:
         print("\n  Resume selected, but no saved state exists. Starting fresh.")
 
     def refresh_home_pose() -> np.ndarray:
-        nonlocal home_real, origin_xy
+        nonlocal home_real, origin_xy, default_joint6_rad
         snap_local = get_robot_snapshot()
         set_runtime_alignment(snap_local.tcp_pose)
         home_real = np.asarray(snap_local.tcp_pose, dtype=np.float64).reshape(6).copy()
+        joint_q_local = np.asarray(snap_local.joint_q, dtype=np.float64).reshape(-1)
+        if joint_q_local.size >= 6:
+            default_joint6_rad = float(joint_q_local[5])
         origin_xy = home_real[:2].copy()
         return home_real.copy()
 
@@ -1108,9 +1111,7 @@ def main() -> int:
         above_z = target_z + APPROACH_HEIGHT
         step_frames: list[RecordedFrame] = []
         target_joint6_rad = j6_target_from_deg(step.deg)
-        should_align_joint6 = bool(
-            step.align_j6 and abs(_wrap_angle(current_joint6_rad() - target_joint6_rad)) > JOINT6_ALIGN_DEADBAND_RAD
-        )
+        should_align_joint6 = bool(step.align_j6)
 
         if args.dry_run:
             dummy_count = 12 + (3 if should_align_joint6 else 0)
@@ -1195,9 +1196,7 @@ def main() -> int:
         above_z = target_z + APPROACH_HEIGHT
         step_frames: list[RecordedFrame] = []
         target_joint6_rad = j6_target_from_deg(step.deg)
-        should_align_joint6 = bool(
-            step.align_j6 and abs(_wrap_angle(current_joint6_rad() - target_joint6_rad)) > JOINT6_ALIGN_DEADBAND_RAD
-        )
+        should_align_joint6 = bool(step.align_j6)
 
         if args.dry_run:
             dummy_count = 10 + (3 if should_align_joint6 else 0)

@@ -23,6 +23,7 @@ Saved format for the AUBO OpenPI pipeline:
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import sys
@@ -1035,6 +1036,44 @@ def main() -> int:
         print("Prompt mode:  alternating ('open the storage box' / 'close the storage box')")
         print("Task mix:     open / close alternating by episode")
 
+    cameras: CameraPair | None = None
+    daemon = None
+    episode_count = 0
+    scene_state: dict[str, dict[str, object]] = {}
+    open_close_reference: OpenCloseReference | None = None
+    task_index = 0
+    cleanup_state = {"done": False}
+
+    def cleanup_collection() -> None:
+        if cleanup_state["done"]:
+            return
+        cleanup_state["done"] = True
+        if selected_task == "pick_and_place" and scene_state:
+            save_collect_state(save_dir, scene_state, task_index, episode_count)
+            print(f"  State saved to {_state_file_path(save_dir)}")
+        elif selected_task == "open_and_close" and open_close_reference is not None:
+            save_collect_state(
+                save_dir,
+                {},
+                task_index,
+                episode_count,
+                open_close_reference=open_close_reference,
+            )
+            print(f"  State saved to {_state_file_path(save_dir)}")
+        if daemon is not None:
+            try:
+                stop_motion_and_confirm(daemon, "collect_data cleanup")
+            except Exception:
+                pass
+            try:
+                daemon.stop()
+            except Exception:
+                pass
+        if cameras is not None:
+            cameras.stop()
+
+    atexit.register(cleanup_collection)
+
     print("Compiling C++ helpers...")
     build_joint_helper()
     build_tcp_helper()
@@ -1042,6 +1081,11 @@ def main() -> int:
     print("Initializing cameras...")
     cameras = CameraPair()
     daemon = _get_motion_daemon()
+    try:
+        startup_stop_resp = daemon.stop_motion()
+        print(f"  Best-effort startup stop: {startup_stop_resp}")
+    except Exception as exc:
+        print(f"  Best-effort startup stop skipped: {exc}")
     startup_snap = get_robot_snapshot()
     startup_tcp_pose = np.asarray(startup_snap.tcp_pose, dtype=np.float64).reshape(6).copy()
 
@@ -1069,10 +1113,6 @@ def main() -> int:
         )
 
     z_grasp = MIN_TCP_Z
-    episode_count = 0
-    scene_state: dict[str, dict[str, object]] = {}
-    open_close_reference: OpenCloseReference | None = None
-    task_index = 0
     skip_prep = False
     default_joint6_rad = float(DEFAULT_J6_HOME_RAD)
     local_exec_joint6_rad = float(DEFAULT_J6_HOME_RAD)
@@ -1649,27 +1689,7 @@ def main() -> int:
         print(f"\nERROR: {exc}")
         return 1
     finally:
-        if selected_task == "pick_and_place" and scene_state:
-            save_collect_state(save_dir, scene_state, task_index, episode_count)
-            print(f"  State saved to {_state_file_path(save_dir)}")
-        elif selected_task == "open_and_close" and open_close_reference is not None:
-            save_collect_state(
-                save_dir,
-                {},
-                task_index,
-                episode_count,
-                open_close_reference=open_close_reference,
-            )
-            print(f"  State saved to {_state_file_path(save_dir)}")
-        try:
-            stop_motion_and_confirm(daemon, "collect_data cleanup")
-        except Exception:
-            pass
-        try:
-            daemon.stop()
-        except Exception:
-            pass
-        cameras.stop()
+        cleanup_collection()
 
     print("Done.")
     return 0

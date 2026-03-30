@@ -318,7 +318,7 @@ def _build_pick_plan(scene: SceneState, source_name: str, *, config: PlannerConf
             level=0,
             is_rotate=post_is_rotate,
             deg=post_deg,
-            align_j6=bool(source_name != APPLE_NAME),
+            align_j6=_should_align_j6(source_name, is_rotate=post_is_rotate),
             note=f"post-place {source_name}",
         )
     ]
@@ -354,7 +354,7 @@ def _build_place_plan(scene: SceneState, source_name: str, target_name: str, *, 
             level=place_level,
             is_rotate=place_is_rotate,
             deg=place_deg,
-            align_j6=bool(source_name != APPLE_NAME),
+            align_j6=_should_align_j6(source_name, is_rotate=place_is_rotate),
             note=f"place {source_name} on {target_name}",
             support_name=actual_support,
         )
@@ -412,7 +412,7 @@ def _plan_clear_above(
 
 def _make_pick_step(scene: SceneState, object_name: str, *, note: str) -> TaskStep:
     obj = scene.get(object_name)
-    should_align_j6 = bool(object_name != APPLE_NAME and obj.is_rotate)
+    should_align_j6 = _should_align_j6(object_name, is_rotate=obj.is_rotate)
     return TaskStep(
         kind="pick",
         object_name=object_name,
@@ -450,6 +450,10 @@ def _make_place_step(
         note=note,
         support_name=support_name if target_name is not None else None,
     )
+
+
+def _should_align_j6(object_name: str, *, is_rotate: bool) -> bool:
+    return bool(object_name != APPLE_NAME and is_rotate)
 
 
 def _resolve_place_orientation(scene: SceneState, source_name: str, support_name: str) -> tuple[bool, float]:

@@ -16,6 +16,7 @@ using namespace arcs::common_interface;
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
+constexpr int kMoveJointBusyRet = -4;
 
 struct Options {
     std::string robot_ip = "192.168.1.100";
@@ -155,6 +156,34 @@ int wait_for_motion_idle(RobotInterfacePtr robot, MotionControlPtr motion, int t
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     return -1;
+}
+
+int preclear_motion_queue(RobotInterfacePtr robot, MotionControlPtr motion, const char *phase, bool force_stop)
+{
+    auto state = robot->getRobotState();
+    const int exec_id_before = motion->getExecId();
+    const bool steady_before = state->isSteady();
+    const bool should_stop = force_stop || exec_id_before != -1 || !steady_before;
+
+    std::cout << phase << "_exec_id_before=" << exec_id_before << std::endl;
+    std::cout << phase << "_steady_before=" << steady_before << std::endl;
+    std::cout << phase << "_should_stop=" << should_stop << std::endl;
+
+    int stop_ret = 0;
+    if (should_stop) {
+        stop_ret = motion->stopMove(true, true);
+    }
+    const int clear_path_ret = motion->clearPath();
+    const int wait_idle_ret = wait_for_motion_idle(robot, motion, 1000);
+
+    std::cout << phase << "_stop_move_ret=" << stop_ret << std::endl;
+    std::cout << phase << "_clear_path_ret=" << clear_path_ret << std::endl;
+    std::cout << phase << "_wait_idle_ret=" << wait_idle_ret << std::endl;
+
+    state = robot->getRobotState();
+    std::cout << phase << "_exec_id_after=" << motion->getExecId() << std::endl;
+    std::cout << phase << "_steady_after=" << state->isSteady() << std::endl;
+    return wait_idle_ret;
 }
 
 int clear_abnormal_state_sdk(RobotInterfacePtr robot, MotionControlPtr motion, RobotManagePtr manage)
@@ -311,21 +340,19 @@ int main(int argc, char **argv)
     std::cout << "acc_deg=" << opt.acc_deg << std::endl;
     std::cout << "speed_fraction=" << opt.speed_fraction << std::endl;
 
-    // Refresh state after ensure_robot_ready, then stop any in-flight motion
-    // (e.g. from daemon's movel_async on a separate connection) before moveJoint
-    state = robot->getRobotState();
-    if (motion->getExecId() != -1 || !state->isSteady()) {
-        motion->stopMove(true, true);
-        auto steady_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
-        while (std::chrono::steady_clock::now() < steady_deadline) {
-            state = robot->getRobotState();
-            if (motion->getExecId() == -1 && state->isSteady()) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-    }
+    // Clear any leftover queued path from prior async motion before moveJoint.
+    preclear_motion_queue(robot, motion, "pre_move", false);
 
     motion->setSpeedFraction(opt.speed_fraction);
     int move_ret = motion->moveJoint(opt.joint_target, acc_rad, speed_rad, 0.0, 0.0);
+    std::cout << "moveJoint_first_ret=" << move_ret << std::endl;
+    if (move_ret == kMoveJointBusyRet) {
+        std::cout << "moveJoint_busy_retry=1" << std::endl;
+        preclear_motion_queue(robot, motion, "busy_retry", true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        move_ret = motion->moveJoint(opt.joint_target, acc_rad, speed_rad, 0.0, 0.0);
+        std::cout << "moveJoint_retry_ret=" << move_ret << std::endl;
+    }
     std::cout << "moveJoint_ret=" << move_ret << std::endl;
     if (move_ret != 0) {
         rpc_cli->logout();

@@ -56,18 +56,7 @@ class TaskStep:
     deg: float
     note: str
     support_name: str | None = None
-    align_j6: bool | None = None
-
-    def __post_init__(self) -> None:
-        if self.align_j6 is None:
-            if self.kind == "pick":
-                self.align_j6 = True
-            elif self.kind == "place":
-                self.align_j6 = self.object_name != APPLE_NAME
-            else:
-                self.align_j6 = False
-        else:
-            self.align_j6 = bool(self.align_j6)
+    align_j6: bool = False
 
 
 @dataclass
@@ -328,6 +317,7 @@ def _build_pick_plan(scene: SceneState, source_name: str, *, config: PlannerConf
             level=0,
             is_rotate=post_is_rotate,
             deg=post_deg,
+            align_j6=bool(source_name != APPLE_NAME),
             note=f"post-place {source_name}",
         )
     ]
@@ -363,6 +353,7 @@ def _build_place_plan(scene: SceneState, source_name: str, target_name: str, *, 
             level=place_level,
             is_rotate=place_is_rotate,
             deg=place_deg,
+            align_j6=bool(source_name != APPLE_NAME),
             note=f"place {source_name} on {target_name}",
             support_name=actual_support,
         )
@@ -411,6 +402,7 @@ def _plan_clear_above(
             level=0,
             is_rotate=False,
             deg=0.0,
+            align_j6=bool(upper_name != APPLE_NAME),
             note=f"place cleared {upper_name} to table",
         )
     )
@@ -419,6 +411,7 @@ def _plan_clear_above(
 
 def _make_pick_step(scene: SceneState, object_name: str, *, note: str) -> TaskStep:
     obj = scene.get(object_name)
+    should_align_j6 = bool(object_name != APPLE_NAME and obj.is_rotate)
     return TaskStep(
         kind="pick",
         object_name=object_name,
@@ -426,6 +419,7 @@ def _make_pick_step(scene: SceneState, object_name: str, *, note: str) -> TaskSt
         level=scene.depth(object_name),
         is_rotate=bool(obj.is_rotate),
         deg=0.0 if not obj.is_rotate else float(obj.deg),
+        align_j6=should_align_j6,
         note=note,
     )
 
@@ -439,6 +433,7 @@ def _make_place_step(
     level: int,
     is_rotate: bool,
     deg: float,
+    align_j6: bool,
     note: str,
     support_name: str | None = None,
 ) -> TaskStep:
@@ -450,6 +445,7 @@ def _make_place_step(
         level=int(level),
         is_rotate=bool(is_rotate),
         deg=0.0 if not is_rotate else float(deg),
+        align_j6=bool(align_j6),
         note=note,
         support_name=support_name if target_name is not None else None,
     )

@@ -50,6 +50,7 @@ WORKSPACE_Y_MAX = 0.30
 # Heights
 GRASP_HEIGHT_MM = 180.0
 MIN_TCP_Z = GRASP_HEIGHT_MM / 1000.0
+PLACE_HEIGHT_OFFSET_M = 0.005
 APPROACH_HEIGHT = 0.15
 
 # Object placement
@@ -933,8 +934,11 @@ def main() -> int:
             return refresh_home_pose()
         origin_xy = home_real[:2].copy()
         return home_real.copy()
-    def z_for_level(level: int) -> float:
+    def z_for_pick_level(level: int) -> float:
         return float(z_grasp + CUBE_HEIGHT_M * max(0, int(level)))
+
+    def z_for_place_level(level: int) -> float:
+        return float(z_for_pick_level(level) + PLACE_HEIGHT_OFFSET_M)
 
     def sample_initial_object_state(name: str) -> dict[str, object]:
         occupied = [origin_xy.copy()]
@@ -960,7 +964,7 @@ def main() -> int:
 
     def execute_pick_step(step: TaskStep, *, record: bool, frame_idx: int) -> tuple[list[RecordedFrame], int]:
         target_xy = np.asarray(step.xy, dtype=np.float64).reshape(2)
-        target_z = z_for_level(step.level)
+        target_z = z_for_pick_level(step.level)
         above_z = target_z + APPROACH_HEIGHT
         step_frames: list[RecordedFrame] = []
 
@@ -1043,7 +1047,7 @@ def main() -> int:
 
     def execute_place_step(step: TaskStep, *, record: bool, frame_idx: int) -> tuple[list[RecordedFrame], int]:
         target_xy = np.asarray(step.xy, dtype=np.float64).reshape(2)
-        target_z = z_for_level(step.level)
+        target_z = z_for_place_level(step.level)
         above_z = target_z + APPROACH_HEIGHT
         step_frames: list[RecordedFrame] = []
         must_align_support = step.support_name is not None

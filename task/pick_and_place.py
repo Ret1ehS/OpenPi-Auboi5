@@ -12,10 +12,11 @@ PICK_TASK_PROBABILITY = 0.20
 NON_ROTATED_TABLE_PLACE_PROBABILITY = 0.70
 DEFAULT_ROTATE_DEG_MIN = 12.0
 DEFAULT_ROTATE_DEG_MAX = 22.5
-LOCAL_CLEAR_INITIAL_RADIUS_M = 0.10
-LOCAL_CLEAR_RADIUS_EXPAND_M = 0.15
+DEFAULT_J6_HOME_RAD = 0.11434
+LOCAL_CLEAR_INITIAL_RADIUS_M = 0.15
+LOCAL_CLEAR_RADIUS_EXPAND_M = 0.0
 LOCAL_CLEAR_POINTS_PER_RETRY = 8
-LOCAL_CLEAR_MAX_RETRIES = 5
+LOCAL_CLEAR_MAX_RETRIES = 1
 
 
 @dataclass(frozen=True)
@@ -126,7 +127,7 @@ class SceneState:
             if xy is None:
                 return None
             if "j6" in raw:
-                deg = float(np.rad2deg(float(raw.get("j6", 0.0))))
+                deg = float(np.rad2deg(float(raw.get("j6", 0.0)) - DEFAULT_J6_HOME_RAD))
                 is_rotate = abs(deg) > 1e-6 and name != APPLE_NAME
             else:
                 deg = float(raw.get("deg", 0.0))

@@ -58,7 +58,7 @@ APPROACH_HEIGHT = 0.15
 
 # Object placement
 CUBE_HEIGHT_M = 0.05
-MIN_CUBE_SPACING_M = 0.08
+MIN_CUBE_SPACING_M = 0.10
 MAX_XY_SAMPLE_ATTEMPTS = 512
 QUIT_TOKENS = {"q", "quit", "exit"}
 STATE_FILE_NAME = ".collect_state.json"
@@ -77,6 +77,7 @@ DEFAULT_J6_SPEED_RADPS = float(np.deg2rad(10.0))
 DEFAULT_J6_MOVE_SPEED_DEG = 10.0
 DEFAULT_J6_MOVE_ACC_DEG = 20.0
 DEFAULT_J6_HOME_RAD = 0.11434
+DEFAULT_J6_EXEC_TOL_RAD = float(np.deg2rad(1.0))
 ROTATE_ABS_DEG_MIN = 12.0
 ROTATE_ABS_DEG_MAX = 22.5
 
@@ -591,7 +592,6 @@ def execute_joint6_rotation_and_record(
     speed_deg: float = DEFAULT_J6_MOVE_SPEED_DEG,
     acc_deg: float = DEFAULT_J6_MOVE_ACC_DEG,
     timeout_s: float = DEFAULT_ASYNC_MOVE_TIMEOUT_S,
-    joint6_tol_rad: float = float(np.deg2rad(1.0)),
 ) -> list[RecordedFrame]:
     """Rotate joint6 in joint space and record real observations at 30Hz."""
     from support.joint_control import move_to_joint_positions
@@ -641,7 +641,7 @@ def execute_joint6_rotation_and_record(
             )
         )
 
-        done = (not worker.is_alive()) and abs(_wrap_angle(actual_joint6 - float(target_joint6))) <= joint6_tol_rad
+        done = not worker.is_alive()
         if done:
             break
         if outcome["error"] is not None:
@@ -649,7 +649,7 @@ def execute_joint6_rotation_and_record(
         if time.monotonic() > deadline:
             raise RuntimeError(
                 f"joint6 rotation timed out after {timeout_s:.1f}s "
-                f"(target_joint6={float(target_joint6):.6f}, actual_joint6={actual_joint6:.6f})"
+                f"(target_joint6={float(target_joint6):.6f}, last_joint6={actual_joint6:.6f})"
             )
 
         frame_idx += 1
@@ -1013,6 +1013,7 @@ def main() -> int:
     task_index = 0
     skip_prep = False
     default_joint6_rad = float(DEFAULT_J6_HOME_RAD)
+    local_exec_joint6_rad = float(DEFAULT_J6_HOME_RAD)
 
     # --- Check for saved state ---
     saved = saved_state_preview
@@ -1055,13 +1056,15 @@ def main() -> int:
         return build_pose_at_xy(live_base, x, y, z)
 
     def return_home(label: str) -> np.ndarray:
-        nonlocal home_real, origin_xy
+        nonlocal home_real, origin_xy, local_exec_joint6_rad
         if not args.dry_run:
             ensure_joint_move_ok(
                 move_to_joint_positions(REAL_INIT_QPOS_RAD, execute=True),
                 label,
             )
+            local_exec_joint6_rad = float(DEFAULT_J6_HOME_RAD)
             return refresh_home_pose()
+        local_exec_joint6_rad = float(DEFAULT_J6_HOME_RAD)
         origin_xy = home_real[:2].copy()
         return home_real.copy()
     def z_for_pick_level(level: int) -> float:
@@ -1073,11 +1076,12 @@ def main() -> int:
     def j6_target_from_deg(deg: float) -> float:
         return float(default_joint6_rad + np.deg2rad(float(deg)))
 
-    def current_joint6_rad() -> float:
-        joint_q = np.asarray(get_robot_snapshot().joint_q, dtype=np.float64).reshape(-1)
-        if joint_q.size >= 6:
-            return float(joint_q[5])
-        return float(default_joint6_rad)
+    def should_align_joint6_for_step(step: TaskStep) -> tuple[bool, float]:
+        target_joint6_rad = j6_target_from_deg(step.deg)
+        need_align = bool(step.align_j6) and (
+            abs(_wrap_angle(local_exec_joint6_rad - target_joint6_rad)) > DEFAULT_J6_EXEC_TOL_RAD
+        )
+        return need_align, target_joint6_rad
 
     def sample_initial_object_state(name: str) -> dict[str, object]:
         occupied = [origin_xy.copy()]
@@ -1103,17 +1107,17 @@ def main() -> int:
         }
 
     def execute_pick_step(step: TaskStep, *, record: bool, frame_idx: int) -> tuple[list[RecordedFrame], int]:
+        nonlocal local_exec_joint6_rad
         target_xy = np.asarray(step.xy, dtype=np.float64).reshape(2)
         target_z = z_for_pick_level(step.level)
         above_z = target_z + APPROACH_HEIGHT
         step_frames: list[RecordedFrame] = []
-        target_joint6_rad = j6_target_from_deg(step.deg)
-        should_align_joint6 = bool(step.align_j6)
+        should_align_joint6, target_joint6_rad = should_align_joint6_for_step(step)
 
         if args.dry_run:
             dummy_count = 12 + (3 if should_align_joint6 else 0)
             sim_pose = real_pose_to_sim(home_real)
-            joint6 = target_joint6_rad if should_align_joint6 else default_joint6_rad
+            joint6 = target_joint6_rad if should_align_joint6 else local_exec_joint6_rad
             for idx in range(dummy_count):
                 step_frames.append(
                     RecordedFrame(
@@ -1125,6 +1129,8 @@ def main() -> int:
                         timestamp=(frame_idx + idx) * CONTROL_DT,
                     )
                 )
+            if should_align_joint6:
+                local_exec_joint6_rad = target_joint6_rad
             return step_frames, frame_idx + len(step_frames)
 
         print(
@@ -1154,6 +1160,7 @@ def main() -> int:
             if record:
                 step_frames.extend(seg)
             frame_idx += len(seg)
+            local_exec_joint6_rad = target_joint6_rad
 
         down_pose = build_pose_from_live_orientation(float(target_xy[0]), float(target_xy[1]), float(target_z))
         seg = execute_and_record(
@@ -1188,17 +1195,17 @@ def main() -> int:
         return step_frames, frame_idx
 
     def execute_place_step(step: TaskStep, *, record: bool, frame_idx: int) -> tuple[list[RecordedFrame], int]:
+        nonlocal local_exec_joint6_rad
         target_xy = np.asarray(step.xy, dtype=np.float64).reshape(2)
         target_z = z_for_place_level(step.level)
         above_z = target_z + APPROACH_HEIGHT
         step_frames: list[RecordedFrame] = []
-        target_joint6_rad = j6_target_from_deg(step.deg)
-        should_align_joint6 = bool(step.align_j6)
+        should_align_joint6, target_joint6_rad = should_align_joint6_for_step(step)
 
         if args.dry_run:
             dummy_count = 10 + (3 if should_align_joint6 else 0)
             sim_pose = real_pose_to_sim(home_real)
-            joint6 = target_joint6_rad if should_align_joint6 else default_joint6_rad
+            joint6 = target_joint6_rad if should_align_joint6 else local_exec_joint6_rad
             for idx in range(dummy_count):
                 step_frames.append(
                     RecordedFrame(
@@ -1210,6 +1217,8 @@ def main() -> int:
                         timestamp=(frame_idx + idx) * CONTROL_DT,
                     )
                 )
+            if should_align_joint6:
+                local_exec_joint6_rad = target_joint6_rad
             return step_frames, frame_idx + len(step_frames)
 
         print(
@@ -1239,6 +1248,7 @@ def main() -> int:
             if record:
                 step_frames.extend(seg)
             frame_idx += len(seg)
+            local_exec_joint6_rad = target_joint6_rad
 
         down_pose = build_pose_from_live_orientation(float(target_xy[0]), float(target_xy[1]), float(target_z))
         seg = execute_and_record(
@@ -1319,6 +1329,7 @@ def main() -> int:
                     level=0,
                     is_rotate=False,
                     deg=0.0,
+                    align_j6=False,
                     note=f"prep pick {object_name}",
                 )
                 place_step = TaskStep(
@@ -1328,6 +1339,7 @@ def main() -> int:
                     level=0,
                     is_rotate=bool(placed_state["is_rotate"]),
                     deg=float(placed_state["deg"]),
+                    align_j6=bool(object_name != APPLE_NAME and bool(placed_state["is_rotate"])),
                     note=f"prep place {object_name}",
                 )
                 _, held_after_prep = execute_step_sequence([pick_step, place_step], record=False)

@@ -76,6 +76,7 @@ DEFAULT_ASYNC_MOVE_TIMEOUT_S = 30.0
 DEFAULT_J6_SPEED_RADPS = float(np.deg2rad(10.0))
 DEFAULT_J6_MOVE_SPEED_DEG = 10.0
 DEFAULT_J6_MOVE_ACC_DEG = 20.0
+DEFAULT_J6_HOME_RAD = 0.11434
 ROTATE_ABS_DEG_MIN = 12.0
 ROTATE_ABS_DEG_MAX = 22.5
 
@@ -1011,8 +1012,7 @@ def main() -> int:
     scene_state: dict[str, dict[str, object]] = {}
     task_index = 0
     skip_prep = False
-    joint_q_init = np.asarray(snap.joint_q, dtype=np.float64).reshape(-1)
-    default_joint6_rad = float(joint_q_init[5]) if joint_q_init.size >= 6 else float(REAL_INIT_QPOS_RAD[5])
+    default_joint6_rad = float(DEFAULT_J6_HOME_RAD)
 
     # --- Check for saved state ---
     saved = saved_state_preview
@@ -1042,13 +1042,10 @@ def main() -> int:
         print("\n  Resume selected, but no saved state exists. Starting fresh.")
 
     def refresh_home_pose() -> np.ndarray:
-        nonlocal home_real, origin_xy, default_joint6_rad
+        nonlocal home_real, origin_xy
         snap_local = get_robot_snapshot()
         set_runtime_alignment(snap_local.tcp_pose)
         home_real = np.asarray(snap_local.tcp_pose, dtype=np.float64).reshape(6).copy()
-        joint_q_local = np.asarray(snap_local.joint_q, dtype=np.float64).reshape(-1)
-        if joint_q_local.size >= 6:
-            default_joint6_rad = float(joint_q_local[5])
         origin_xy = home_real[:2].copy()
         return home_real.copy()
 

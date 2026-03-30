@@ -1183,8 +1183,9 @@ def main() -> int:
         target_z = z_for_place_level(step.level)
         above_z = target_z + APPROACH_HEIGHT
         step_frames: list[RecordedFrame] = []
-        must_align_support = step.support_name is not None
-        should_align_joint6 = step.object_name != APPLE_NAME and (step.is_rotate or must_align_support)
+        must_align_support = step.support_name is not None and step.object_name != APPLE_NAME
+        must_reset_table_joint6 = step.support_name is None and (not step.is_rotate) and abs(float(step.deg)) <= 1e-6
+        should_align_joint6 = bool(step.is_rotate or must_align_support or must_reset_table_joint6)
         target_joint6_rad = j6_target_from_deg(step.deg)
 
         if args.dry_run:

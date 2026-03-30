@@ -53,8 +53,8 @@ WORKSPACE_Y_MAX = 0.26
 # Heights
 GRASP_HEIGHT_MM = 180.0
 MIN_TCP_Z = GRASP_HEIGHT_MM / 1000.0
+APPROACH_Z_OFFSET_M = 0.20
 PLACE_HEIGHT_OFFSET_M = 0.0
-APPROACH_HEIGHT = 0.15
 
 # Object placement
 CUBE_HEIGHT_M = 0.05
@@ -1069,7 +1069,6 @@ def main() -> int:
         )
 
     z_grasp = MIN_TCP_Z
-    z_above = z_grasp + APPROACH_HEIGHT
     episode_count = 0
     scene_state: dict[str, dict[str, object]] = {}
     open_close_reference: OpenCloseReference | None = None
@@ -1206,7 +1205,7 @@ def main() -> int:
         nonlocal local_exec_joint6_rad
         target_xy = np.asarray(step.xy, dtype=np.float64).reshape(2)
         target_z = z_for_pick_level(step.level)
-        above_z = target_z + APPROACH_HEIGHT
+        above_z = z_grasp + APPROACH_Z_OFFSET_M
         step_frames: list[RecordedFrame] = []
         should_align_joint6, target_joint6_rad = should_align_joint6_for_step(step)
 
@@ -1294,7 +1293,7 @@ def main() -> int:
         nonlocal local_exec_joint6_rad
         target_xy = np.asarray(step.xy, dtype=np.float64).reshape(2)
         target_z = z_for_place_level(step.level)
-        above_z = target_z + APPROACH_HEIGHT
+        above_z = z_grasp + APPROACH_Z_OFFSET_M
         step_frames: list[RecordedFrame] = []
         should_align_joint6, target_joint6_rad = should_align_joint6_for_step(step)
 

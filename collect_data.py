@@ -1046,11 +1046,14 @@ def main() -> int:
         target_z = z_for_level(step.level)
         above_z = target_z + APPROACH_HEIGHT
         step_frames: list[RecordedFrame] = []
+        must_align_support = step.support_name is not None
+        should_align_joint6 = step.object_name != APPLE_NAME and (step.is_rotate or must_align_support)
+        target_joint6_rad = float(np.deg2rad(step.deg))
 
         if args.dry_run:
-            dummy_count = 10 + (3 if step.is_rotate else 0)
+            dummy_count = 10 + (3 if should_align_joint6 else 0)
             sim_pose = real_pose_to_sim(home_real)
-            joint6 = np.deg2rad(step.deg) if step.is_rotate else 0.0
+            joint6 = target_joint6_rad if should_align_joint6 else 0.0
             for idx in range(dummy_count):
                 step_frames.append(
                     RecordedFrame(
@@ -1081,10 +1084,10 @@ def main() -> int:
             step_frames.extend(seg)
         frame_idx += len(seg)
 
-        if step.is_rotate:
+        if should_align_joint6:
             seg = execute_joint6_rotation_and_record(
                 cameras,
-                target_joint6=float(np.deg2rad(step.deg)),
+                target_joint6=target_joint6_rad,
                 gripper=0.0,
                 start_frame_idx=frame_idx,
             )

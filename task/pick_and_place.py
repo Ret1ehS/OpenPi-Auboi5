@@ -479,11 +479,21 @@ def sample_global_xy(
     exclude_names: set[str] | None = None,
 ) -> np.ndarray:
     occupied = scene.occupied_positions(exclude_names=exclude_names)
+    x_min, x_max = _workspace_axis_bounds(
+        float(config.workspace_x_min),
+        float(config.workspace_x_max),
+        float(config.min_spacing_m),
+    )
+    y_min, y_max = _workspace_axis_bounds(
+        float(config.workspace_y_min),
+        float(config.workspace_y_max),
+        float(config.min_spacing_m),
+    )
     for _ in range(512):
         candidate = np.array(
             [
-                np.random.uniform(config.workspace_x_min, config.workspace_x_max),
-                np.random.uniform(config.workspace_y_min, config.workspace_y_max),
+                np.random.uniform(x_min, x_max),
+                np.random.uniform(y_min, y_max),
             ],
             dtype=np.float64,
         )
@@ -522,10 +532,27 @@ def _is_far_enough(candidate: np.ndarray, occupied: list[np.ndarray], min_spacin
 
 
 def _inside_workspace(candidate: np.ndarray, config: PlannerConfig) -> bool:
-    return (
-        float(config.workspace_x_min) <= float(candidate[0]) <= float(config.workspace_x_max)
-        and float(config.workspace_y_min) <= float(candidate[1]) <= float(config.workspace_y_max)
+    x_min, x_max = _workspace_axis_bounds(
+        float(config.workspace_x_min),
+        float(config.workspace_x_max),
+        float(config.min_spacing_m),
     )
+    y_min, y_max = _workspace_axis_bounds(
+        float(config.workspace_y_min),
+        float(config.workspace_y_max),
+        float(config.min_spacing_m),
+    )
+    return (
+        x_min <= float(candidate[0]) <= x_max
+        and y_min <= float(candidate[1]) <= y_max
+    )
+
+
+def _workspace_axis_bounds(axis_min: float, axis_max: float, min_spacing_m: float) -> tuple[float, float]:
+    edge_margin = max(0.0, float(min_spacing_m) * 0.5)
+    half_span = max(0.0, (float(axis_max) - float(axis_min)) * 0.5 - 1e-6)
+    effective_margin = min(edge_margin, half_span)
+    return float(axis_min) + effective_margin, float(axis_max) - effective_margin
 
 
 def _normalize_xy_tuple(xy: Any) -> tuple[float, float]:

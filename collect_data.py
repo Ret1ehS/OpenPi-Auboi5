@@ -367,6 +367,43 @@ def _normalize_held_object(value: object) -> str | None:
     return None
 
 
+def _load_raw_state_payload(data_dir: Path) -> dict:
+    path = _state_file_path(data_dir)
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _serialize_open_close_reference(reference: OpenCloseReference) -> dict[str, object]:
+    return {
+        "x_start": float(reference.x_start),
+        "y_start": float(reference.y_start),
+        "reference_pose6": [
+            float(v)
+            for v in np.asarray(reference.reference_pose6, dtype=np.float64).reshape(6).tolist()
+        ],
+    }
+
+
+def _deserialize_open_close_reference(payload: object) -> OpenCloseReference | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        ref_pose = np.asarray(payload.get("reference_pose6", []), dtype=np.float64).reshape(6).copy()
+        return OpenCloseReference(
+            x_start=float(payload.get("x_start", ref_pose[0])),
+            y_start=float(payload.get("y_start", ref_pose[1])),
+            reference_pose6=ref_pose,
+        )
+    except Exception:
+        return None
+
+
 def save_collect_state(
     data_dir: Path,
     scene_state: dict[str, dict[str, object]],
@@ -376,21 +413,24 @@ def save_collect_state(
     held_object: str | None = None,
     open_close_reference: OpenCloseReference | None = None,
 ) -> None:
-    payload = {
-        "object_states": scene_state,
-        "color_index": int(color_index),
-        "episode_count": int(episode_count),
-        "held_object": _normalize_held_object(held_object),
-    }
-    if open_close_reference is not None:
-        payload["open_close_reference"] = {
-            "x_start": float(open_close_reference.x_start),
-            "y_start": float(open_close_reference.y_start),
-            "z_base": float(open_close_reference.z_base),
-            "reference_pose6": [
-                float(v)
-                for v in np.asarray(open_close_reference.reference_pose6, dtype=np.float64).reshape(6).tolist()
-            ],
+    payload = _load_raw_state_payload(data_dir)
+    legacy_open_close_reference = _deserialize_open_close_reference(payload.get("open_close_reference"))
+    if "open_close_state" not in payload and legacy_open_close_reference is not None:
+        legacy_open_close_episode_count = _load_state_counter(payload, "episode_count")
+        payload["open_close_state"] = {
+            "episode_count": 0 if legacy_open_close_episode_count is None else legacy_open_close_episode_count,
+            "reference": _serialize_open_close_reference(legacy_open_close_reference),
+        }
+    payload.pop("open_close_reference", None)
+    if open_close_reference is None:
+        payload["object_states"] = scene_state
+        payload["color_index"] = int(color_index)
+        payload["episode_count"] = int(episode_count)
+        payload["held_object"] = _normalize_held_object(held_object)
+    else:
+        payload["open_close_state"] = {
+            "episode_count": int(episode_count),
+            "reference": _serialize_open_close_reference(open_close_reference),
         }
     path = _state_file_path(data_dir)
     with open(path, "w", encoding="utf-8") as fh:
@@ -417,32 +457,29 @@ def load_collect_state(data_dir: Path) -> dict | None:
     if not path.exists():
         return None
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            payload = json.load(fh)
-        if not isinstance(payload, dict):
+        payload = _load_raw_state_payload(data_dir)
+        if not payload:
             return None
         scene_payload = payload.get("object_states")
         if scene_payload is None:
             scene_payload = payload
         scene_state = load_scene_state(scene_payload)
         open_close_reference: OpenCloseReference | None = None
-        open_close_payload = payload.get("open_close_reference")
+        open_close_episode_count: int | None = None
+        open_close_payload = payload.get("open_close_state")
         if isinstance(open_close_payload, dict):
-            try:
-                ref_pose = np.asarray(open_close_payload.get("reference_pose6", []), dtype=np.float64).reshape(6).copy()
-                open_close_reference = OpenCloseReference(
-                    x_start=float(open_close_payload.get("x_start", ref_pose[0])),
-                    y_start=float(open_close_payload.get("y_start", ref_pose[1])),
-                    z_base=float(open_close_payload.get("z_base", ref_pose[2])),
-                    reference_pose6=ref_pose,
-                )
-            except Exception:
-                open_close_reference = None
+            open_close_episode_count = _load_state_counter(open_close_payload, "episode_count")
+            open_close_reference = _deserialize_open_close_reference(open_close_payload.get("reference"))
+        if open_close_reference is None:
+            open_close_reference = _deserialize_open_close_reference(payload.get("open_close_reference"))
+            if open_close_reference is not None:
+                open_close_episode_count = _load_state_counter(payload, "episode_count")
         color_index = _load_state_counter(payload, "color_index")
         episode_count = _load_state_counter(payload, "episode_count")
         held_object = _normalize_held_object(payload.get("held_object"))
         has_valid_counters = color_index is not None and episode_count is not None
-        if scene_state is None and open_close_reference is None and not has_valid_counters:
+        has_valid_open_close_episode_count = open_close_episode_count is not None
+        if scene_state is None and open_close_reference is None and not has_valid_counters and not has_valid_open_close_episode_count:
             return None
         return {
             "scene_state": scene_state or {},
@@ -450,6 +487,8 @@ def load_collect_state(data_dir: Path) -> dict | None:
             "episode_count": 0 if episode_count is None else episode_count,
             "held_object": held_object,
             "has_valid_counters": has_valid_counters,
+            "open_close_episode_count": 0 if open_close_episode_count is None else open_close_episode_count,
+            "has_valid_open_close_episode_count": has_valid_open_close_episode_count,
             "open_close_reference": open_close_reference,
         }
     except Exception:
@@ -460,6 +499,20 @@ def clear_collect_state(data_dir: Path) -> None:
     path = _state_file_path(data_dir)
     if path.exists():
         path.unlink()
+
+
+def clear_open_close_state(data_dir: Path) -> None:
+    path = _state_file_path(data_dir)
+    if not path.exists():
+        return
+    payload = _load_raw_state_payload(data_dir)
+    if not payload:
+        clear_collect_state(data_dir)
+        return
+    payload.pop("open_close_state", None)
+    payload.pop("open_close_reference", None)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
 
 
 def build_pose_at_xy(base_pose: np.ndarray, x: float, y: float, z: float) -> np.ndarray:
@@ -1077,8 +1130,8 @@ def main() -> int:
         print("Prompt mode:  auto random ('pick up ...' / 'put ... on ...')")
         print("Task mix:     20% pick / 80% place")
     else:
-        print("Prompt mode:  alternating ('open the storage box' / 'close the storage box')")
-        print("Task mix:     open / close alternating by episode")
+        print("Prompt mode:  fixed ('open and close the storage box')")
+        print("Task mix:     each episode runs open, then close")
 
     saved_held_object = _normalize_held_object(saved_state_preview.get("held_object")) if saved_state_preview else None
     if selected_task == "pick_and_place" and resume_mode == "continue" and saved_held_object is not None:
@@ -1211,29 +1264,27 @@ def main() -> int:
     else:
         if resume_mode == "reset":
             if saved is not None:
-                clear_collect_state(save_dir)
-                print("\n  State cleared. Open/close reference will be re-captured from current TCP.")
+                clear_open_close_state(save_dir)
+                print("\n  Open/close state cleared. Reference will be re-captured from current TCP.")
         elif resume_mode == "continue":
             if saved is None:
                 print("\n  Resume selected, but no saved state exists. Open/close reference will use startup TCP.")
             else:
-                task_index = int(saved.get("color_index", 0))
-                episode_count = int(saved.get("episode_count", 0))
+                episode_count = int(saved.get("open_close_episode_count", 0))
                 saved_reference = saved.get("open_close_reference")
                 if isinstance(saved_reference, OpenCloseReference):
                     open_close_reference = saved_reference
                     print(
                         "\n  Found saved open/close reference: "
                         f"x_start={open_close_reference.x_start:.4f}, "
-                        f"y_start={open_close_reference.y_start:.4f}, "
-                        f"z_base={open_close_reference.z_base:.4f}"
+                        f"y_start={open_close_reference.y_start:.4f}"
                     )
                     print(f"  Resuming with saved open/close reference (episode_count={episode_count}).")
                 else:
-                    if saved.get("has_valid_counters", False):
+                    if saved.get("has_valid_open_close_episode_count", False):
                         print(
                             "\n  Restored open/close counters from saved state: "
-                            f"task_index={task_index}, episode_count={episode_count}."
+                            f"episode_count={episode_count}."
                         )
                     print(
                         "  Saved state has no reusable open/close reference. "
@@ -1741,8 +1792,7 @@ def main() -> int:
             print(
                 "  Captured open reference: "
                 f"x_start={open_close_reference.x_start:.4f}, "
-                f"y_start={open_close_reference.y_start:.4f}, "
-                f"z_base={open_close_reference.z_base:.4f}"
+                f"y_start={open_close_reference.y_start:.4f}"
             )
             save_collect_state(
                 save_dir,
@@ -1757,14 +1807,10 @@ def main() -> int:
             print(
                 "Using saved open reference: "
                 f"x_start={open_close_reference.x_start:.4f}, "
-                f"y_start={open_close_reference.y_start:.4f}, "
-                f"z_base={open_close_reference.z_base:.4f}"
+                f"y_start={open_close_reference.y_start:.4f}"
             )
 
-    if selected_task == "open_and_close":
-        max_ep = episode_count + 1
-    else:
-        max_ep = auto_episodes if auto_episodes > 0 else args.max_episodes
+    max_ep = auto_episodes if auto_episodes > 0 else args.max_episodes
 
     print("\n=== Ready For Episodes ===")
     if auto_episodes > 0:
@@ -1774,7 +1820,7 @@ def main() -> int:
     if selected_task == "pick_and_place":
         print("Task policy: 20% pick / 80% place")
     else:
-        print("Task policy: open, close, open, close ...")
+        print("Task policy: each episode performs open, then close")
         print("Gripper policy: always open (no close/open action during episode)")
     print("Quit with q / quit / exit.\n")
 
@@ -1803,7 +1849,8 @@ def main() -> int:
                     raise RuntimeError("open/close reference is not initialized")
                 plan = build_open_and_close_episode_plan(
                     reference=open_close_reference,
-                    episode_index=episode_count,
+                    target_z=float(MIN_TCP_Z + 0.20),
+                    press_z=float(MIN_TCP_Z + 0.05),
                     workspace_x_min=WORKSPACE_X_MIN,
                     workspace_x_max=WORKSPACE_X_MAX,
                     workspace_y_min=WORKSPACE_Y_MIN,
@@ -1857,9 +1904,9 @@ def main() -> int:
                 state_mode=collect_state_mode,
             )
             episode_count += 1
-            task_index += 1
 
             if selected_task == "pick_and_place":
+                task_index += 1
                 if plan.post_steps:
                     _, held_after_post = execute_step_sequence(
                         plan.post_steps,

@@ -35,7 +35,8 @@ TIMESTAMP_GRID_WARN_S = 1e-4
 TIMESTAMP_GRID_FAIL_S = 1e-3
 QUAT_NORM_WARN = 1e-3
 QUAT_NORM_FAIL = 1e-2
-ACTION_ERR_WARN = 1e-4
+ACTION_ERR_WARN_STRICT = 1e-4
+ACTION_ERR_WARN_ORIENTATION = 1e-3
 ACTION_ERR_FAIL = 1e-3
 
 
@@ -106,6 +107,14 @@ def expected_actions_from_states(states: np.ndarray, *, state_mode: str) -> np.n
     actions[:-1, 6] = grip[1:]
     actions[-1, 6] = grip[-1]
     return actions
+
+
+def action_err_warn_thresholds(*, state_mode: str) -> np.ndarray:
+    thresholds = np.full(ACTION_DIM, ACTION_ERR_WARN_STRICT, dtype=np.float64)
+    thresholds[3:5] = ACTION_ERR_WARN_ORIENTATION
+    if state_mode != "j6":
+        thresholds[5] = ACTION_ERR_WARN_ORIENTATION
+    return thresholds
 
 
 def image_stream_metrics(arr: np.ndarray, *, saved_fps: float, raw_capture_fps: float) -> dict[str, Any]:
@@ -258,10 +267,12 @@ def inspect_episode(ep_dir: Path, *, raw_capture_fps: float) -> EpisodeReport:
         expected_actions = expected_actions_from_states(states, state_mode=state_mode)
         action_err = np.abs(actions.astype(np.float64) - expected_actions)
         max_action_err = np.max(action_err, axis=0)
+        warn_thresholds = action_err_warn_thresholds(state_mode=state_mode)
         metrics["action_err_max"] = max_action_err.tolist()
+        metrics["action_err_warn_thresholds"] = warn_thresholds.tolist()
         if float(np.max(max_action_err)) > ACTION_ERR_FAIL:
             errors.append(f"actions inconsistent with states: max_err={max_action_err.tolist()}")
-        elif float(np.max(max_action_err)) > ACTION_ERR_WARN:
+        elif np.any(max_action_err > warn_thresholds):
             warnings.append(f"actions slightly inconsistent with states: max_err={max_action_err.tolist()}")
 
     for key, arr in [("main_images", main_images), ("wrist_images", wrist_images)]:

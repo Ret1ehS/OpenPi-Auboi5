@@ -109,7 +109,7 @@
 
 脚本路径：
 
-- [check_dataset_health.py](/home/orin/openpi/scripts/data/check_dataset_health.py)
+- [check_data.py](/home/orin/openpi/scripts/data/check_data.py)
 
 
 ### 3.4 坐标系对齐
@@ -221,7 +221,7 @@
 
 ### 4.3 数据质检流程
 
-数据质检由 [check_dataset_health.py](/home/orin/openpi/scripts/data/check_dataset_health.py) 负责，当前流程如下：
+数据质检由 [check_data.py](/home/orin/openpi/scripts/data/check_data.py) 负责，当前流程如下：
 
 1. 扫描 `data/episode_*`
 2. 逐个读取数组与 metadata
@@ -486,7 +486,7 @@
 
 文件：
 
-- [check_dataset_health.py](/home/orin/openpi/scripts/data/check_dataset_health.py)
+- [check_data.py](/home/orin/openpi/scripts/data/check_data.py)
 
 职责：
 

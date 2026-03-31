@@ -9,7 +9,7 @@ import numpy as np
 APPLE_NAME = "apple"
 OBJECT_ORDER = ("red", "green", "blue", APPLE_NAME)
 PICK_TASK_PROBABILITY = 0.20
-NON_ROTATED_TABLE_PLACE_PROBABILITY = 0.30
+NON_ROTATED_TABLE_PLACE_PROBABILITY = 0.0
 DEFAULT_ROTATE_DEG_MIN = 12.0
 DEFAULT_ROTATE_DEG_MAX = 22.5
 DEFAULT_J6_HOME_RAD = 0.11434
@@ -43,6 +43,7 @@ class ObjectState:
     xy: tuple[float, float]
     is_rotate: bool
     deg: float
+    standard_j6_rad: float | None = None
     upper: str | None = None
     lower: str | None = None
 
@@ -102,11 +103,19 @@ class SceneState:
             xy = raw.get("xy")
             if xy is None:
                 return None
+            is_rotate = bool(raw.get("is_rotate", False))
+            deg = float(raw.get("deg", 0.0))
+            standard_j6_rad = _normalize_optional_j6(raw.get("standard_j6_rad"))
+            if name == APPLE_NAME:
+                is_rotate = False
+                deg = 0.0
+                standard_j6_rad = None
             objects[name] = ObjectState(
                 name=name,
                 xy=_normalize_xy_tuple(xy),
-                is_rotate=bool(raw.get("is_rotate", False)),
-                deg=float(raw.get("deg", 0.0)),
+                is_rotate=is_rotate,
+                deg=deg,
+                standard_j6_rad=standard_j6_rad if is_rotate else None,
                 upper=_normalize_link(raw.get("upper")),
                 lower=_normalize_link(raw.get("lower")),
             )
@@ -127,19 +136,23 @@ class SceneState:
             if xy is None:
                 return None
             if "j6" in raw:
-                deg = float(np.rad2deg(float(raw.get("j6", 0.0)) - DEFAULT_J6_HOME_RAD))
+                saved_j6 = _normalize_optional_j6(raw.get("j6"))
+                deg = float(np.rad2deg(float(saved_j6 or 0.0) - DEFAULT_J6_HOME_RAD))
                 is_rotate = abs(deg) > 1e-6 and name != APPLE_NAME
             else:
+                saved_j6 = _normalize_optional_j6(raw.get("standard_j6_rad"))
                 deg = float(raw.get("deg", 0.0))
                 is_rotate = bool(raw.get("is_rotate", False))
             if name == APPLE_NAME:
                 deg = 0.0
                 is_rotate = False
+                saved_j6 = None
             objects[name] = ObjectState(
                 name=name,
                 xy=_normalize_xy_tuple(xy),
                 is_rotate=is_rotate,
                 deg=deg,
+                standard_j6_rad=saved_j6 if is_rotate else None,
                 upper=_normalize_link(raw.get("upper")),
                 lower=_normalize_link(raw.get("lower")),
             )
@@ -153,6 +166,7 @@ class SceneState:
                     xy=tuple(obj.xy),
                     is_rotate=bool(obj.is_rotate),
                     deg=float(obj.deg),
+                    standard_j6_rad=None if obj.standard_j6_rad is None else float(obj.standard_j6_rad),
                     upper=obj.upper,
                     lower=obj.lower,
                 )
@@ -166,6 +180,7 @@ class SceneState:
                 "xy": [float(obj.xy[0]), float(obj.xy[1])],
                 "is_rotate": bool(obj.is_rotate),
                 "deg": 0.0 if not obj.is_rotate else float(obj.deg),
+                "standard_j6_rad": None if (name == APPLE_NAME or not obj.is_rotate or obj.standard_j6_rad is None) else float(obj.standard_j6_rad),
                 "upper": obj.upper,
                 "lower": obj.lower,
             }
@@ -225,9 +240,11 @@ class SceneState:
         if name == APPLE_NAME:
             obj.is_rotate = False
             obj.deg = 0.0
+            obj.standard_j6_rad = None
         else:
             obj.is_rotate = bool(is_rotate)
             obj.deg = 0.0 if not is_rotate else float(deg)
+            obj.standard_j6_rad = None
         obj.lower = None
 
     def place_on_target(self, name: str, target_name: str, *, is_rotate: bool, deg: float) -> str:
@@ -241,9 +258,11 @@ class SceneState:
         if name == APPLE_NAME:
             obj.is_rotate = False
             obj.deg = 0.0
+            obj.standard_j6_rad = None
         else:
             obj.is_rotate = bool(is_rotate)
             obj.deg = 0.0 if not is_rotate else float(deg)
+            obj.standard_j6_rad = None
         obj.lower = actual_target
         self.objects[actual_target].upper = name
         return actual_target
@@ -582,6 +601,15 @@ def _normalize_link(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text if text else None
+
+
+def _normalize_optional_j6(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 __all__ = [

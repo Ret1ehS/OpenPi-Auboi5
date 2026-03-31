@@ -327,18 +327,60 @@ def get_object_deg(scene_state: dict[str, dict[str, object]], name: str) -> floa
     return float(scene_state[name]["deg"])
 
 
+def get_object_standard_j6_rad(scene_state: dict[str, dict[str, object]], name: str) -> float | None:
+    raw = scene_state.get(name, {}).get("standard_j6_rad")
+    if raw is None:
+        return None
+    try:
+        return _normalize_j6(float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def set_object_standard_j6_rad(
+    scene_state: dict[str, dict[str, object]],
+    name: str,
+    joint6_rad: float | None,
+) -> None:
+    state = scene_state.get(name)
+    if not isinstance(state, dict):
+        return
+    if name == APPLE_NAME or not bool(state.get("is_rotate", False)) or joint6_rad is None:
+        state["standard_j6_rad"] = None
+        return
+    state["standard_j6_rad"] = float(_normalize_j6(joint6_rad))
+
+
+def clone_scene_state(scene_state: dict[str, dict[str, object]]) -> dict[str, dict[str, object]]:
+    cloned = load_scene_state(scene_state)
+    if cloned is None:
+        raise RuntimeError("invalid scene_state payload")
+    return cloned
+
+
+def _normalize_held_object(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text in OBJECT_ORDER:
+        return text
+    return None
+
+
 def save_collect_state(
     data_dir: Path,
     scene_state: dict[str, dict[str, object]],
     color_index: int,
     episode_count: int,
     *,
+    held_object: str | None = None,
     open_close_reference: OpenCloseReference | None = None,
 ) -> None:
     payload = {
         "object_states": scene_state,
         "color_index": int(color_index),
         "episode_count": int(episode_count),
+        "held_object": _normalize_held_object(held_object),
     }
     if open_close_reference is not None:
         payload["open_close_reference"] = {
@@ -398,6 +440,7 @@ def load_collect_state(data_dir: Path) -> dict | None:
                 open_close_reference = None
         color_index = _load_state_counter(payload, "color_index")
         episode_count = _load_state_counter(payload, "episode_count")
+        held_object = _normalize_held_object(payload.get("held_object"))
         has_valid_counters = color_index is not None and episode_count is not None
         if scene_state is None and open_close_reference is None and not has_valid_counters:
             return None
@@ -405,6 +448,7 @@ def load_collect_state(data_dir: Path) -> dict | None:
             "scene_state": scene_state or {},
             "color_index": 0 if color_index is None else color_index,
             "episode_count": 0 if episode_count is None else episode_count,
+            "held_object": held_object,
             "has_valid_counters": has_valid_counters,
             "open_close_reference": open_close_reference,
         }
@@ -1036,10 +1080,19 @@ def main() -> int:
         print("Prompt mode:  alternating ('open the storage box' / 'close the storage box')")
         print("Task mix:     open / close alternating by episode")
 
+    saved_held_object = _normalize_held_object(saved_state_preview.get("held_object")) if saved_state_preview else None
+    if selected_task == "pick_and_place" and resume_mode == "continue" and saved_held_object is not None:
+        raise RuntimeError(
+            f"saved state indicates the gripper is still holding '{saved_held_object}'. "
+            "Please manually restore the scene and restart with resume=reset."
+        )
+
     cameras: CameraPair | None = None
     daemon = None
     episode_count = 0
     scene_state: dict[str, dict[str, object]] = {}
+    cleanup_scene_state: dict[str, dict[str, object]] | None = None
+    runtime_held_object: str | None = None
     open_close_reference: OpenCloseReference | None = None
     task_index = 0
     cleanup_state = {"done": False}
@@ -1048,8 +1101,15 @@ def main() -> int:
         if cleanup_state["done"]:
             return
         cleanup_state["done"] = True
-        if selected_task == "pick_and_place" and scene_state:
-            save_collect_state(save_dir, scene_state, task_index, episode_count)
+        latest_scene_state = cleanup_scene_state if cleanup_scene_state is not None else scene_state
+        if selected_task == "pick_and_place" and latest_scene_state:
+            save_collect_state(
+                save_dir,
+                latest_scene_state,
+                task_index,
+                episode_count,
+                held_object=runtime_held_object,
+            )
             print(f"  State saved to {_state_file_path(save_dir)}")
         elif selected_task == "open_and_close" and open_close_reference is not None:
             save_collect_state(
@@ -1133,7 +1193,10 @@ def main() -> int:
                     f"    {name}: xy=({xy[0]:.4f}, {xy[1]:.4f}), "
                     f"is_rotate={is_rotate}, deg={deg:.1f}, upper={upper}, lower={lower}"
                 )
-            print(f"    task_index={saved['color_index']}, episode_count={saved['episode_count']}")
+            print(
+                f"    task_index={saved['color_index']}, episode_count={saved['episode_count']}, "
+                f"held_object={_normalize_held_object(saved.get('held_object'))}"
+            )
             if resume_mode == "reset":
                 clear_collect_state(save_dir)
                 print("  State cleared. Starting fresh.")
@@ -1211,8 +1274,35 @@ def main() -> int:
     def j6_target_from_deg(deg: float) -> float:
         return float(default_joint6_rad + np.deg2rad(float(deg)))
 
-    def should_align_joint6_for_step(step: TaskStep) -> tuple[bool, float]:
+    def resolve_step_target_joint6_rad(
+        step: TaskStep,
+        lookup_scene_state: dict[str, dict[str, object]],
+    ) -> float:
         target_joint6_rad = j6_target_from_deg(step.deg)
+        if step.object_name == APPLE_NAME or not step.is_rotate:
+            return target_joint6_rad
+
+        reference_name: str | None
+        if step.kind == "pick":
+            reference_name = step.object_name
+        elif step.support_name is not None:
+            reference_name = step.support_name
+        else:
+            reference_name = None
+
+        if reference_name is None:
+            return target_joint6_rad
+
+        saved_joint6_rad = get_object_standard_j6_rad(lookup_scene_state, reference_name)
+        if saved_joint6_rad is None:
+            return target_joint6_rad
+        return saved_joint6_rad
+
+    def should_align_joint6_for_step(
+        step: TaskStep,
+        lookup_scene_state: dict[str, dict[str, object]],
+    ) -> tuple[bool, float]:
+        target_joint6_rad = resolve_step_target_joint6_rad(step, lookup_scene_state)
         need_align = bool(step.align_j6) and (
             abs(_wrap_angle(local_exec_joint6_rad - target_joint6_rad)) > DEFAULT_J6_EXEC_TOL_RAD
         )
@@ -1237,17 +1327,76 @@ def main() -> int:
             "xy": [float(xy[0]), float(xy[1])],
             "is_rotate": bool(is_rotate),
             "deg": float(deg),
+            "standard_j6_rad": None,
             "upper": None,
             "lower": None,
         }
 
-    def execute_pick_step(step: TaskStep, *, record: bool, frame_idx: int) -> tuple[list[RecordedFrame], int]:
+    def scene_top_of(state: dict[str, dict[str, object]], name: str) -> str:
+        current = name
+        seen: set[str] = set()
+        while True:
+            upper = state[current].get("upper")
+            if upper is None:
+                return current
+            if current in seen:
+                raise RuntimeError(f"cycle detected while following upper chain from {name}")
+            seen.add(current)
+            current = str(upper)
+
+    def scene_detach_top(state: dict[str, dict[str, object]], name: str) -> None:
+        obj = state[name]
+        upper = obj.get("upper")
+        if upper is not None:
+            raise RuntimeError(f"cannot detach {name}: upper={upper} still present")
+        lower = obj.get("lower")
+        if lower is not None:
+            state[str(lower)]["upper"] = None
+        obj["lower"] = None
+
+    def scene_place_object(state: dict[str, dict[str, object]], step: TaskStep) -> None:
+        obj = state[step.object_name]
+        if obj.get("upper") is not None:
+            raise RuntimeError(f"cannot place {step.object_name}: upper={obj.get('upper')} still present")
+        if step.support_name is None:
+            obj["xy"] = [float(step.xy[0]), float(step.xy[1])]
+            obj["lower"] = None
+        else:
+            actual_support = scene_top_of(state, step.support_name)
+            if actual_support == APPLE_NAME:
+                raise RuntimeError("apple cannot receive an upper object")
+            obj["xy"] = list(state[actual_support]["xy"])
+            obj["lower"] = actual_support
+            state[actual_support]["upper"] = step.object_name
+        if step.object_name == APPLE_NAME:
+            obj["is_rotate"] = False
+            obj["deg"] = 0.0
+            obj["standard_j6_rad"] = None
+        else:
+            obj["is_rotate"] = bool(step.is_rotate)
+            obj["deg"] = 0.0 if not step.is_rotate else float(step.deg)
+
+    def commit_place_state(state: dict[str, dict[str, object]], step: TaskStep) -> None:
+        nonlocal cleanup_scene_state, runtime_held_object
+        scene_place_object(state, step)
+        runtime_held_object = None
+        normalized_state = load_scene_state(state)
+        if normalized_state is not None:
+            cleanup_scene_state = normalized_state
+
+    def execute_pick_step(
+        step: TaskStep,
+        *,
+        record: bool,
+        frame_idx: int,
+        lookup_scene_state: dict[str, dict[str, object]],
+    ) -> tuple[list[RecordedFrame], int]:
         nonlocal local_exec_joint6_rad
         target_xy = np.asarray(step.xy, dtype=np.float64).reshape(2)
         target_z = z_for_pick_level(step.level)
         above_z = z_grasp + APPROACH_Z_OFFSET_M
         step_frames: list[RecordedFrame] = []
-        should_align_joint6, target_joint6_rad = should_align_joint6_for_step(step)
+        should_align_joint6, target_joint6_rad = should_align_joint6_for_step(step, lookup_scene_state)
 
         if args.dry_run:
             dummy_count = 12 + (3 if should_align_joint6 else 0)
@@ -1295,7 +1444,10 @@ def main() -> int:
             if record:
                 step_frames.extend(seg)
             frame_idx += len(seg)
-            local_exec_joint6_rad = target_joint6_rad
+            if seg:
+                local_exec_joint6_rad = _normalize_j6(seg[-1].joint6)
+            else:
+                local_exec_joint6_rad = target_joint6_rad
 
         down_pose = build_pose_from_live_orientation(float(target_xy[0]), float(target_xy[1]), float(target_z))
         seg = execute_and_record(
@@ -1329,13 +1481,20 @@ def main() -> int:
         frame_idx += len(seg)
         return step_frames, frame_idx
 
-    def execute_place_step(step: TaskStep, *, record: bool, frame_idx: int) -> tuple[list[RecordedFrame], int]:
+    def execute_place_step(
+        step: TaskStep,
+        *,
+        record: bool,
+        frame_idx: int,
+        lookup_scene_state: dict[str, dict[str, object]],
+        result_scene_state: dict[str, dict[str, object]],
+    ) -> tuple[list[RecordedFrame], int]:
         nonlocal local_exec_joint6_rad
         target_xy = np.asarray(step.xy, dtype=np.float64).reshape(2)
         target_z = z_for_place_level(step.level)
         above_z = z_grasp + APPROACH_Z_OFFSET_M
         step_frames: list[RecordedFrame] = []
-        should_align_joint6, target_joint6_rad = should_align_joint6_for_step(step)
+        should_align_joint6, target_joint6_rad = should_align_joint6_for_step(step, lookup_scene_state)
 
         if args.dry_run:
             dummy_count = 10 + (3 if should_align_joint6 else 0)
@@ -1354,6 +1513,12 @@ def main() -> int:
                 )
             if should_align_joint6:
                 local_exec_joint6_rad = target_joint6_rad
+            set_object_standard_j6_rad(
+                result_scene_state,
+                step.object_name,
+                local_exec_joint6_rad if step.is_rotate else None,
+            )
+            commit_place_state(result_scene_state, step)
             return step_frames, frame_idx + len(step_frames)
 
         print(
@@ -1383,7 +1548,10 @@ def main() -> int:
             if record:
                 step_frames.extend(seg)
             frame_idx += len(seg)
-            local_exec_joint6_rad = target_joint6_rad
+            if seg:
+                local_exec_joint6_rad = _normalize_j6(seg[-1].joint6)
+            else:
+                local_exec_joint6_rad = target_joint6_rad
 
         down_pose = build_pose_from_live_orientation(float(target_xy[0]), float(target_xy[1]), float(target_z))
         seg = execute_and_record(
@@ -1397,11 +1565,18 @@ def main() -> int:
         if record:
             step_frames.extend(seg)
         frame_idx += len(seg)
+        actual_standard_j6_rad = _normalize_j6(seg[-1].joint6) if seg else local_exec_joint6_rad
+        set_object_standard_j6_rad(
+            result_scene_state,
+            step.object_name,
+            actual_standard_j6_rad if step.is_rotate else None,
+        )
 
         ensure_gripper_ok(
             command_gripper_state(1, timeout_s=args.gripper_timeout),
             f"open gripper for {step.object_name}",
         )
+        commit_place_state(result_scene_state, step)
 
         lift_pose = build_pose_from_live_orientation(float(target_xy[0]), float(target_xy[1]), float(above_z))
         seg = execute_and_record(
@@ -1422,7 +1597,12 @@ def main() -> int:
         *,
         record: bool,
         initial_held_object: str | None = None,
+        lookup_scene_state: dict[str, dict[str, object]] | None = None,
+        result_scene_state: dict[str, dict[str, object]] | None = None,
     ) -> tuple[list[RecordedFrame], str | None]:
+        nonlocal cleanup_scene_state, runtime_held_object
+        execution_state = scene_state if result_scene_state is None else result_scene_state
+        lookup_state = execution_state if lookup_scene_state is None else lookup_scene_state
         frames: list[RecordedFrame] = []
         frame_idx = 0
         held_object: str | None = initial_held_object
@@ -1430,17 +1610,31 @@ def main() -> int:
             if step.kind == "pick":
                 if held_object is not None:
                     raise RuntimeError(f"cannot pick {step.object_name} while holding {held_object}")
-                step_frames, frame_idx = execute_pick_step(step, record=record, frame_idx=frame_idx)
+                step_frames, frame_idx = execute_pick_step(
+                    step,
+                    record=record,
+                    frame_idx=frame_idx,
+                    lookup_scene_state=lookup_state,
+                )
                 frames.extend(step_frames)
+                scene_detach_top(execution_state, step.object_name)
                 held_object = step.object_name
+                runtime_held_object = held_object
             elif step.kind == "place":
                 if held_object != step.object_name:
                     raise RuntimeError(
                         f"cannot place {step.object_name}: currently holding {held_object!r}"
                     )
-                step_frames, frame_idx = execute_place_step(step, record=record, frame_idx=frame_idx)
+                step_frames, frame_idx = execute_place_step(
+                    step,
+                    record=record,
+                    frame_idx=frame_idx,
+                    lookup_scene_state=lookup_state,
+                    result_scene_state=execution_state,
+                )
                 frames.extend(step_frames)
                 held_object = None
+                runtime_held_object = None
             else:
                 raise RuntimeError(f"unknown step kind: {step.kind}")
         return frames, held_object
@@ -1527,7 +1721,12 @@ def main() -> int:
                         align_j6=bool(object_name != APPLE_NAME),
                         note=f"prep place {object_name}",
                     )
-                    _, held_after_prep = execute_step_sequence([pick_step, place_step], record=False)
+                    _, held_after_prep = execute_step_sequence(
+                        [pick_step, place_step],
+                        record=False,
+                        lookup_scene_state=scene_state,
+                        result_scene_state={object_name: placed_state},
+                    )
                     if held_after_prep is not None:
                         raise RuntimeError(f"prep sequence ended while still holding {held_after_prep}")
                     return_home(f"[prep {object_name}] return home")
@@ -1634,7 +1833,12 @@ def main() -> int:
                 )
 
             if selected_task == "pick_and_place":
-                all_frames, held_after_recorded = execute_step_sequence(plan.recorded_steps, record=True)
+                episode_execution_scene_state = clone_scene_state(scene_state)
+                all_frames, held_after_recorded = execute_step_sequence(
+                    plan.recorded_steps,
+                    record=True,
+                    result_scene_state=episode_execution_scene_state,
+                )
             else:
                 all_frames = execute_move_step_sequence(
                     plan.recorded_steps,
@@ -1661,6 +1865,7 @@ def main() -> int:
                         plan.post_steps,
                         record=False,
                         initial_held_object=held_after_recorded,
+                        result_scene_state=episode_execution_scene_state,
                     )
                 else:
                     held_after_post = held_after_recorded
@@ -1672,8 +1877,9 @@ def main() -> int:
                 return_home("post-episode return home")
 
             if selected_task == "pick_and_place":
-                scene_state = plan.scene_after
+                scene_state = clone_scene_state(episode_execution_scene_state)
                 save_collect_state(save_dir, scene_state, task_index, episode_count)
+                cleanup_scene_state = None
             else:
                 save_collect_state(
                     save_dir,

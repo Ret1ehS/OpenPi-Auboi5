@@ -7,7 +7,6 @@ import numpy as np
 
 OPEN_PROMPT = "open the storage box"
 CLOSE_PROMPT = "close the storage box"
-OPEN_AND_CLOSE_PROMPT = "open and close the storage box"
 
 
 @dataclass(frozen=True)
@@ -80,35 +79,8 @@ def build_close_episode_plan(
         prompt=CLOSE_PROMPT,
         recorded_steps=[
             MoveStep(x=x_rand, y=y_rand, z=float(target_z), note="close step 1 random approach"),
-            MoveStep(x=x_start - 0.24, y=y_start, z=float(press_z), note="close step 2 touch"),
-            MoveStep(x=x_start + 0.02, y=y_start, z=float(press_z), note="close step 3 push"),
-            MoveStep(x=x_start + 0.02, y=y_start, z=float(target_z), note="close step 4 lift"),
+            MoveStep(x=x_start - 0.24, y=y_start, z=float(target_z), note="close step 2 align high"),
+            MoveStep(x=x_start - 0.24, y=y_start, z=float(press_z), note="close step 3 lower"),
+            MoveStep(x=x_start + 0.02, y=y_start, z=float(press_z), note="close step 4 push"),
         ],
-    )
-
-
-def build_open_and_close_episode_plan(
-    *,
-    reference: OpenCloseReference,
-    target_z: float,
-    press_z: float,
-    workspace_x_min: float,
-    workspace_x_max: float,
-    workspace_y_min: float,
-    workspace_y_max: float,
-) -> OpenCloseEpisodePlan:
-    open_plan = build_open_episode_plan(reference, target_z=target_z, press_z=press_z)
-    close_plan = build_close_episode_plan(
-        reference,
-        target_z=target_z,
-        press_z=press_z,
-        workspace_x_min=workspace_x_min,
-        workspace_x_max=workspace_x_max,
-        workspace_y_min=workspace_y_min,
-        workspace_y_max=workspace_y_max,
-    )
-    return OpenCloseEpisodePlan(
-        task_kind="open_close",
-        prompt=OPEN_AND_CLOSE_PROMPT,
-        recorded_steps=[*open_plan.recorded_steps, *close_plan.recorded_steps],
     )

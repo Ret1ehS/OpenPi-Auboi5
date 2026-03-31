@@ -114,7 +114,8 @@ from task.pick_and_place import (
 from task.open_and_close import (
     MoveStep as OpenCloseMoveStep,
     OpenCloseReference,
-    build_open_and_close_episode_plan,
+    build_close_episode_plan,
+    build_open_episode_plan,
     build_reference_from_tcp_pose,
 )
 
@@ -1130,8 +1131,8 @@ def main() -> int:
         print("Prompt mode:  auto random ('pick up ...' / 'put ... on ...')")
         print("Task mix:     20% pick / 80% place")
     else:
-        print("Prompt mode:  fixed ('open and close the storage box')")
-        print("Task mix:     each episode runs open, then close")
+        print("Prompt mode:  fixed pair ('open the storage box' / 'close the storage box')")
+        print("Task mix:     each cycle runs open, then close and saves two episodes")
 
     saved_held_object = _normalize_held_object(saved_state_preview.get("held_object")) if saved_state_preview else None
     if selected_task == "pick_and_place" and resume_mode == "continue" and saved_held_object is not None:
@@ -1820,7 +1821,8 @@ def main() -> int:
     if selected_task == "pick_and_place":
         print("Task policy: 20% pick / 80% place")
     else:
-        print("Task policy: each episode performs open, then close")
+        print("Task policy: each cycle performs open, then close")
+        print("Save policy: split into one 'open' episode and one 'close' episode")
         print("Gripper policy: always open (no close/open action during episode)")
     print("Quit with q / quit / exit.\n")
 
@@ -1828,6 +1830,12 @@ def main() -> int:
         while True:
             if 0 < max_ep <= episode_count:
                 print(f"\nReached {episode_count} episodes. Done.")
+                break
+            if selected_task == "open_and_close" and 0 < max_ep and (max_ep - episode_count) < 2:
+                print(
+                    f"\nReached {episode_count} episodes. "
+                    "Open/close collection saves 2 episodes per cycle, so the remaining budget is insufficient."
+                )
                 break
 
             if selected_task == "pick_and_place":
@@ -1847,7 +1855,12 @@ def main() -> int:
             else:
                 if open_close_reference is None:
                     raise RuntimeError("open/close reference is not initialized")
-                plan = build_open_and_close_episode_plan(
+                open_plan = build_open_episode_plan(
+                    reference=open_close_reference,
+                    target_z=float(MIN_TCP_Z + 0.20),
+                    press_z=float(MIN_TCP_Z + 0.05),
+                )
+                close_plan = build_close_episode_plan(
                     reference=open_close_reference,
                     target_z=float(MIN_TCP_Z + 0.20),
                     press_z=float(MIN_TCP_Z + 0.05),
@@ -1856,15 +1869,25 @@ def main() -> int:
                     workspace_y_min=WORKSPACE_Y_MIN,
                     workspace_y_max=WORKSPACE_Y_MAX,
                 )
-                episode_label = f"Episode {episode_count} [{plan.task_kind}]"
-                print(f"\n--- {episode_label} ---")
-                print(f"  Prompt: \"{plan.prompt}\"")
-                print(f"  Recorded move steps: {len(plan.recorded_steps)}")
+                cycle_label = f"Cycle {episode_count // 2}"
+                print(f"\n--- {cycle_label} [open -> close] ---")
+                print(f"  Open prompt:  \"{open_plan.prompt}\"")
+                print(f"  Open steps:   {len(open_plan.recorded_steps)}")
+                print(f"  Close prompt: \"{close_plan.prompt}\"")
+                print(f"  Close steps:  {len(close_plan.recorded_steps)}")
 
             if auto_episodes > 0:
-                print(f"  Auto: recording ({episode_count + 1}/{auto_episodes})")
+                if selected_task == "pick_and_place":
+                    print(f"  Auto: recording ({episode_count + 1}/{auto_episodes})")
+                else:
+                    print(f"  Auto: recording cycle -> episodes {episode_count + 1}-{episode_count + 2}/{auto_episodes}")
             else:
-                cmd = input("  Press ENTER to record this episode, or q to quit: ").strip().lower()
+                prompt_text = (
+                    "  Press ENTER to record this cycle, or q to quit: "
+                    if selected_task == "open_and_close"
+                    else "  Press ENTER to record this episode, or q to quit: "
+                )
+                cmd = input(prompt_text).strip().lower()
                 if cmd in QUIT_TOKENS:
                     print("Exit requested.")
                     break
@@ -1887,23 +1910,50 @@ def main() -> int:
                     result_scene_state=episode_execution_scene_state,
                 )
             else:
-                all_frames = execute_move_step_sequence(
-                    plan.recorded_steps,
+                open_frames = execute_move_step_sequence(
+                    open_plan.recorded_steps,
                     record=True,
                     base_pose6=open_close_reference.reference_pose6,
                 )
+                close_frames = execute_move_step_sequence(
+                    close_plan.recorded_steps,
+                    record=True,
+                    base_pose6=open_close_reference.reference_pose6,
+                )
+                all_frames = [*open_frames, *close_frames]
                 held_after_recorded = None
             if not all_frames:
                 raise RuntimeError("recorded episode produced no frames")
 
-            save_episode(
-                all_frames,
-                save_dir,
-                plan.prompt,
-                save_fps=save_fps,
-                state_mode=collect_state_mode,
-            )
-            episode_count += 1
+            if selected_task == "pick_and_place":
+                save_episode(
+                    all_frames,
+                    save_dir,
+                    plan.prompt,
+                    save_fps=save_fps,
+                    state_mode=collect_state_mode,
+                )
+                episode_count += 1
+            else:
+                if not open_frames:
+                    raise RuntimeError("open episode produced no frames")
+                if not close_frames:
+                    raise RuntimeError("close episode produced no frames")
+                save_episode(
+                    open_frames,
+                    save_dir,
+                    open_plan.prompt,
+                    save_fps=save_fps,
+                    state_mode=collect_state_mode,
+                )
+                save_episode(
+                    close_frames,
+                    save_dir,
+                    close_plan.prompt,
+                    save_fps=save_fps,
+                    state_mode=collect_state_mode,
+                )
+                episode_count += 2
 
             if selected_task == "pick_and_place":
                 task_index += 1

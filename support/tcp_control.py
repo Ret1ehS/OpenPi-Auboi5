@@ -58,6 +58,7 @@ DEFAULT_TCP_ANGULAR_SPEED_RADPS = 0.60
 DEFAULT_MOVE_LINE_BLEND_RADIUS_M = 0.01
 
 RESET_ERR_M = 0.10
+DEFAULT_Z_MIN_M = 0.180  # TCP minimum z height (180 mm), clip anything below
 
 JOINT_NAMES = [
     "base_link",
@@ -600,6 +601,7 @@ def integrate_delta_tcp_pose(
     delta6: np.ndarray,
     *,
     lock_yaw: bool = False,
+    z_min: float = DEFAULT_Z_MIN_M,
 ) -> np.ndarray:
     pose = np.asarray(pose6_zyx, dtype=np.float64).reshape(POSE_DIM)
     delta = np.asarray(delta6, dtype=np.float64).reshape(OPENPI_DELTA_DIM).copy()
@@ -608,6 +610,9 @@ def integrate_delta_tcp_pose(
     out = pose.copy()
     out[:3] = pose[:3] + delta[:3]
     out[3:] = wrap_euler_zyx(pose[3:] + delta[3:])
+    # Clip z to minimum safe height
+    if out[2] < z_min:
+        out[2] = z_min
     return out
 
 

@@ -31,6 +31,7 @@ REPO_VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
 
 GRIPPER_THRESHOLD = 0.6
 MAX_EXEC_ACTION_INTERVALS = 10
+NATIVE_INTERP_FACTOR = 5  # 10 intervals -> 50 actions in native mode
 
 
 def _maybe_reexec_into_repo_venv() -> None:
@@ -512,8 +513,7 @@ def main() -> int:
     print(f"\nConfiguration:")
     print(f"  Policy:     {cfg.policy_location}")
     print(f"  Frame:      {cfg.pose_frame}")
-    print(f"  State Mode: {cfg.obs_state_mode}")
-    print(f"  Lock Yaw:   {cfg.lock_yaw}")
+    print(f"  State Mode: {cfg.obs_state_mode} (lock_yaw={'yes' if cfg.lock_yaw else 'no'})")
     print(f"  Speed Mode: {cfg.speed_mode}")
     if cfg.speed_mode == "limited":
         print(f"  Exec Speed: {cfg.exec_speed_mps} m/s")
@@ -560,6 +560,7 @@ def main() -> int:
         print("Cameras ready.")
 
     effective_speed = float('inf') if cfg.speed_mode == "native" else cfg.exec_speed_mps
+    is_native_speed = cfg.speed_mode == "native"
     executor = TrajectoryExecutor(execute=execute, lock_yaw=cfg.lock_yaw, max_speed_mps=effective_speed)
     executor.start()
 
@@ -770,6 +771,19 @@ def main() -> int:
                 tcp_deltas = np.zeros((len(exec_actions), 6), dtype=np.float64)
                 tcp_deltas[:, :3] = exec_actions[:, :3]
                 tcp_deltas[:, 3:6] = exec_actions[:, 3:6]
+
+                # Native mode: linearly interpolate 10 intervals -> 50 actions
+                if is_native_speed:
+                    n_orig = tcp_deltas.shape[0]
+                    interp_deltas = np.repeat(
+                        tcp_deltas / float(NATIVE_INTERP_FACTOR),
+                        NATIVE_INTERP_FACTOR,
+                        axis=0,
+                    )
+                    tcp_deltas = interp_deltas
+                    # Also expand exec_actions for gripper edge detection
+                    exec_actions = np.repeat(exec_actions, NATIVE_INTERP_FACTOR, axis=0)
+
                 gripper_action = float(raw_actions[0, 6])
                 current_gripper_state = last_gripper_state
                 if current_gripper_state is None:

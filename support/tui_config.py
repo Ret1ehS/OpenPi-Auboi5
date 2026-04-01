@@ -263,7 +263,6 @@ def run_tui_config(
         ToggleItem("Policy", ["remote", "local"], selected=0),
         ToggleItem("Frame", ["sim", "real"], selected=0),
         ToggleItem("State Mode", ["yaw", "j6"], selected=0),
-        ToggleItem("Lock Yaw", ["true", "false"], selected=0),
         ToggleItem("Record", ["false", "true"], selected=0),
         ToggleItem("Speed Mode", ["limited", "native"], selected=0),
         TextItem("Exec Speed (m/s)", "0.05"),
@@ -454,11 +453,12 @@ def _infer_disabled_labels(rows: list[MenuRow]) -> set[str]:
 
 def _snapshot_config(rows: list[MenuRow]) -> TUIConfig:
     speed_mode = _get_toggle(rows, "Speed Mode")
+    state_mode = _get_toggle(rows, "State Mode")
     return TUIConfig(
         policy_location=_get_toggle(rows, "Policy"),
         pose_frame=_get_toggle(rows, "Frame"),
-        obs_state_mode=_get_toggle(rows, "State Mode"),
-        lock_yaw=_get_toggle(rows, "Lock Yaw") == "true",
+        obs_state_mode=state_mode,
+        lock_yaw=(state_mode == "yaw"),
         dry_run=_get_env_bool("OPENPI_DEBUG_DRY_RUN", False),
         exec_speed_mps=_get_float(rows, "Exec Speed (m/s)", 0.05),
         speed_mode=speed_mode,

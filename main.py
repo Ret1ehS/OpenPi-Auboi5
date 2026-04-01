@@ -488,7 +488,7 @@ def main() -> int:
                 snap = get_robot_snapshot()
                 print(f"  Pose frame: {get_alignment_mode()}")
                 print(f"  Execute: {execute_now}  Lock Yaw: {cfg_now.lock_yaw}")
-                print(f"  Exec Speed: {cfg_now.exec_speed_mps} m/s")
+                print(f"  Speed Mode: {cfg_now.speed_mode}  Exec Speed: {cfg_now.exec_speed_mps} m/s")
                 print(f"  TCP pose: {np.round(snap.tcp_pose, 5).tolist()}")
                 print(f"  Joint q (deg): {np.round(np.degrees(snap.joint_q), 2).tolist()}")
                 print(f"  Collision: {snap.collision}")
@@ -514,7 +514,11 @@ def main() -> int:
     print(f"  Frame:      {cfg.pose_frame}")
     print(f"  State Mode: {cfg.obs_state_mode}")
     print(f"  Lock Yaw:   {cfg.lock_yaw}")
-    print(f"  Exec Speed: {cfg.exec_speed_mps} m/s")
+    print(f"  Speed Mode: {cfg.speed_mode}")
+    if cfg.speed_mode == "limited":
+        print(f"  Exec Speed: {cfg.exec_speed_mps} m/s")
+    else:
+        print(f"  Exec Speed: native (no retime)")
     print(f"  Record:     {cfg.record}")
     if cfg.dry_run:
         print(f"  Debug Dry Run: {cfg.dry_run}")
@@ -555,7 +559,8 @@ def main() -> int:
         cameras_ready = True
         print("Cameras ready.")
 
-    executor = TrajectoryExecutor(execute=execute, lock_yaw=cfg.lock_yaw, max_speed_mps=cfg.exec_speed_mps)
+    effective_speed = float('inf') if cfg.speed_mode == "native" else cfg.exec_speed_mps
+    executor = TrajectoryExecutor(execute=execute, lock_yaw=cfg.lock_yaw, max_speed_mps=effective_speed)
     executor.start()
 
     # --- Prompt input loop ---

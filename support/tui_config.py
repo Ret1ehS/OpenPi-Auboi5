@@ -107,6 +107,7 @@ class TUIConfig:
     lock_yaw: bool
     dry_run: bool
     exec_speed_mps: float  # max TCP linear speed (m/s) for servo execution
+    speed_mode: str = "limited"  # "limited" | "native"
     record: bool = False   # True to record video of inference session
     quit: bool = False     # True if user pressed q
 
@@ -264,6 +265,7 @@ def run_tui_config(
         ToggleItem("State Mode", ["yaw", "j6"], selected=0),
         ToggleItem("Lock Yaw", ["true", "false"], selected=0),
         ToggleItem("Record", ["false", "true"], selected=0),
+        ToggleItem("Speed Mode", ["limited", "native"], selected=0),
         TextItem("Exec Speed (m/s)", "0.05"),
         SeparatorItem(),
         ActionItem("Align Joints", "align"),
@@ -273,19 +275,38 @@ def run_tui_config(
         StartItem(),
     ]
 
-    selectable_rows = [r for r in rows if not isinstance(r, SeparatorItem)]
+    def _infer_selectable_rows() -> list[MenuRow]:
+        nonselectable = _infer_nonselectable_labels(rows)
+        return [r for r in rows
+                if not isinstance(r, SeparatorItem)
+                and not (hasattr(r, "label") and r.label in nonselectable)]
+
+    selectable_rows = _infer_selectable_rows()
     n_selectable = len(selectable_rows)
     cursor = 0
     status_line = ""
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
+    def _render_infer(status: str) -> str:
+        return _render(
+            rows,
+            cursor,
+            status,
+            disabled_labels=_infer_disabled_labels(rows),
+            nonselectable_labels=_infer_nonselectable_labels(rows),
+        )
+
     try:
         tty.setraw(fd)
         sys.stdout.write(HIDE_CURSOR)
-        sys.stdout.write(_render(rows, cursor, status_line))
+        sys.stdout.write(_render_infer(status_line))
         sys.stdout.flush()
 
         while True:
+            selectable_rows = _infer_selectable_rows()
+            n_selectable = len(selectable_rows)
+            cursor = min(cursor, max(0, n_selectable - 1))
+
             key = _read_key(fd)
             if not key:
                 continue
@@ -319,7 +340,7 @@ def run_tui_config(
                     current_row.editing = True
                     current_row._edit_buf = current_row.value
                     status_line = "Type new value, Enter to confirm, Esc to cancel"
-                    sys.stdout.write(_render(rows, cursor, status_line))
+                    sys.stdout.write(_render_infer(status_line))
                     sys.stdout.flush()
                     while True:
                         ekey = _read_key(fd)
@@ -335,7 +356,7 @@ def run_tui_config(
                             current_row._edit_buf += ekey
                         else:
                             continue
-                        sys.stdout.write(_render(rows, cursor, status_line))
+                        sys.stdout.write(_render_infer(status_line))
                         sys.stdout.flush()
                     current_row.editing = False
                     status_line = ""
@@ -359,12 +380,15 @@ def run_tui_config(
                         status_line = f"{current_row.label}: no handler"
                 elif isinstance(current_row, StartItem):
                     cfg = _snapshot_config(rows)
-                    if cfg.exec_speed_mps <= 0.0:
+                    if cfg.speed_mode == "limited" and cfg.exec_speed_mps <= 0.0:
                         status_line = "Exec Speed must be > 0"
                     else:
                         return cfg
 
-            sys.stdout.write(_render(rows, cursor, status_line))
+            selectable_rows = _infer_selectable_rows()
+            n_selectable = len(selectable_rows)
+            cursor = min(cursor, max(0, n_selectable - 1))
+            sys.stdout.write(_render_infer(status_line))
             sys.stdout.flush()
 
     finally:
@@ -415,7 +439,21 @@ def _get_env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _infer_nonselectable_labels(rows: list[MenuRow]) -> set[str]:
+    """When Speed Mode is 'native', hide the Exec Speed text input."""
+    labels: set[str] = set()
+    if _get_toggle(rows, "Speed Mode") == "native":
+        labels.add("Exec Speed (m/s)")
+    return labels
+
+
+def _infer_disabled_labels(rows: list[MenuRow]) -> set[str]:
+    """Disabled (greyed-out) labels for inference TUI."""
+    return _infer_nonselectable_labels(rows)
+
+
 def _snapshot_config(rows: list[MenuRow]) -> TUIConfig:
+    speed_mode = _get_toggle(rows, "Speed Mode")
     return TUIConfig(
         policy_location=_get_toggle(rows, "Policy"),
         pose_frame=_get_toggle(rows, "Frame"),
@@ -423,6 +461,7 @@ def _snapshot_config(rows: list[MenuRow]) -> TUIConfig:
         lock_yaw=_get_toggle(rows, "Lock Yaw") == "true",
         dry_run=_get_env_bool("OPENPI_DEBUG_DRY_RUN", False),
         exec_speed_mps=_get_float(rows, "Exec Speed (m/s)", 0.05),
+        speed_mode=speed_mode,
         record=_get_toggle(rows, "Record") == "true",
     )
 

@@ -1,538 +1,308 @@
-# OpenPI Jetson 侧机器人执行与数据采集系统说明
+# OpenPI-AUBO i5 真机执行与数据采集系统
 
-## 1. 文档目的
+本仓库为 OpenPI 在 AUBO i5 机械臂上的 Jetson 侧完整系统，包含 **在线推理执行** 和 **训练数据采集** 两条链路。
 
-本文档用于说明 `/home/orin/openpi/scripts` 当前的系统能力、运行方式、数据格式与核心实现，作为 Jetson 侧真实机器人执行与采集系统的对外汇报材料。
+---
 
-文档面向项目负责人、管理者和后续维护人员，重点回答以下问题：
+## 目录
 
-- 当前系统能完成什么
-- 系统如何运行
-- 采集数据以什么格式保存
-- 关键模块分别承担什么职责
-- 当前仍需重点关注哪些工程配置项
+- [快速开始](#快速开始)
+- [如何训练出一个可用的权重](#如何训练出一个可用的权重)
+- [文件结构与功能说明](#文件结构与功能说明)
+- [数据格式](#数据格式)
+- [调用关系](#调用关系)
 
+---
 
-## 2. 系统概述
+## 快速开始
 
-`scripts` 目录承担 OpenPI 在 Jetson Orin 端的机器人执行层与数据采集层，围绕 AUBO i5 机械臂、双路 Orbbec 相机与夹爪构成完整闭环。
+### 环境要求
 
-当前系统覆盖的主链路包括：
+- Jetson Orin + AUBO i5（IP: 192.168.1.100）
+- 双路 Orbbec RGB 相机（主视角 + 腕部）
+- Lebai 夹爪（USB-RS485）
+- Python 3.10+，依赖：`numpy`, `cv2`, `pyorbbecsdk`, `pyserial`
+- AUBO SDK (`libaubo_sdk.so`)，C++ helper 会在首次运行时自动编译
 
-- 双相机观测采集与预处理
-- 机器人状态读取与观测组织
-- OpenPI 策略加载与推理
-- TCP 笛卡尔轨迹规划与执行
-- 夹爪开合控制与状态管理
-- 真机 pick / put / stack 数据采集
-- episode 落盘、断点续采与数据质检
+### 运行推理
 
-系统当前已经形成统一的运行接口和统一的数据产出格式，可同时支撑在线执行与离线训练数据生产。
+```bash
+cd /home/orin/openpi/scripts
 
+# 本地 checkpoint 推理
+python main.py
 
-## 3. 当前功能能力
+# 远端推理服务
+python main.py --remote
+```
 
-### 3.1 实时推理执行
+启动后进入 TUI 菜单，可配置：
+- **Task**：`pick_and_place` / `open_and_close`
+- **State Mode**：`j6`（不锁 yaw）/ `yaw`（锁 yaw）
+- **Speed Mode**：`limited`（限速）/ `native`（原生速度，自动插值）
+- **Exec Speed**：限速模式下的笛卡尔速度（m/s）
 
-系统支持在 Jetson 上加载 OpenPI 策略并驱动真实机械臂执行。
+### 运行数据采集
 
-当前策略接入方式包括：
+```bash
+# 采集 pick_and_place 任务数据
+python collect_data.py --task pick_and_place --save-dir data/pick_place
 
-- 本地 checkpoint 直接推理
-- 远端推理服务经 websocket 调用
+# 采集 open_and_close 任务数据
+python collect_data.py --task open_and_close --save-dir data/open_close
 
-实时执行链路如下：
+# 自动连续采集 100 个 episode
+python collect_data.py --task pick_and_place --save-dir data/pick_place --auto 100
 
-1. 采集双路相机图像与机器人状态
-2. 组织成 OpenPI 标准 observation
-3. 策略输出 TCP delta 与 gripper action
-4. 在仿真坐标系中积分目标位姿
-5. 映射到真实机器人坐标系
-6. 进行边界约束、逆解与轨迹合法性检查
-7. 通过 `moveLine` 轨迹块连续执行
-8. 根据动作结果更新夹爪状态与执行状态
+# 空跑模式（不连接机器人）
+python collect_data.py --task pick_and_place --save-dir data/test --dry-run
+```
 
-该链路的主入口为：
+### 数据质检
 
-- [main.py](/home/orin/openpi/scripts/main.py)
+```bash
+python data/check_data.py data/pick_place
+```
 
+自动删除异常 episode 并重编号，输出 `dataset_health_report.json`。
 
-### 3.2 真机数据采集
+---
 
-系统支持在真实环境下自动采集 OpenPI 训练数据，当前支持 `pick`、`put` 与 `stack` 三类任务。
+## 如何训练出一个可用的权重
 
-任务生成方式如下：
+整体流程分为三步：**采集 → 训练 → 部署**。
 
-- `pick`: 自动生成 `pick up the <color> cube`
-- `put`: 自动生成 `put the <color1> cube on the <color2> cube`
-- `stack`: 自动生成 `stack <bottom> <middle> <top> cubes from bottom to top`
+### 第一步：采集训练数据
 
-当前采集能力包括：
+1. 在 Jetson 上运行 `collect_data.py`，选择目标任务（`pick_and_place` 或 `open_and_close`）
+2. 系统自动完成：
+   - **准备阶段**：将物体从原点摆放到随机位置
+   - **录制阶段**：执行任务的同时以 30Hz 记录双路图像 + 机器人状态
+   - **保存阶段**：重采样到 50Hz，以标准格式落盘
+   - **恢复阶段**：整理工作区，进入下一轮
+3. 采集结束后运行 `data/check_data.py` 清理异常数据
+4. 每个任务建议采集 **50-200 个 episode**
 
-- 三色方块位置维护
-- 准备阶段自动整理工作区
-- 按颜色、颜色对或三元组顺序持续采集
-- 手动启动或自动连续执行
-- 中断状态持久化与恢复
-- 原始 `30Hz` 观测记录
-- 保存前重采样到 `50Hz`
-- 保存格式与 WSL / MuJoCo 侧脚本保持一致
-- 任务结束后自动执行整理与恢复工作区
+采集产出的每个 episode 包含：`states.npy`, `actions.npy`, `timestamps.npy`, `env_steps.npy`, `images.npz`, `metadata.json`
 
-当前采集主入口为：
+### 第二步：在 WSL/服务器端训练
 
-- [collect_data.py](/home/orin/openpi/scripts/collect_data.py)
+将采集好的 `data/` 目录拷贝到训练机器（WSL 或服务器），使用 OpenPI 官方训练流程：
 
+```bash
+# 在 openpi/repo 目录下
+# 1. 确认训练配置（config 中指定数据路径和 LoRA 参数）
+#    默认配置名: pi05_aubo_agv_lora
 
-### 3.3 数据质量检查
+# 2. 启动训练
+uv run scripts/train.py --config pi05_aubo_agv_lora
 
-系统提供数据集健康检查脚本，对 `data/episode_*` 自动执行结构检查、数值检查与图像健康检查。
+# 3. 训练完成后在 checkpoints/ 下生成权重
+#    例如: checkpoints/pi05_aubo_agv_lora/my_first_run/9999
+```
+
+训练配置需要关注：
+- `data_path`：指向采集数据目录
+- `action_dim`：7（dx, dy, dz, droll, dpitch, dyaw, gripper）
+- `state_dim`：8（x, y, z, qw, qx, qy, qz, gripper）
+- LoRA rank 和学习率根据数据量调整
+
+### 第三步：部署推理
+
+将训练好的 checkpoint 拷贝到 Jetson：
 
-当前检测项包括：
+```bash
+# 本地推理：将 checkpoint 放到默认路径
+scp -r checkpoints/pi05_aubo_agv_lora/my_first_run/9999 \
+    orin@172.18.10.44:/home/orin/openpi/repo/checkpoints/pi05_aubo_agv_lora/my_first_run/
 
-- 必需文件完整性
-- `states / actions / timestamps / env_steps / images / metadata` 的 shape 与 dtype
-- `NaN / Inf`
-- 四元数范数异常
-- `actions` 与相邻 `states` 差分一致性
-- 时间轴与 `50Hz` 网格一致性
-- 黑帧
-- 唯一帧数过低
-- 长时间连续重复帧
+# 运行
+python main.py
+```
 
-当前脚本默认行为包括：
+或使用远端推理服务（K8s pod 部署 checkpoint，Jetson 通过 WebSocket 调用）：
 
-- 自动识别异常 episode
-- 自动删除异常 episode
-- 自动对剩余 episode 重编号
-- 生成 JSON 质检报告
+```bash
+python main.py --remote
+```
 
-脚本路径：
+---
 
-- [check_data.py](/home/orin/openpi/scripts/data/check_data.py)
+## 文件结构与功能说明
 
+```
+scripts/
+├── main.py                          # 在线推理主入口
+├── collect_data.py                  # 数据采集主入口
+├── support/
+│   ├── get_obs.py                   # 观测构建（相机 + 机器人状态）
+│   ├── gripper_control.py           # 夹爪串口控制
+│   ├── joint_control.py             # 关节空间控制
+│   ├── load_policy.py               # 策略加载（本地/远端）
+│   ├── pose_align.py                # 仿真-真机坐标系对齐
+│   ├── tcp_control.py               # TCP 笛卡尔轨迹规划与执行
+│   └── tui_config.py                # TUI 交互式配置菜单
+├── task/
+│   ├── pick_and_place.py            # pick/put/stack 任务规划
+│   └── open_and_close.py            # 开关盖任务规划 + 障碍物管理
+├── data/
+│   └── check_data.py                # 数据集质检与清理
+├── tcp_control_helper.cpp           # AUBO SDK C++ 控制守护进程
+└── joint_control_helper.cpp         # AUBO SDK C++ 关节控制守护进程
+```
 
-### 3.4 坐标系对齐
+### 各文件详细说明
 
-系统实现了从仿真坐标系到真实机器人坐标系的位姿对齐模块，用于连接 MuJoCo 侧策略输出和真实机器人执行层。
+#### `main.py` — 在线推理主入口
 
-当前策略为：
+负责整个推理执行循环：加载策略 → 构建观测 → 推理输出动作 → 积分轨迹 → 执行运动。
 
-- 位置映射采用 yaw 旋转加平移
-- 姿态映射采用旋转矩阵组合
+核心逻辑：
+- 主线程串行执行：观测采集 → 策略推理 → 动作积分，每次取 10 个 interval
+- 后台 `TrajectoryExecutor` 线程异步执行 servo 轨迹
+- 支持 limited（限速重定时）和 native（原生速度，10→50 线性插值）两种速度模式
+- 夹爪状态变化时执行 TCP 前缀段，等待夹爪到位后重新推理
+- z_clip 安全机制：TCP 最低点不低于 180mm
 
-该模块负责保证 sim 侧 delta 能以符合真实机器人语义的方式落到真实 TCP 控制链路中。
+**调用的模块**：
+- `support/load_policy.py` → 加载策略
+- `support/get_obs.py` → 构建观测
+- `support/tcp_control.py` → 轨迹规划 + 执行
+- `support/pose_align.py` → 坐标系转换
+- `support/gripper_control.py` → 夹爪控制
+- `support/joint_control.py` → 回原点
+- `support/tui_config.py` → 启动前配置
 
-实现文件：
+#### `collect_data.py` — 数据采集主入口
 
-- [pose_align.py](/home/orin/openpi/scripts/pose_align.py)
+负责组织完整的采集流程：准备工作区 → 规划任务 → 录制执行 → 保存数据 → 恢复工作区。
 
+核心逻辑：
+- **pick_and_place 模式**：维护 4 个物体（red/green/blue/apple）的场景状态，自动生成 pick/put/stack 任务，录制执行段，任务后执行 post_steps 恢复场景
+- **open_and_close 模式**：维护 5 个障碍物的场景状态，每个周期随机布局 → 物理摆放 → 清障（录制，属于 open episode）→ 开盖（录制）→ 关盖（录制），每周期产出 2 个 episode
+- 30Hz 原始录制，保存前重采样到 50Hz
+- 支持断点续采（`.collect_state.json`）
+- 支持 `--auto N` 连续采集和 `--dry-run` 空跑
 
-### 3.5 相机观测构建
+**调用的模块**：
+- `task/pick_and_place.py` → 任务规划（pick/put/stack 步骤生成）
+- `task/open_and_close.py` → 任务规划（开关盖步骤 + 障碍物布局 + 清障步骤）
+- `support/tcp_control.py` → 轨迹执行
+- `support/pose_align.py` → 坐标系转换
+- `support/gripper_control.py` → 夹爪控制
+- `support/joint_control.py` → 回原点
+- `support/get_obs.py` → 录制时的相机采集（使用 `CameraPair`）
 
-系统当前支持双路 Orbbec RGB 观测：
+#### `support/get_obs.py` — 观测构建
 
-- 主视角相机
-- 腕部相机
+并发采集双路 Orbbec 相机图像 + 机器人 TCP 状态，组装成 OpenPI 标准 observation dict。图像 resize/pad 到 224×224。
 
-观测构建内容包括：
+被 `main.py`（推理观测）和 `collect_data.py`（录制帧）调用。
 
-- 双路图像抓取
-- 图像 resize / pad 到 OpenPI 输入规格
-- TCP pose 读取
-- 夹爪状态拼接
-- observation dict 组装
+#### `support/gripper_control.py` — 夹爪控制
 
-实时推理使用：
+通过 USB-RS485 串口控制 Lebai 夹爪，支持开/闭、状态读取、到位等待、稳态闭合判定。OpenPI 0/1 语义对齐。
 
-- [get_obs.py](/home/orin/openpi/scripts/get_obs.py)
+被 `main.py` 和 `collect_data.py` 调用。
 
-数据采集使用：
+#### `support/joint_control.py` — 关节空间控制
 
-- [collect_data.py](/home/orin/openpi/scripts/collect_data.py) 中的 `CameraPair`
+封装 `moveJoint` 命令，用于回原点、初始位姿对齐。通过 C++ helper 进程与 AUBO SDK 通信。
 
+被 `main.py`（回原点）和 `collect_data.py`（准备阶段、每轮回原点）调用。
 
-### 3.6 夹爪控制
+#### `support/load_policy.py` — 策略加载
 
-夹爪通过 USB-RS485 控制，当前支持：
+统一的策略加载入口，屏蔽本地推理（直接加载 checkpoint）和远端推理（WebSocket + kubectl port-forward）的差异。
 
-- 打开 / 闭合
-- 状态读取
-- 到位等待
-- 稳态闭合判定
-- OpenPI `0 / 1` 语义对齐
+仅被 `main.py` 调用。
 
-当前默认参数：
+#### `support/pose_align.py` — 坐标系对齐
 
-- 默认速度：`20`
-- 默认力度：`10`
+实现仿真坐标系（MuJoCo/OpenPI）与真实机器人坐标系之间的双向转换。位置映射采用 yaw 旋转 + 平移，姿态映射采用旋转矩阵组合。
 
-实现文件：
+被 `main.py`、`collect_data.py`、`tcp_control.py` 调用，贯穿整个系统。
 
-- [gripper_control.py](/home/orin/openpi/scripts/gripper_control.py)
+#### `support/tcp_control.py` — TCP 轨迹规划与执行
 
+核心控制模块。将策略输出的 TCP delta 在仿真坐标系中积分，转换到真实坐标系，经边界约束、逆解校验、碰撞检查后，通过 `moveLine` 分块执行。支持 z_clip 安全限制（180mm 最低点）。
 
-## 4. 运行方式与业务流程
+被 `main.py`（推理轨迹执行）和 `collect_data.py`（采集任务执行）调用。
 
-### 4.1 在线推理流程
+#### `support/tui_config.py` — TUI 配置菜单
 
-在线推理由 [main.py](/home/orin/openpi/scripts/main.py) 负责调度，当前运行方式如下：
+终端交互式配置界面，支持方向键导航、选项切换。配置项包括任务类型、状态模式、速度模式、执行速度等。
 
-1. 编译并加载 C++ helper
-2. 加载策略
-3. 初始化相机与控制对象
-4. 循环构造 observation
-5. 执行策略推理
-6. 将动作提交到 TCP 执行线程
-7. 在循环中处理夹爪动作与执行状态
-8. 输出每轮耗时、跟踪结果与采样信息
+被 `main.py` 在启动时调用。
 
-当前主循环与运动执行线程解耦：
+#### `task/pick_and_place.py` — 抓放任务规划
 
-- 主线程负责观测与推理
-- 后台执行器负责连续提交与等待运动轨迹
+为 pick/put/stack 任务生成执行步骤序列。维护 4 个物体（3 色方块 + apple）的场景状态（位置、旋转、堆叠关系），自动生成任务 prompt 和 pick/place 步骤。
 
-该结构用于保证策略推理和真实运动可以并行推进。
+仅被 `collect_data.py` 调用。
 
+#### `task/open_and_close.py` — 开关盖任务规划
 
-### 4.2 数据采集流程
+为 open/close 任务生成执行步骤。包含：
+- 5 个障碍物的场景管理（`ObstacleScene`），支持堆叠
+- 随机布局生成（2-4 个落在目标 y 带内，70% 概率堆叠 2 个）
+- 清障步骤生成（将带内障碍物移到带外，堆叠的先拆上层）
+- 开盖/关盖动作步骤生成
 
-数据采集由 [collect_data.py](/home/orin/openpi/scripts/collect_data.py) 负责，当前业务流程如下：
+仅被 `collect_data.py` 调用。
 
-1. 读取断点状态文件 `.collect_state.json`
-2. 若存在历史状态，则选择继续或清空后重置
-3. 若为新采集，则进入准备阶段整理三色方块
-4. 维护三色方块当前 `xy` 坐标
-5. 根据当前任务选择颜色、颜色对或三色顺序并自动生成 prompt
-6. 返回原点后开始录制 episode
-7. 在执行段内同步记录机器人状态、夹爪状态与双路图像
-8. 任务结束后执行对应的整理动作并恢复工作区状态
-9. 将原始 `30Hz` 序列重采样到 `50Hz`
-10. 以统一格式落盘
-11. 更新状态文件并进入下一轮
+#### `data/check_data.py` — 数据质检
 
-当前放置逻辑满足以下要求：
+扫描 episode 目录，检查文件完整性、数值异常（NaN/Inf）、四元数范数、时间轴对齐、黑帧、重复帧等。自动删除异常 episode 并重编号。
 
-- 三个方块随机落点间隔不小于约 `0.08m`
-- 每轮任务结束后先完成放置，再回到原点
-- 录制只覆盖任务执行段，不包含准备段和收尾段
-- `stack` 任务在录制后会执行拆堆与随机回放，保证下一轮仍从分散状态开始
+独立运行，不被其他文件调用。
 
+#### `tcp_control_helper.cpp` / `joint_control_helper.cpp` — C++ 守护进程
 
-### 4.3 数据质检流程
+与 AUBO SDK 保持常驻连接，接收 Python 侧的控制命令（snapshot、movel、move_joint 等），降低重复连接开销和 Python 高频控制的不确定性。
 
-数据质检由 [check_data.py](/home/orin/openpi/scripts/data/check_data.py) 负责，当前流程如下：
+由 `tcp_control.py` 和 `joint_control.py` 自动编译并启动。
 
-1. 扫描 `data/episode_*`
-2. 逐个读取数组与 metadata
-3. 执行结构、数值与图像检查
-4. 对异常样本标记结果
-5. 默认删除异常样本
-6. 重排剩余 episode 编号
-7. 输出 `dataset_health_report.json`
+---
 
+## 数据格式
 
-## 5. 数据格式说明
+每个 episode 目录（`episode_XXXXXX/`）包含：
 
-当前采集结果与 WSL 侧训练脚本使用统一格式，单个 episode 目录包含以下文件：
+| 文件 | 形状 | 说明 |
+|------|------|------|
+| `states.npy` | `(N, 8)` | `[x, y, z, qw, qx, qy, qz, gripper]`，仿真坐标系 |
+| `actions.npy` | `(N, 7)` | `[dx, dy, dz, droll, dpitch, dyaw, gripper]`，相邻 state 差分 |
+| `timestamps.npy` | `(N,)` | `env_steps / 50`，50Hz 网格 |
+| `env_steps.npy` | `(N,)` | `0..N-1` |
+| `images.npz` | — | 含 `main_images (N,224,224,3)` 和 `wrist_images (N,224,224,3)` |
+| `metadata.json` | — | 含 `prompt`, `save_fps`, `state_mode` 等 |
 
-- `states.npy`
-- `actions.npy`
-- `timestamps.npy`
-- `env_steps.npy`
-- `images.npz`
-- `metadata.json`
+---
 
+## 调用关系
 
-### 5.1 `states.npy`
+```
+main.py (在线推理)
+├── support/tui_config.py        ← 启动配置
+├── support/load_policy.py       ← 加载策略
+├── support/get_obs.py           ← 构建观测
+├── support/pose_align.py        ← 坐标系转换
+├── support/tcp_control.py       ← 轨迹规划执行
+│   └── tcp_control_helper.cpp   ← C++ SDK 通信
+├── support/gripper_control.py   ← 夹爪控制
+└── support/joint_control.py     ← 回原点
+    └── joint_control_helper.cpp ← C++ SDK 通信
 
-形状：
+collect_data.py (数据采集)
+├── task/pick_and_place.py       ← pick/put/stack 任务规划
+├── task/open_and_close.py       ← 开关盖任务规划 + 障碍物管理
+├── support/get_obs.py           ← 录制时相机采集
+├── support/pose_align.py        ← 坐标系转换
+├── support/tcp_control.py       ← 轨迹执行
+├── support/gripper_control.py   ← 夹爪控制
+└── support/joint_control.py     ← 回原点
 
-- `(N, 8)`
-
-定义：
-
-- `[x, y, z, qw, qx, qy, qz, gripper]`
-
-说明：
-
-- 位置为仿真坐标系下的位置状态
-- 姿态采用 `wxyz` 四元数
-- `gripper` 采用 `0 / 1` 标量
-
-
-### 5.2 `actions.npy`
-
-形状：
-
-- `(N, 7)`
-
-定义：
-
-- `[dx, dy, dz, droll, dpitch, dyaw, gripper_next]`
-
-说明：
-
-- 由相邻 state 自动差分得到
-- 最后一帧位移与角位移补零
-- 最后一帧夹爪值继承末状态
-
-
-### 5.3 `timestamps.npy` 与 `env_steps.npy`
-
-当前保存规则如下：
-
-- `env_steps = 0..N-1`
-- `timestamps = env_steps / 50`
-
-因此落盘后的时间轴严格对应 `50Hz` 采样网格。
-
-
-### 5.4 `images.npz`
-
-包含：
-
-- `main_images`
-- `wrist_images`
-
-图像规格：
-
-- `(N, 224, 224, 3)`
-- `uint8`
-
-
-## 6. 核心模块说明
-
-### 6.1 策略加载层
-
-文件：
-
-- [load_policy.py](/home/orin/openpi/scripts/load_policy.py)
-
-职责：
-
-- 提供统一的策略加载入口
-- 屏蔽本地推理与远端推理的接入差异
-- 对上层暴露统一 `infer / reset / metadata` 接口
-
-核心对象：
-
-- `PolicyLoadSpec`
-- `LocalPolicyRunner`
-- `RemotePolicyRunner`
-- `load_policy()`
-
-
-### 6.2 观测构建层
-
-文件：
-
-- [get_obs.py](/home/orin/openpi/scripts/get_obs.py)
-
-职责：
-
-- 并发抓取图像与机器人状态
-- 组织 OpenPI observation
-- 对图像进行对齐、裁剪与格式整理
-
-核心对象与函数：
-
-- `RealRobotOpenPIObservationBuilder`
-- `_capture_best_pair()`
-- `pose6_to_openpi_state()`
-
-设计特性：
-
-- 使用线程池并发读取相机与 robot snapshot
-- 夹爪状态以本地缓存为主，并在控制更新失败时读回校正
-
-
-### 6.3 TCP 控制层
-
-文件：
-
-- [tcp_control.py](/home/orin/openpi/scripts/tcp_control.py)
-- [tcp_control_helper.cpp](/home/orin/openpi/scripts/tcp_control_helper.cpp)
-
-职责：
-
-- 将策略输出的 TCP delta 转换为真实机器人轨迹
-- 完成边界约束、逆解校验与轨迹合法性检查
-- 调用 SDK 的 `moveLine` 接口执行真实笛卡尔运动
-
-核心对象与函数：
-
-- `RobotSnapshot`
-- `_DaemonHelper`
-- `plan_tcp_action_chunk_movel()`
-- `execute_tcp_action_chunk()`
-
-当前控制特性：
-
-- 采用 `moveLine` 分块执行
-- 支持非阻塞轨迹提交
-- 支持 chunk 内多 waypoint 与 blend 过渡
-- 执行完成后以真实停点回填结果
-- 对 waypoint 间扫掠路径执行采样检查
-- 真实笛卡尔速度可通过 `speed_mps` 显式设置
-
-
-### 6.4 C++ Helper 层
-
-文件：
-
-- [tcp_control_helper.cpp](/home/orin/openpi/scripts/tcp_control_helper.cpp)
-- [joint_control_helper.cpp](/home/orin/openpi/scripts/joint_control_helper.cpp)
-
-职责：
-
-- 与 AUBO SDK 保持常驻连接
-- 下沉实时控制与状态读取逻辑
-- 对 Python 暴露稳定的命令式接口
-
-当前对外命令包括：
-
-- `snapshot`
-- `movel`
-- `movel_chunk`
-- `wait_motion`
-- `stop_motion`
-- `move_joint`
-
-设计目标：
-
-- 降低重复连接开销
-- 降低 Python 高频实时控制的不确定性
-- 将关键控制时序留在 C++ 侧完成
-
-
-### 6.5 关节控制层
-
-文件：
-
-- [joint_control.py](/home/orin/openpi/scripts/joint_control.py)
-- [joint_control_helper.cpp](/home/orin/openpi/scripts/joint_control_helper.cpp)
-
-职责：
-
-- 提供 `moveJoint` 控制能力
-- 用于初始位姿对齐、回原点与准备阶段姿态恢复
-
-返回结果中包含：
-
-- `current_q`
-- `target_q`
-- `final_q`
-- `err`
-- `collision`
-
-
-### 6.6 夹爪控制层
-
-文件：
-
-- [gripper_control.py](/home/orin/openpi/scripts/gripper_control.py)
-
-职责：
-
-- 串口通信
-- 开合控制
-- 读回状态
-- 到位等待
-- 稳态闭合判定
-
-核心对象与函数：
-
-- `GripperController`
-- `command_gripper_state()`
-- `is_gripper_stably_closed()`
-
-
-### 6.7 数据采集层
-
-文件：
-
-- [collect_data.py](/home/orin/openpi/scripts/collect_data.py)
-
-职责：
-
-- 组织真机 pick / put / stack 采集任务
-- 维护三色方块状态
-- 执行采样、重采样与落盘
-- 处理状态续采与相机重建
-
-核心对象与函数：
-
-- `CameraPair`
-- `execute_and_record()`
-- `resample_episode_to_50hz()`
-- `save_episode()`
-- `save_collect_state()`
-- `load_collect_state()`
-
-当前状态文件：
-
-- `.collect_state.json`
-
-保存内容包括：
-
-- 三色方块当前 `xy`
-- 当前任务索引
-- 当前颜色索引
-- 已采 episode 数
-
-
-### 6.8 数据质检层
-
-文件：
-
-- [check_data.py](/home/orin/openpi/scripts/data/check_data.py)
-
-职责：
-
-- 自动筛查异常 episode
-- 自动删除异常目录
-- 自动整理编号
-- 输出质检结果报告
-
-
-## 7. 当前配置与运行特性
-
-当前系统的重要运行参数如下：
-
-- 采集原始帧率：`30Hz`
-- 保存帧率：`50Hz`
-- 默认 `moveLine` 笛卡尔速度：`0.10 m/s`
-- 方块最小安全间距：`0.08m`
-- 默认夹爪力度：`10`
-- 默认夹爪速度：`20`
-
-当前运行方式具备以下工程特征：
-
-- 策略加载入口统一
-- 在线推理与运动执行解耦
-- 采集格式与训练侧统一
-- 状态文件支持断点续采
-- 质检脚本支持自动清理异常样本
-
-
-## 8. 当前关注项与建议
-
-当前仍建议持续关注以下工程项：
-
-- 碰撞检测阈值与停机策略仍建议按任务场景分别标定并形成固定配置
-- 采集流程、质检流程与数据存储策略可以进一步做成一键化作业链路
-- 运行参数建议继续沉淀为集中配置，便于不同场景下快速切换
-
-
-## 9. 结论
-
-当前 `/home/orin/openpi/scripts` 已形成完整的 Jetson 侧真实机器人执行与数据采集系统，能够支撑真实机器人在线推理执行、三色方块任务数据采集、断点续采、统一格式落盘以及自动数据质检。
-
-从对外汇报角度看，当前系统已经具备以下交付特征：
-
-- 真实机器人执行链路完整
-- 训练数据生产链路完整
-- 数据格式与训练侧对齐
-- 运行、采集、质检职责边界清晰
-- 核心模块结构稳定，便于继续扩展任务类型和工程配置
+data/check_data.py (独立运行)
+└── 扫描 episode 目录，质检 + 清理
+```

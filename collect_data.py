@@ -112,11 +112,19 @@ from task.pick_and_place import (
     load_scene_state,
 )
 from task.open_and_close import (
+    CLEAR_MIN_SPACING_M as OC_CLEAR_SPACING,
     MoveStep as OpenCloseMoveStep,
+    NUM_OBSTACLES,
+    OBSTACLE_NAMES,
+    ObstacleScene,
+    ObstacleState,
+    ObstacleTaskStep,
     OpenCloseReference,
+    build_clearing_steps,
     build_close_episode_plan,
     build_open_episode_plan,
     build_reference_from_tcp_pose,
+    generate_random_layout,
 )
 
 
@@ -413,6 +421,7 @@ def save_collect_state(
     *,
     held_object: str | None = None,
     open_close_reference: OpenCloseReference | None = None,
+    obstacle_scene: ObstacleScene | None = None,
 ) -> None:
     payload = _load_raw_state_payload(data_dir)
     legacy_open_close_reference = _deserialize_open_close_reference(payload.get("open_close_reference"))
@@ -429,10 +438,13 @@ def save_collect_state(
         payload["episode_count"] = int(episode_count)
         payload["held_object"] = _normalize_held_object(held_object)
     else:
-        payload["open_close_state"] = {
+        oc_state: dict[str, object] = {
             "episode_count": int(episode_count),
             "reference": _serialize_open_close_reference(open_close_reference),
         }
+        if obstacle_scene is not None:
+            oc_state["obstacles"] = obstacle_scene.to_serializable()
+        payload["open_close_state"] = oc_state
     path = _state_file_path(data_dir)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
@@ -468,9 +480,13 @@ def load_collect_state(data_dir: Path) -> dict | None:
         open_close_reference: OpenCloseReference | None = None
         open_close_episode_count: int | None = None
         open_close_payload = payload.get("open_close_state")
+        obstacle_scene: ObstacleScene | None = None
         if isinstance(open_close_payload, dict):
             open_close_episode_count = _load_state_counter(open_close_payload, "episode_count")
             open_close_reference = _deserialize_open_close_reference(open_close_payload.get("reference"))
+            raw_obstacles = open_close_payload.get("obstacles")
+            if isinstance(raw_obstacles, dict):
+                obstacle_scene = ObstacleScene.from_serialized(raw_obstacles)
         if open_close_reference is None:
             open_close_reference = _deserialize_open_close_reference(payload.get("open_close_reference"))
             if open_close_reference is not None:
@@ -491,6 +507,7 @@ def load_collect_state(data_dir: Path) -> dict | None:
             "open_close_episode_count": 0 if open_close_episode_count is None else open_close_episode_count,
             "has_valid_open_close_episode_count": has_valid_open_close_episode_count,
             "open_close_reference": open_close_reference,
+            "obstacle_scene": obstacle_scene,
         }
     except Exception:
         return None
@@ -1148,6 +1165,7 @@ def main() -> int:
     cleanup_scene_state: dict[str, dict[str, object]] | None = None
     runtime_held_object: str | None = None
     open_close_reference: OpenCloseReference | None = None
+    oc_obstacle_scene: ObstacleScene | None = None
     task_index = 0
     cleanup_state = {"done": False}
 
@@ -1273,6 +1291,9 @@ def main() -> int:
             else:
                 episode_count = int(saved.get("open_close_episode_count", 0))
                 saved_reference = saved.get("open_close_reference")
+                saved_obstacle_scene = saved.get("obstacle_scene")
+                if isinstance(saved_obstacle_scene, ObstacleScene):
+                    oc_obstacle_scene = saved_obstacle_scene
                 if isinstance(saved_reference, OpenCloseReference):
                     open_close_reference = saved_reference
                     print(
@@ -1280,6 +1301,8 @@ def main() -> int:
                         f"x_start={open_close_reference.x_start:.4f}, "
                         f"y_start={open_close_reference.y_start:.4f}"
                     )
+                    if oc_obstacle_scene is not None:
+                        print(f"  Loaded obstacle scene with {len(oc_obstacle_scene.obstacles)} objects.")
                     print(f"  Resuming with saved open/close reference (episode_count={episode_count}).")
                 else:
                     if saved.get("has_valid_open_close_episode_count", False):
@@ -1795,14 +1818,24 @@ def main() -> int:
                 f"x_start={open_close_reference.x_start:.4f}, "
                 f"y_start={open_close_reference.y_start:.4f}"
             )
-            save_collect_state(
-                save_dir,
-                {},
-                task_index,
-                episode_count,
-                open_close_reference=open_close_reference,
-            )
+            # Move to standard z_min+0.20 at reference xy before returning home
             if not args.dry_run:
+                ref_z_pose = build_pose_at_xy(
+                    open_close_reference.reference_pose6,
+                    open_close_reference.x_start,
+                    open_close_reference.y_start,
+                    float(MIN_TCP_Z + 0.20),
+                )
+                print(f"  Moving to reference z_min+0.20 = {MIN_TCP_Z + 0.20:.4f} m ...")
+                daemon_snap = get_robot_snapshot()
+                _ = execute_and_record(
+                    _get_servo_daemon(),
+                    cameras,
+                    ref_z_pose,
+                    gripper=1.0,
+                    start_frame_idx=0,
+                    speed_mps=LINEAR_SPEED,
+                )
                 return_home("post-reference return home")
         else:
             print(
@@ -1810,6 +1843,80 @@ def main() -> int:
                 f"x_start={open_close_reference.x_start:.4f}, "
                 f"y_start={open_close_reference.y_start:.4f}"
             )
+
+        # --- Obstacle initialization: receive 5 objects ---
+        if oc_obstacle_scene is None:
+            print(f"\n=== Obstacle Initialization ({NUM_OBSTACLES} objects) ===")
+            print("Place objects one by one at the pickup point. The robot will grab continuously.")
+            oc_obstacle_scene = ObstacleScene({})
+            for idx, obj_name in enumerate(OBSTACLE_NAMES):
+                # Sample random placement
+                occupied = [origin_xy.copy()] + oc_obstacle_scene.occupied_positions()
+                xy = sample_non_overlapping_xy(occupied, min_dist=OC_CLEAR_SPACING)
+                is_rotate = bool(np.random.random() < 0.5)
+                deg = 0.0
+                if is_rotate:
+                    abs_deg = float(np.random.uniform(12.0, 22.5))
+                    deg = -abs_deg if np.random.random() < 0.5 else abs_deg
+                print(
+                    f"  [{idx + 1}/{NUM_OBSTACLES}] {obj_name}: "
+                    f"-> ({xy[0]:.4f}, {xy[1]:.4f}), rotate={is_rotate}, deg={deg:.1f}"
+                )
+                if not args.dry_run:
+                    pick_step = TaskStep(
+                        kind="pick",
+                        object_name=obj_name,
+                        xy=(float(origin_xy[0]), float(origin_xy[1])),
+                        level=0,
+                        is_rotate=False,
+                        deg=0.0,
+                        align_j6=True,
+                        note=f"obstacle prep pick {obj_name}",
+                    )
+                    place_step = TaskStep(
+                        kind="place",
+                        object_name=obj_name,
+                        xy=(float(xy[0]), float(xy[1])),
+                        level=0,
+                        is_rotate=is_rotate,
+                        deg=deg,
+                        align_j6=True,
+                        note=f"obstacle prep place {obj_name}",
+                    )
+                    # Build a temporary scene_state dict for execute_step_sequence
+                    temp_state: dict[str, dict[str, object]] = {
+                        obj_name: {
+                            "xy": [float(origin_xy[0]), float(origin_xy[1])],
+                            "is_rotate": False,
+                            "deg": 0.0,
+                            "standard_j6_rad": None,
+                            "upper": None,
+                            "lower": None,
+                        }
+                    }
+                    _, held_after = execute_step_sequence(
+                        [pick_step, place_step],
+                        record=False,
+                        lookup_scene_state=temp_state,
+                        result_scene_state=temp_state,
+                    )
+                    if held_after is not None:
+                        raise RuntimeError(f"obstacle prep ended while holding {held_after}")
+                    return_home(f"[obstacle prep {obj_name}] return home")
+                oc_obstacle_scene.obstacles[obj_name] = ObstacleState(
+                    name=obj_name,
+                    xy=(float(xy[0]), float(xy[1])),
+                    is_rotate=is_rotate,
+                    deg=deg,
+                )
+            print(f"  All {NUM_OBSTACLES} obstacles placed.")
+            save_collect_state(
+                save_dir, {}, task_index, episode_count,
+                open_close_reference=open_close_reference,
+                obstacle_scene=oc_obstacle_scene,
+            )
+        else:
+            print(f"\n  Using saved obstacle scene ({len(oc_obstacle_scene.obstacles)} objects).")
 
     max_ep = auto_episodes if auto_episodes > 0 else args.max_episodes
 
@@ -1855,6 +1962,114 @@ def main() -> int:
             else:
                 if open_close_reference is None:
                     raise RuntimeError("open/close reference is not initialized")
+                if oc_obstacle_scene is None:
+                    raise RuntimeError("obstacle scene is not initialized")
+
+                # --- Step 1: Generate random layout for this cycle ---
+                cycle_layout = generate_random_layout(
+                    oc_obstacle_scene,
+                    y_target=open_close_reference.y_start,
+                    workspace_x_min=WORKSPACE_X_MIN,
+                    workspace_x_max=WORKSPACE_X_MAX,
+                    workspace_y_min=WORKSPACE_Y_MIN,
+                    workspace_y_max=WORKSPACE_Y_MAX,
+                    min_spacing=OC_CLEAR_SPACING,
+                )
+
+                # --- Step 2: Physically rearrange obstacles to match layout (NOT recorded) ---
+                print("  [layout] Rearranging obstacles to cycle layout...")
+                for obj_name in OBSTACLE_NAMES:
+                    old_obj = oc_obstacle_scene.obstacles[obj_name]
+                    new_obj = cycle_layout.obstacles[obj_name]
+                    old_xy = np.asarray(old_obj.xy)
+                    new_xy = np.asarray(new_obj.xy)
+                    if float(np.linalg.norm(old_xy - new_xy)) < 0.005 and old_obj.is_rotate == new_obj.is_rotate:
+                        continue  # No need to move
+                    # If stacked, skip for now — will be handled by stacking pass
+                    if new_obj.lower is not None:
+                        continue
+                    print(
+                        f"    {obj_name}: ({old_obj.xy[0]:.3f},{old_obj.xy[1]:.3f}) -> "
+                        f"({new_obj.xy[0]:.3f},{new_obj.xy[1]:.3f}) rotate={new_obj.is_rotate}"
+                    )
+                    if not args.dry_run:
+                        pick_step = TaskStep(
+                            kind="pick", object_name=obj_name,
+                            xy=tuple(old_obj.xy), level=0,
+                            is_rotate=old_obj.is_rotate, deg=old_obj.deg,
+                            align_j6=True, note=f"layout pick {obj_name}",
+                        )
+                        place_step = TaskStep(
+                            kind="place", object_name=obj_name,
+                            xy=tuple(new_obj.xy), level=0,
+                            is_rotate=new_obj.is_rotate, deg=new_obj.deg,
+                            align_j6=True, note=f"layout place {obj_name}",
+                        )
+                        temp_state: dict[str, dict[str, object]] = {
+                            obj_name: {
+                                "xy": list(old_obj.xy), "is_rotate": old_obj.is_rotate,
+                                "deg": old_obj.deg, "standard_j6_rad": None,
+                                "upper": None, "lower": None,
+                            }
+                        }
+                        _, held = execute_step_sequence(
+                            [pick_step, place_step], record=False,
+                            lookup_scene_state=temp_state, result_scene_state=temp_state,
+                        )
+                        if held is not None:
+                            raise RuntimeError(f"layout rearrange ended while holding {held}")
+                        return_home(f"[layout {obj_name}] return home")
+
+                # Handle stacking (place upper onto lower)
+                for obj_name in OBSTACLE_NAMES:
+                    new_obj = cycle_layout.obstacles[obj_name]
+                    if new_obj.lower is not None and new_obj.upper is None:
+                        # This is the top of a stack — pick from its current pos, place on lower
+                        current_xy = cycle_layout.obstacles[obj_name].xy
+                        lower_name = new_obj.lower
+                        lower_xy = cycle_layout.obstacles[lower_name].xy
+                        print(f"    {obj_name}: stacking onto {lower_name} at ({lower_xy[0]:.3f},{lower_xy[1]:.3f})")
+                        if not args.dry_run:
+                            pick_step = TaskStep(
+                                kind="pick", object_name=obj_name,
+                                xy=tuple(current_xy), level=0,
+                                is_rotate=new_obj.is_rotate, deg=new_obj.deg,
+                                align_j6=True, note=f"stack pick {obj_name}",
+                            )
+                            place_step = TaskStep(
+                                kind="place", object_name=obj_name,
+                                xy=tuple(lower_xy), level=1,
+                                is_rotate=new_obj.is_rotate, deg=new_obj.deg,
+                                align_j6=True, note=f"stack place {obj_name} on {lower_name}",
+                            )
+                            temp_state = {
+                                obj_name: {
+                                    "xy": list(current_xy), "is_rotate": new_obj.is_rotate,
+                                    "deg": new_obj.deg, "standard_j6_rad": None,
+                                    "upper": None, "lower": None,
+                                }
+                            }
+                            _, held = execute_step_sequence(
+                                [pick_step, place_step], record=False,
+                                lookup_scene_state=temp_state, result_scene_state=temp_state,
+                            )
+                            if held is not None:
+                                raise RuntimeError(f"stacking ended while holding {held}")
+                            return_home(f"[stack {obj_name}] return home")
+
+                oc_obstacle_scene = cycle_layout.copy()
+
+                # --- Step 3: Build clearing steps ---
+                clearing_steps, scene_after_clear = build_clearing_steps(
+                    oc_obstacle_scene,
+                    y_target=open_close_reference.y_start,
+                    workspace_x_min=WORKSPACE_X_MIN,
+                    workspace_x_max=WORKSPACE_X_MAX,
+                    workspace_y_min=WORKSPACE_Y_MIN,
+                    workspace_y_max=WORKSPACE_Y_MAX,
+                    min_spacing=OC_CLEAR_SPACING,
+                )
+
                 open_plan = build_open_episode_plan(
                     reference=open_close_reference,
                     target_z=float(MIN_TCP_Z + 0.20),
@@ -1870,7 +2085,8 @@ def main() -> int:
                     workspace_y_max=WORKSPACE_Y_MAX,
                 )
                 cycle_label = f"Cycle {episode_count // 2}"
-                print(f"\n--- {cycle_label} [open -> close] ---")
+                print(f"\n--- {cycle_label} [clear -> open -> close] ---")
+                print(f"  Clearing steps: {len(clearing_steps)}")
                 print(f"  Open prompt:  \"{open_plan.prompt}\"")
                 print(f"  Open steps:   {len(open_plan.recorded_steps)}")
                 print(f"  Close prompt: \"{close_plan.prompt}\"")
@@ -1910,17 +2126,60 @@ def main() -> int:
                     result_scene_state=episode_execution_scene_state,
                 )
             else:
+                # --- Execute clearing steps (recorded, part of open episode) ---
+                clearing_frames: list[RecordedFrame] = []
+                if clearing_steps:
+                    # Convert ObstacleTaskStep -> TaskStep for execute_step_sequence
+                    clear_task_steps: list[TaskStep] = []
+                    for cs in clearing_steps:
+                        clear_task_steps.append(TaskStep(
+                            kind=cs.kind,
+                            object_name=cs.object_name,
+                            xy=cs.xy,
+                            level=cs.level,
+                            is_rotate=cs.is_rotate,
+                            deg=cs.deg,
+                            note=cs.note,
+                            align_j6=cs.align_j6,
+                        ))
+                    # Build a temporary scene state dict for execution
+                    clear_scene_state: dict[str, dict[str, object]] = {}
+                    for oname, ostate in oc_obstacle_scene.obstacles.items():
+                        clear_scene_state[oname] = {
+                            "xy": list(ostate.xy),
+                            "is_rotate": ostate.is_rotate,
+                            "deg": ostate.deg,
+                            "standard_j6_rad": None,
+                            "upper": ostate.upper,
+                            "lower": ostate.lower,
+                        }
+                    clearing_frames, held_after_clear = execute_step_sequence(
+                        clear_task_steps,
+                        record=True,
+                        lookup_scene_state=clear_scene_state,
+                        result_scene_state=clear_scene_state,
+                    )
+                    if held_after_clear is not None:
+                        raise RuntimeError(f"clearing ended while holding {held_after_clear}")
+                    if not args.dry_run:
+                        return_home("post-clear return home")
+
+                # Update obstacle scene to post-clear state
+                oc_obstacle_scene = scene_after_clear
+
+                # --- Execute open move steps (recorded) ---
                 open_frames = execute_move_step_sequence(
                     open_plan.recorded_steps,
                     record=True,
                     base_pose6=open_close_reference.reference_pose6,
                 )
+                # --- Execute close move steps (recorded) ---
                 close_frames = execute_move_step_sequence(
                     close_plan.recorded_steps,
                     record=True,
                     base_pose6=open_close_reference.reference_pose6,
                 )
-                all_frames = [*open_frames, *close_frames]
+                all_frames = [*clearing_frames, *open_frames, *close_frames]
                 held_after_recorded = None
             if not all_frames:
                 raise RuntimeError("recorded episode produced no frames")
@@ -1935,12 +2194,14 @@ def main() -> int:
                 )
                 episode_count += 1
             else:
-                if not open_frames:
+                # Clearing frames are part of the open episode
+                combined_open_frames = [*clearing_frames, *open_frames]
+                if not combined_open_frames:
                     raise RuntimeError("open episode produced no frames")
                 if not close_frames:
                     raise RuntimeError("close episode produced no frames")
                 save_episode(
-                    open_frames,
+                    combined_open_frames,
                     save_dir,
                     open_plan.prompt,
                     save_fps=save_fps,
@@ -1984,6 +2245,7 @@ def main() -> int:
                     task_index,
                     episode_count,
                     open_close_reference=open_close_reference,
+                    obstacle_scene=oc_obstacle_scene,
                 )
             continue
     except KeyboardInterrupt:

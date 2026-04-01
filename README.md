@@ -2,26 +2,14 @@
 
 本仓库为 OpenPI 在 AUBO i5 机械臂上的 Jetson 侧完整系统，包含 **在线推理执行** 和 **训练数据采集** 两条链路。
 
----
-
-## 目录
-
-- [快速开始](#快速开始)
-- [如何训练出一个可用的权重](#如何训练出一个可用的权重)
-- [文件结构与功能说明](#文件结构与功能说明)
-- [数据格式](#数据格式)
-- [调用关系](#调用关系)
-
----
-
 ## 快速开始
 
 ### 环境要求
 
 - Jetson Orin + AUBO i5（IP: 192.168.1.100）
-- 双路 Orbbec RGB 相机（主视角 + 腕部）
-- Lebai 夹爪（USB-RS485）
-- Python 3.10+，依赖：`numpy`, `cv2`, `pyorbbecsdk`, `pyserial`
+- 双路 Orbbec RGB 相机（主视角335L + 腕部305）
+- Lebai 夹爪（USB-RS485通信 机械臂末端工具IO供电）
+- Python 3.10+，依赖：`numpy`, `cv2`, `pyorbbecsdk`, `pyserial` 等
 - AUBO SDK (`libaubo_sdk.so`)，C++ helper 会在首次运行时自动编译
 
 ### 运行推理
@@ -29,15 +17,14 @@
 ```bash
 cd /home/orin/openpi/scripts
 
-# 本地 checkpoint 推理
+# checkpoint 推理
 python main.py
 
-# 远端推理服务
-python main.py --remote
 ```
 
-启动后进入 TUI 菜单，可配置：
-- **Task**：`pick_and_place` / `open_and_close`
+启动后进入 TUI 菜单，可配置:
+- **Frame**：`sim` / `real`
+- **Policy**：`remote` / `local`
 - **State Mode**：`j6`（不锁 yaw）/ `yaw`（锁 yaw）
 - **Speed Mode**：`limited`（限速）/ `native`（原生速度，自动插值）
 - **Exec Speed**：限速模式下的笛卡尔速度（m/s）
@@ -45,18 +32,17 @@ python main.py --remote
 ### 运行数据采集
 
 ```bash
-# 采集 pick_and_place 任务数据
-python collect_data.py --task pick_and_place --save-dir data/pick_place
-
-# 采集 open_and_close 任务数据
-python collect_data.py --task open_and_close --save-dir data/open_close
-
-# 自动连续采集 100 个 episode
-python collect_data.py --task pick_and_place --save-dir data/pick_place --auto 100
-
-# 空跑模式（不连接机器人）
-python collect_data.py --task pick_and_place --save-dir data/test --dry-run
+# 采集任务数据
+python collect_data.py
 ```
+
+- **Task**：`pick_and_place` / `open_and_close` / `后续任务`
+- **Resume**：`conntinue` / `reset`
+- **Save FPS**：`30` / `50`
+- **State Mode**：`j6` / `yaw`
+- **Mode**：`auto` / `manual`
+- **Auto Episode**：Mode-auto时可选最大采集轮次
+
 
 ### 数据质检
 
@@ -72,40 +58,42 @@ python data/check_data.py data/pick_place
 
 整体流程分为三步：**采集 → 训练 → 部署**。
 
-### 第一步：采集训练数据
+### 第一步：采集训练数据(硬编码位姿)
 
 1. 在 Jetson 上运行 `collect_data.py`，选择目标任务（`pick_and_place` 或 `open_and_close`）
 2. 系统自动完成：
    - **准备阶段**：将物体从原点摆放到随机位置
    - **录制阶段**：执行任务的同时以 30Hz 记录双路图像 + 机器人状态
-   - **保存阶段**：重采样到 50Hz，以标准格式落盘
+   - **保存阶段(可选)**：重采样到 50Hz，以标准格式落盘
    - **恢复阶段**：整理工作区，进入下一轮
 3. 采集结束后运行 `data/check_data.py` 清理异常数据
-4. 每个任务建议采集 **50-200 个 episode**
+4. 每个任务建议采集 **20-50 个 episode**
 
 采集产出的每个 episode 包含：`states.npy`, `actions.npy`, `timestamps.npy`, `env_steps.npy`, `images.npz`, `metadata.json`
 
-### 第二步：在 WSL/服务器端训练
+### 第二步：在服务器端训练
 
-将采集好的 `data/` 目录拷贝到训练机器（WSL 或服务器），使用 OpenPI 官方训练流程：
+将采集好的 `data/` 目录拷贝到训练机器，使用 OpenPI 官方训练流程：
 
 ```bash
+# 1.转换数据到标准LeRobot格式(见mujoco-env仓库)
+python convert_mujoco_to_lerobot.py
+
 # 在 openpi/repo 目录下
-# 1. 确认训练配置（config 中指定数据路径和 LoRA 参数）
+# 2. 确认训练配置（config 中指定数据路径和 LoRA 参数）
 #    默认配置名: pi05_aubo_agv_lora
 
-# 2. 启动训练
+# 3.数据归一化
+cd /path/to/openpi
+source ./.venv/bin/activate
+uv run scripts/compute_norm_stats.py --config-name pi05_aubo_agv_lora
+
+# 4. 启动训练
 uv run scripts/train.py --config pi05_aubo_agv_lora
 
-# 3. 训练完成后在 checkpoints/ 下生成权重
+# 5. 训练完成后在 checkpoints/ 下生成权重
 #    例如: checkpoints/pi05_aubo_agv_lora/my_first_run/9999
 ```
-
-训练配置需要关注：
-- `data_path`：指向采集数据目录
-- `action_dim`：7（dx, dy, dz, droll, dpitch, dyaw, gripper）
-- `state_dim`：8（x, y, z, qw, qx, qy, qz, gripper）
-- LoRA rank 和学习率根据数据量调整
 
 ### 第三步：部署推理
 
@@ -120,11 +108,7 @@ scp -r checkpoints/pi05_aubo_agv_lora/my_first_run/9999 \
 python main.py
 ```
 
-或使用远端推理服务（K8s pod 部署 checkpoint，Jetson 通过 WebSocket 调用）：
-
-```bash
-python main.py --remote
-```
+或使用远端推理服务（K8s pod 部署 checkpoint，Jetson 基于 Kubeconfig.yaml 通过 WebSocket 调用:
 
 ---
 
@@ -143,7 +127,7 @@ scripts/
 │   ├── tcp_control.py               # TCP 笛卡尔轨迹规划与执行
 │   └── tui_config.py                # TUI 交互式配置菜单
 ├── task/
-│   ├── pick_and_place.py            # pick/put/stack 任务规划
+│   ├── pick_and_place.py            # pick/put 任务规划
 │   └── open_and_close.py            # 开关盖任务规划 + 障碍物管理
 ├── data/
 │   └── check_data.py                # 数据集质检与清理
@@ -180,9 +164,9 @@ scripts/
 核心逻辑：
 - **pick_and_place 模式**：维护 4 个物体（red/green/blue/apple）的场景状态，自动生成 pick/put/stack 任务，录制执行段，任务后执行 post_steps 恢复场景
 - **open_and_close 模式**：维护 5 个障碍物的场景状态，每个周期随机布局 → 物理摆放 → 清障（录制，属于 open episode）→ 开盖（录制）→ 关盖（录制），每周期产出 2 个 episode
-- 30Hz 原始录制，保存前重采样到 50Hz
+- 30Hz 原始录制，保存前重采样到 50Hz(可选)
 - 支持断点续采（`.collect_state.json`）
-- 支持 `--auto N` 连续采集和 `--dry-run` 空跑
+- 支持连续采集和 `--dry-run` 空跑
 
 **调用的模块**：
 - `task/pick_and_place.py` → 任务规划（pick/put/stack 步骤生成）
@@ -267,30 +251,18 @@ scripts/
 
 ## 数据格式
 
-数据格式由 `state_mode` 决定，有 `yaw` 和 `j6` 两种模式。每个 episode 目录（`episode_XXXXXX/`）包含：
+每个 episode 目录（`episode_XXXXXX/`）包含：
 
 | 文件 | 形状 | 说明 |
 |------|------|------|
-| `states.npy` | `(N, 7)` yaw 模式 | `[x, y, z, aa_x, aa_y, aa_z, gripper]` |
-|              | `(N, 8)` j6 模式  | `[x, y, z, aa_x, aa_y, aa_z, gripper, j6]` |
-| `actions.npy` | `(N, 7)` yaw 模式 | `[dx, dy, dz, droll, dpitch, dyaw, gripper_next]` |
-|               | `(N, 7)` j6 模式  | `[dx, dy, dz, droll, dpitch, dj6, gripper_next]` |
-| `timestamps.npy` | `(N,)` | `env_steps / 50`，50Hz 网格 |
+| `states.npy` | `(N, 7)` | `[x, y, z, aa_x, aa_y, aa_z, gripper]`，仿真坐标系, yaw格式 |
+| `states.npy` | `(N, 8)` | `[x, y, z, aa_x, aa_y, aa_z, gripper, j6]`，仿真坐标系, j6格式 |
+| `actions.npy` | `(N, 7)` | `[dx, dy, dz, droll, dpitch, dyaw, gripper]`，相邻 state 差分, yaw格式 |
+| `actions.npy` | `(N, 7)` | `[dx, dy, dz, droll, dpitch, dj6, gripper]`，相邻 state 差分， j6格式 |
+| `timestamps.npy` | `(N,)` | `env_steps / 50/30`，50Hz/30Hz 网格 |
 | `env_steps.npy` | `(N,)` | `0..N-1` |
 | `images.npz` | — | 含 `main_images (N,224,224,3)` 和 `wrist_images (N,224,224,3)` |
 | `metadata.json` | — | 含 `prompt`, `save_fps`, `state_mode` 等 |
-
-**两种模式的区别：**
-
-- **yaw 模式**（`state_mode="yaw"`，对应 TUI 中 State Mode = yaw，自动锁 yaw）
-  - 姿态用 axis-angle 表示：`aa_x, aa_y, aa_z`
-  - action 第 6 维是 `dyaw`（TCP 偏航角增量）
-  - state 维度为 7
-
-- **j6 模式**（`state_mode="j6"`，对应 TUI 中 State Mode = j6，不锁 yaw）
-  - 姿态同样用 axis-angle：`aa_x, aa_y, aa_z`
-  - action 第 6 维是 `dj6`（第 6 关节角增量，替代 dyaw）
-  - state 多一维 `j6`（第 6 关节当前角度），维度为 8
 
 ---
 

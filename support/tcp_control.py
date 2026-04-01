@@ -601,7 +601,6 @@ def integrate_delta_tcp_pose(
     delta6: np.ndarray,
     *,
     lock_yaw: bool = False,
-    z_min: float = DEFAULT_Z_MIN_M,
 ) -> np.ndarray:
     pose = np.asarray(pose6_zyx, dtype=np.float64).reshape(POSE_DIM)
     delta = np.asarray(delta6, dtype=np.float64).reshape(OPENPI_DELTA_DIM).copy()
@@ -610,9 +609,6 @@ def integrate_delta_tcp_pose(
     out = pose.copy()
     out[:3] = pose[:3] + delta[:3]
     out[3:] = wrap_euler_zyx(pose[3:] + delta[3:])
-    # Clip z to minimum safe height
-    if out[2] < z_min:
-        out[2] = z_min
     return out
 
 
@@ -915,6 +911,7 @@ def retime_tcp_action_chunk(
     control_dt_s: float = DEFAULT_TRACK_CONTROL_DT_S,
     max_linear_speed_mps: float = DEFAULT_TCP_LINEAR_SPEED_MPS,
     max_angular_speed_radps: float = DEFAULT_TCP_ANGULAR_SPEED_RADPS,
+    z_min: float = DEFAULT_Z_MIN_M,
 ) -> RetimedTcpChunk:
     """Retime a chunk of TCP delta actions into fine-grained servo steps.
 
@@ -953,6 +950,11 @@ def retime_tcp_action_chunk(
             current_sim = integrate_delta_tcp_pose(current_sim, step_delta, lock_yaw=lock_yaw)
             # Convert to real frame for robot SDK
             current_real = sim_pose_to_real(current_sim)
+            # Clip TCP z in real frame to minimum safe height
+            if current_real[2] < z_min:
+                current_real[2] = z_min
+                # Reflect the clipped real pose back to sim frame
+                current_sim = real_pose_to_sim(current_real)
             steps.append(RetimedTcpStep(
                 pose_real=current_real.copy(),
                 pose_sim=current_sim.copy(),

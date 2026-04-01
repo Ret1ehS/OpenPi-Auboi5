@@ -79,8 +79,8 @@ def build_close_episode_plan(
         prompt=CLOSE_PROMPT,
         recorded_steps=[
             MoveStep(x=x_rand, y=y_rand, z=float(target_z), note="close step 1 random approach"),
-            MoveStep(x=x_start - 0.24, y=y_start, z=float(target_z), note="close step 2 align high"),
-            MoveStep(x=x_start - 0.24, y=y_start, z=float(press_z), note="close step 3 lower"),
-            MoveStep(x=x_start + 0.02, y=y_start, z=float(press_z), note="close step 4 push"),
+            MoveStep(x=x_start - 0.26, y=y_start, z=float(target_z), note="close step 2 align high"),
+            MoveStep(x=x_start - 0.26, y=y_start, z=float(press_z - 0.02), note="close step 3 lower"),
+            MoveStep(x=x_start + 0.02, y=y_start, z=float(press_z - 0.02), note="close step 4 push"),
         ],
     )

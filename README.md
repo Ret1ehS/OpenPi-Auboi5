@@ -267,16 +267,30 @@ scripts/
 
 ## 数据格式
 
-每个 episode 目录（`episode_XXXXXX/`）包含：
+数据格式由 `state_mode` 决定，有 `yaw` 和 `j6` 两种模式。每个 episode 目录（`episode_XXXXXX/`）包含：
 
 | 文件 | 形状 | 说明 |
 |------|------|------|
-| `states.npy` | `(N, 8)` | `[x, y, z, qw, qx, qy, qz, gripper]`，仿真坐标系 |
-| `actions.npy` | `(N, 7)` | `[dx, dy, dz, droll, dpitch, dyaw, gripper]`，相邻 state 差分 |
+| `states.npy` | `(N, 7)` yaw 模式 | `[x, y, z, aa_x, aa_y, aa_z, gripper]` |
+|              | `(N, 8)` j6 模式  | `[x, y, z, aa_x, aa_y, aa_z, gripper, j6]` |
+| `actions.npy` | `(N, 7)` yaw 模式 | `[dx, dy, dz, droll, dpitch, dyaw, gripper_next]` |
+|               | `(N, 7)` j6 模式  | `[dx, dy, dz, droll, dpitch, dj6, gripper_next]` |
 | `timestamps.npy` | `(N,)` | `env_steps / 50`，50Hz 网格 |
 | `env_steps.npy` | `(N,)` | `0..N-1` |
 | `images.npz` | — | 含 `main_images (N,224,224,3)` 和 `wrist_images (N,224,224,3)` |
 | `metadata.json` | — | 含 `prompt`, `save_fps`, `state_mode` 等 |
+
+**两种模式的区别：**
+
+- **yaw 模式**（`state_mode="yaw"`，对应 TUI 中 State Mode = yaw，自动锁 yaw）
+  - 姿态用 axis-angle 表示：`aa_x, aa_y, aa_z`
+  - action 第 6 维是 `dyaw`（TCP 偏航角增量）
+  - state 维度为 7
+
+- **j6 模式**（`state_mode="j6"`，对应 TUI 中 State Mode = j6，不锁 yaw）
+  - 姿态同样用 axis-angle：`aa_x, aa_y, aa_z`
+  - action 第 6 维是 `dj6`（第 6 关节角增量，替代 dyaw）
+  - state 多一维 `j6`（第 6 关节当前角度），维度为 8
 
 ---
 

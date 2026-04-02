@@ -1237,12 +1237,10 @@ def main() -> int:
             lift_pose = startup_tcp_pose.copy()
             lift_pose[2] = lift_z
             print(f"  Lifting to z={lift_z:.4f} m at startup xy before homing...")
-            _ = execute_and_record(
+            execute_movel_and_wait(
                 _get_motion_daemon(),
-                cameras,
                 lift_pose,
-                gripper=1.0,
-                start_frame_idx=0,
+                "lift before homing",
                 speed_mps=LINEAR_SPEED,
             )
 

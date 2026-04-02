@@ -17,6 +17,16 @@ CLEAR_MIN_SPACING_M = 0.10  # obstacles must be ≥10 cm apart after clearing
 BAND_OBJECT_COUNT_MIN = 2
 BAND_OBJECT_COUNT_MAX = 4
 STACK_PROBABILITY = 0.70
+OBSTACLE_LAYOUT_X_MAX_M = 0.60
+
+
+def _bounded_layout_x_max(workspace_x_min: float, workspace_x_max: float) -> float:
+    bounded_x_max = min(float(workspace_x_max), OBSTACLE_LAYOUT_X_MAX_M)
+    if bounded_x_max < float(workspace_x_min):
+        raise RuntimeError(
+            f"invalid layout x bounds: x_min={workspace_x_min}, x_max={bounded_x_max}"
+        )
+    return bounded_x_max
 
 
 @dataclass(frozen=True)
@@ -265,12 +275,13 @@ def generate_random_layout(
     # Clamp band to workspace
     band_y_lo = max(band_y_lo, workspace_y_min)
     band_y_hi = min(band_y_hi, workspace_y_max)
+    layout_x_max = _bounded_layout_x_max(workspace_x_min, workspace_x_max)
 
     occupied: list[np.ndarray] = []
 
     def _sample_xy(y_lo: float, y_hi: float) -> np.ndarray:
         for _ in range(512):
-            x = float(np.random.uniform(workspace_x_min, workspace_x_max))
+            x = float(np.random.uniform(workspace_x_min, layout_x_max))
             y = float(np.random.uniform(y_lo, y_hi))
             c = np.array([x, y], dtype=np.float64)
             if all(float(np.linalg.norm(c - p)) >= min_spacing for p in occupied):
@@ -340,6 +351,7 @@ def build_clearing_steps(
     result = scene.copy()
     band_lo = y_target - CLEAR_BAND_M
     band_hi = y_target + CLEAR_BAND_M
+    layout_x_max = _bounded_layout_x_max(workspace_x_min, workspace_x_max)
 
     # Determine which side to clear to
     # Check if each side has room (at least min_spacing from workspace edge)
@@ -373,7 +385,7 @@ def build_clearing_steps(
         y_lo, y_hi = _pick_clear_y(obj_y)
         occupied = result.occupied_positions(exclude={obj_name})
         for _ in range(512):
-            x = float(np.random.uniform(workspace_x_min, workspace_x_max))
+            x = float(np.random.uniform(workspace_x_min, layout_x_max))
             y = float(np.random.uniform(y_lo, y_hi))
             c = np.array([x, y], dtype=np.float64)
             if all(float(np.linalg.norm(c - p)) >= min_spacing for p in occupied):

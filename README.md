@@ -35,13 +35,13 @@ python main.py
 # 采集任务数据
 python collect_data.py
 ```
-TUI 菜单，可配置:
+
 - **Task**：`pick_and_place` / `open_and_close` / `后续任务`
 - **Resume**：`conntinue` / `reset`
 - **Save FPS**：`30` / `50`
 - **State Mode**：`j6` / `yaw`
 - **Mode**：`auto` / `manual`
-- **Auto Episode**：Auto模式下的最大采集轮次
+- **Auto Episode**：Mode-auto时可选最大采集轮次
 
 
 ### 数据质检
@@ -64,7 +64,7 @@ python data/check_data.py data/pick_place
 2. 系统自动完成：
    - **准备阶段**：将物体从原点摆放到随机位置
    - **录制阶段**：执行任务的同时以 30Hz 记录双路图像 + 机器人状态
-   - **保存阶段**：重采样到 50Hz(可选)，以标准格式落盘
+   - **保存阶段(可选)**：重采样到 50Hz，以标准格式落盘
    - **恢复阶段**：整理工作区，进入下一轮
 3. 采集结束后运行 `data/check_data.py` 清理异常数据
 4. 每个任务建议采集 **20-50 个 episode**

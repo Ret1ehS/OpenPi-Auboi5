@@ -233,6 +233,43 @@ class ObstacleScene:
         self.obstacles[actual].upper = name
 
 
+def sample_obstacle_orientation(
+    *,
+    rotate_prob: float = 0.5,
+    rotate_deg_min: float = 12.0,
+    rotate_deg_max: float = 22.5,
+) -> tuple[bool, float]:
+    if np.random.random() < rotate_prob:
+        abs_deg = float(np.random.uniform(rotate_deg_min, rotate_deg_max))
+        sign = -1.0 if np.random.random() < 0.5 else 1.0
+        return True, sign * abs_deg
+    return False, 0.0
+
+
+def sample_obstacle_xy(
+    scene: ObstacleScene,
+    *,
+    object_name: str,
+    workspace_x_min: float,
+    workspace_x_max: float,
+    y_min: float,
+    y_max: float,
+    min_spacing: float = CLEAR_MIN_SPACING_M,
+) -> tuple[float, float]:
+    if float(y_max) < float(y_min):
+        raise RuntimeError(f"invalid layout y bounds: y_min={y_min}, y_max={y_max}")
+
+    layout_x_max = _bounded_layout_x_max(workspace_x_min, workspace_x_max)
+    occupied = scene.occupied_positions(exclude={object_name})
+    for _ in range(512):
+        x = float(np.random.uniform(workspace_x_min, layout_x_max))
+        y = float(np.random.uniform(y_min, y_max))
+        candidate = np.array([x, y], dtype=np.float64)
+        if all(float(np.linalg.norm(candidate - p)) >= min_spacing for p in occupied):
+            return float(candidate[0]), float(candidate[1])
+    raise RuntimeError(f"failed to sample obstacle xy for {object_name}")
+
+
 # ---------------------------------------------------------------------------
 # Layout generation: random placement for each cycle
 # ---------------------------------------------------------------------------
@@ -275,45 +312,32 @@ def generate_random_layout(
     # Clamp band to workspace
     band_y_lo = max(band_y_lo, workspace_y_min)
     band_y_hi = min(band_y_hi, workspace_y_max)
-    layout_x_max = _bounded_layout_x_max(workspace_x_min, workspace_x_max)
-
-    # Track ALL physical positions: start with every object's current (old) position.
-    # As each object gets a new position, remove its old pos and add the new one.
-    # This prevents new placements from landing on top of unmoved objects.
-    occupied: dict[str, np.ndarray] = {
-        n: np.asarray(scene.obstacles[n].xy, dtype=np.float64) for n in names
-    }
-
-    def _sample_xy(obj_name: str, y_lo: float, y_hi: float) -> np.ndarray:
-        # Check against all positions EXCEPT this object's own old position
-        others = [p for n, p in occupied.items() if n != obj_name]
-        for _ in range(512):
-            x = float(np.random.uniform(workspace_x_min, layout_x_max))
-            y = float(np.random.uniform(y_lo, y_hi))
-            c = np.array([x, y], dtype=np.float64)
-            if all(float(np.linalg.norm(c - p)) >= min_spacing for p in others):
-                return c
-        raise RuntimeError(f"failed to sample obstacle xy for {obj_name}")
-
-    def _sample_orient() -> tuple[bool, float]:
-        if np.random.random() < rotate_prob:
-            abs_deg = float(np.random.uniform(rotate_deg_min, rotate_deg_max))
-            sign = -1.0 if np.random.random() < 0.5 else 1.0
-            return True, sign * abs_deg
-        return False, 0.0
-
-    # Place band objects on table first
-    for name in band_names:
-        xy = _sample_xy(name, band_y_lo, band_y_hi)
-        occupied[name] = xy  # replace old pos with new pos
-        is_rot, deg = _sample_orient()
-        result.place_on_table(name, (float(xy[0]), float(xy[1])), is_rotate=is_rot, deg=deg)
-
-    # 70% chance: stack 2 of the band objects
+    bottom: str | None = None
+    top: str | None = None
     if len(band_names) >= 2 and np.random.random() < STACK_PROBABILITY:
         stack_pair = list(np.random.choice(band_names, size=2, replace=False))
-        bottom, top = stack_pair[0], stack_pair[1]
-        result.place_on_object(top, bottom)
+        bottom, top = str(stack_pair[0]), str(stack_pair[1])
+
+    # Sample against the current scene occupancy one object at a time.
+    # The future stack-top keeps its current location occupied until the final stack move.
+    for name in band_names:
+        if name == top:
+            continue
+        xy = sample_obstacle_xy(
+            result,
+            object_name=name,
+            workspace_x_min=workspace_x_min,
+            workspace_x_max=workspace_x_max,
+            y_min=band_y_lo,
+            y_max=band_y_hi,
+            min_spacing=min_spacing,
+        )
+        is_rot, deg = sample_obstacle_orientation(
+            rotate_prob=rotate_prob,
+            rotate_deg_min=rotate_deg_min,
+            rotate_deg_max=rotate_deg_max,
+        )
+        result.place_on_table(name, xy, is_rotate=is_rot, deg=deg)
 
     # Place outside objects
     for name in outside_names:
@@ -327,10 +351,24 @@ def generate_random_layout(
             # Fallback: full workspace
             outside_y_ranges = [(workspace_y_min, workspace_y_max)]
         chosen_range = outside_y_ranges[int(np.random.randint(len(outside_y_ranges)))]
-        xy = _sample_xy(name, chosen_range[0], chosen_range[1])
-        occupied[name] = xy
-        is_rot, deg = _sample_orient()
-        result.place_on_table(name, (float(xy[0]), float(xy[1])), is_rotate=is_rot, deg=deg)
+        xy = sample_obstacle_xy(
+            result,
+            object_name=name,
+            workspace_x_min=workspace_x_min,
+            workspace_x_max=workspace_x_max,
+            y_min=float(chosen_range[0]),
+            y_max=float(chosen_range[1]),
+            min_spacing=min_spacing,
+        )
+        is_rot, deg = sample_obstacle_orientation(
+            rotate_prob=rotate_prob,
+            rotate_deg_min=rotate_deg_min,
+            rotate_deg_max=rotate_deg_max,
+        )
+        result.place_on_table(name, xy, is_rotate=is_rot, deg=deg)
+
+    if top is not None and bottom is not None:
+        result.place_on_object(top, bottom)
 
     return result
 
@@ -391,12 +429,17 @@ def build_clearing_steps(
     def _sample_clear_xy(obj_name: str, obj_y: float) -> np.ndarray:
         y_lo, y_hi = _pick_clear_y(obj_y)
         occupied = result.occupied_positions(exclude={obj_name})
-        for _ in range(512):
-            x = float(np.random.uniform(workspace_x_min, layout_x_max))
-            y = float(np.random.uniform(y_lo, y_hi))
-            c = np.array([x, y], dtype=np.float64)
-            if all(float(np.linalg.norm(c - p)) >= min_spacing for p in occupied):
-                return c
+        candidate_ranges = [
+            (float(y_lo), float(y_hi)),
+            (float(workspace_y_min), float(workspace_y_max)),
+        ]
+        for y_range_lo, y_range_hi in candidate_ranges:
+            for _ in range(512):
+                x = float(np.random.uniform(workspace_x_min, layout_x_max))
+                y = float(np.random.uniform(y_range_lo, y_range_hi))
+                c = np.array([x, y], dtype=np.float64)
+                if all(float(np.linalg.norm(c - p)) >= min_spacing for p in occupied):
+                    return c
         raise RuntimeError(f"failed to sample clearing xy for {obj_name}")
 
     steps: list[ObstacleTaskStep] = []

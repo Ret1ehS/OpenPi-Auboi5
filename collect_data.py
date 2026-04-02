@@ -112,6 +112,9 @@ from task.pick_and_place import (
     load_scene_state,
 )
 from task.open_and_close import (
+    BAND_OBJECT_COUNT_MAX as OC_BAND_COUNT_MAX,
+    BAND_OBJECT_COUNT_MIN as OC_BAND_COUNT_MIN,
+    CLEAR_BAND_M as OC_CLEAR_BAND,
     CLEAR_MIN_SPACING_M as OC_CLEAR_SPACING,
     MoveStep as OpenCloseMoveStep,
     NUM_OBSTACLES,
@@ -125,7 +128,9 @@ from task.open_and_close import (
     build_close_episode_plan,
     build_open_episode_plan,
     build_reference_from_tcp_pose,
-    generate_random_layout,
+    sample_obstacle_orientation,
+    sample_obstacle_xy,
+    STACK_PROBABILITY as OC_STACK_PROBABILITY,
 )
 
 
@@ -1797,6 +1802,180 @@ def main() -> int:
             frames.extend(step_frames)
         return frames
 
+    def rearrange_open_close_scene(reference_y: float) -> ObstacleScene:
+        if oc_obstacle_scene is None:
+            raise RuntimeError("obstacle scene is not initialized")
+
+        result_scene = oc_obstacle_scene.copy()
+        band_y_lo = max(float(reference_y - OC_CLEAR_BAND), WORKSPACE_Y_MIN)
+        band_y_hi = min(float(reference_y + OC_CLEAR_BAND), WORKSPACE_Y_MAX)
+
+        def _execute_rearrange_move(
+            obj_name: str,
+            source_xy: tuple[float, float],
+            source_is_rotate: bool,
+            source_deg: float,
+            target_xy: tuple[float, float],
+            *,
+            level: int,
+            target_is_rotate: bool,
+            target_deg: float,
+            pick_note: str,
+            place_note: str,
+            return_label: str,
+        ) -> None:
+            if level == 0:
+                print(
+                    f"    {obj_name}: ({source_xy[0]:.3f},{source_xy[1]:.3f}) -> "
+                    f"({target_xy[0]:.3f},{target_xy[1]:.3f}) rotate={target_is_rotate}"
+                )
+            else:
+                print(
+                    f"    {obj_name}: ({source_xy[0]:.3f},{source_xy[1]:.3f}) "
+                    f"stacking at ({target_xy[0]:.3f},{target_xy[1]:.3f})"
+                )
+
+            if args.dry_run:
+                return
+
+            pick_step = TaskStep(
+                kind="pick",
+                object_name=obj_name,
+                xy=tuple(source_xy),
+                level=0,
+                is_rotate=source_is_rotate,
+                deg=source_deg,
+                align_j6=True,
+                note=pick_note,
+            )
+            place_step = TaskStep(
+                kind="place",
+                object_name=obj_name,
+                xy=tuple(target_xy),
+                level=level,
+                is_rotate=target_is_rotate,
+                deg=target_deg,
+                align_j6=True,
+                note=place_note,
+            )
+            temp_state: dict[str, dict[str, object]] = {
+                obj_name: {
+                    "xy": [float(source_xy[0]), float(source_xy[1])],
+                    "is_rotate": bool(source_is_rotate),
+                    "deg": float(source_deg),
+                    "standard_j6_rad": None,
+                    "upper": None,
+                    "lower": None,
+                }
+            }
+            _, held = execute_step_sequence(
+                [pick_step, place_step],
+                record=False,
+                lookup_scene_state=temp_state,
+                result_scene_state=temp_state,
+            )
+            if held is not None:
+                raise RuntimeError(f"layout rearrange ended while holding {held}")
+            return_home(return_label)
+
+        layout_names = list(OBSTACLE_NAMES)
+        np.random.shuffle(layout_names)
+        n_in_band = int(np.random.randint(OC_BAND_COUNT_MIN, OC_BAND_COUNT_MAX + 1))
+        band_names = layout_names[:n_in_band]
+        outside_names = layout_names[n_in_band:]
+
+        stack_bottom: str | None = None
+        stack_top: str | None = None
+        if len(band_names) >= 2 and np.random.random() < float(OC_STACK_PROBABILITY):
+            stack_pair = list(np.random.choice(band_names, size=2, replace=False))
+            stack_bottom = str(stack_pair[0])
+            stack_top = str(stack_pair[1])
+
+        for obj_name in band_names:
+            if obj_name == stack_top:
+                continue
+            old_obj = result_scene.obstacles[obj_name]
+            new_xy = sample_obstacle_xy(
+                result_scene,
+                object_name=obj_name,
+                workspace_x_min=WORKSPACE_X_MIN,
+                workspace_x_max=WORKSPACE_X_MAX,
+                y_min=band_y_lo,
+                y_max=band_y_hi,
+                min_spacing=OC_CLEAR_SPACING,
+            )
+            new_is_rotate, new_deg = sample_obstacle_orientation()
+            _execute_rearrange_move(
+                obj_name,
+                tuple(old_obj.xy),
+                bool(old_obj.is_rotate),
+                float(old_obj.deg),
+                tuple(new_xy),
+                level=0,
+                target_is_rotate=new_is_rotate,
+                target_deg=new_deg,
+                pick_note=f"layout pick {obj_name}",
+                place_note=f"layout place {obj_name}",
+                return_label=f"[layout {obj_name}] return home",
+            )
+            result_scene.place_on_table(obj_name, tuple(new_xy), is_rotate=new_is_rotate, deg=new_deg)
+
+        outside_y_ranges: list[tuple[float, float]] = []
+        if WORKSPACE_Y_MIN < band_y_lo - OC_CLEAR_SPACING:
+            outside_y_ranges.append((WORKSPACE_Y_MIN, band_y_lo - OC_CLEAR_SPACING))
+        if band_y_hi + OC_CLEAR_SPACING < WORKSPACE_Y_MAX:
+            outside_y_ranges.append((band_y_hi + OC_CLEAR_SPACING, WORKSPACE_Y_MAX))
+        if not outside_y_ranges:
+            outside_y_ranges = [(WORKSPACE_Y_MIN, WORKSPACE_Y_MAX)]
+
+        for obj_name in outside_names:
+            chosen_range = outside_y_ranges[int(np.random.randint(len(outside_y_ranges)))]
+            old_obj = result_scene.obstacles[obj_name]
+            new_xy = sample_obstacle_xy(
+                result_scene,
+                object_name=obj_name,
+                workspace_x_min=WORKSPACE_X_MIN,
+                workspace_x_max=WORKSPACE_X_MAX,
+                y_min=float(chosen_range[0]),
+                y_max=float(chosen_range[1]),
+                min_spacing=OC_CLEAR_SPACING,
+            )
+            new_is_rotate, new_deg = sample_obstacle_orientation()
+            _execute_rearrange_move(
+                obj_name,
+                tuple(old_obj.xy),
+                bool(old_obj.is_rotate),
+                float(old_obj.deg),
+                tuple(new_xy),
+                level=0,
+                target_is_rotate=new_is_rotate,
+                target_deg=new_deg,
+                pick_note=f"layout pick {obj_name}",
+                place_note=f"layout place {obj_name}",
+                return_label=f"[layout {obj_name}] return home",
+            )
+            result_scene.place_on_table(obj_name, tuple(new_xy), is_rotate=new_is_rotate, deg=new_deg)
+
+        if stack_top is not None and stack_bottom is not None:
+            top_obj = result_scene.obstacles[stack_top]
+            bottom_obj = result_scene.obstacles[stack_bottom]
+            _execute_rearrange_move(
+                stack_top,
+                tuple(top_obj.xy),
+                bool(top_obj.is_rotate),
+                float(top_obj.deg),
+                tuple(bottom_obj.xy),
+                level=1,
+                target_is_rotate=bool(bottom_obj.is_rotate),
+                target_deg=float(bottom_obj.deg),
+                pick_note=f"stack pick {stack_top}",
+                place_note=f"stack place {stack_top} on {stack_bottom}",
+                return_label=f"[stack {stack_top}] return home",
+            )
+            result_scene.place_on_object(stack_top, stack_bottom)
+
+        return result_scene
+
     if selected_task == "pick_and_place":
         if skip_prep:
             print("\n=== Skipping Preparation (resumed from saved state) ===")
@@ -1985,110 +2164,17 @@ def main() -> int:
                 if oc_obstacle_scene is None:
                     raise RuntimeError("obstacle scene is not initialized")
 
-                # --- Step 1: Generate random layout for this cycle ---
-                # First cycle (episode_count == 0): use the initial placement as-is
+                # --- Step 1: Rearrange obstacles for this cycle ---
+                # First cycle (episode_count == 0): use the initial placement as-is.
                 is_first_cycle = (episode_count == 0)
-                if is_first_cycle:
-                    cycle_layout = oc_obstacle_scene.copy()
-                else:
-                    cycle_layout = generate_random_layout(
-                        oc_obstacle_scene,
-                        y_target=open_close_reference.y_start,
-                        workspace_x_min=WORKSPACE_X_MIN,
-                        workspace_x_max=WORKSPACE_X_MAX,
-                        workspace_y_min=WORKSPACE_Y_MIN,
-                        workspace_y_max=WORKSPACE_Y_MAX,
-                        min_spacing=OC_CLEAR_SPACING,
-                    )
+                cycle_layout = oc_obstacle_scene.copy()
 
                 # --- Step 2: Physically rearrange obstacles to match layout (NOT recorded) ---
                 if is_first_cycle:
-                    print("  [layout] First cycle — using initial placement, skip rearrange.")
+                    print("  [layout] First cycle: using initial placement, skip rearrange.")
                 else:
-                    print("  [layout] Rearranging obstacles to cycle layout...")
-                    for obj_name in OBSTACLE_NAMES:
-                        old_obj = oc_obstacle_scene.obstacles[obj_name]
-                        new_obj = cycle_layout.obstacles[obj_name]
-                        old_xy = np.asarray(old_obj.xy)
-                        new_xy = np.asarray(new_obj.xy)
-                        if float(np.linalg.norm(old_xy - new_xy)) < 0.005 and old_obj.is_rotate == new_obj.is_rotate:
-                            continue  # No need to move
-                        # If stacked, skip for now — will be handled by stacking pass
-                        if new_obj.lower is not None:
-                            continue
-                        print(
-                            f"    {obj_name}: ({old_obj.xy[0]:.3f},{old_obj.xy[1]:.3f}) -> "
-                            f"({new_obj.xy[0]:.3f},{new_obj.xy[1]:.3f}) rotate={new_obj.is_rotate}"
-                        )
-                        if not args.dry_run:
-                            pick_step = TaskStep(
-                                kind="pick", object_name=obj_name,
-                                xy=tuple(old_obj.xy), level=0,
-                                is_rotate=old_obj.is_rotate, deg=old_obj.deg,
-                                align_j6=True, note=f"layout pick {obj_name}",
-                            )
-                            place_step = TaskStep(
-                                kind="place", object_name=obj_name,
-                                xy=tuple(new_obj.xy), level=0,
-                                is_rotate=new_obj.is_rotate, deg=new_obj.deg,
-                                align_j6=True, note=f"layout place {obj_name}",
-                            )
-                            temp_state: dict[str, dict[str, object]] = {
-                                obj_name: {
-                                    "xy": list(old_obj.xy), "is_rotate": old_obj.is_rotate,
-                                    "deg": old_obj.deg, "standard_j6_rad": None,
-                                    "upper": None, "lower": None,
-                                }
-                            }
-                            _, held = execute_step_sequence(
-                                [pick_step, place_step], record=False,
-                                lookup_scene_state=temp_state, result_scene_state=temp_state,
-                            )
-                            if held is not None:
-                                raise RuntimeError(f"layout rearrange ended while holding {held}")
-                            return_home(f"[layout {obj_name}] return home")
-
-                    # Handle stacking (place upper onto lower)
-                    for obj_name in OBSTACLE_NAMES:
-                        new_obj = cycle_layout.obstacles[obj_name]
-                        if new_obj.lower is not None and new_obj.upper is None:
-                            # Pick from OLD (actual) position, place on lower's NEW position
-                            old_obj = oc_obstacle_scene.obstacles[obj_name]
-                            actual_xy = old_obj.xy
-                            lower_name = new_obj.lower
-                            lower_xy = cycle_layout.obstacles[lower_name].xy
-                            print(
-                                f"    {obj_name}: ({actual_xy[0]:.3f},{actual_xy[1]:.3f}) "
-                                f"stacking onto {lower_name} at ({lower_xy[0]:.3f},{lower_xy[1]:.3f})"
-                            )
-                            if not args.dry_run:
-                                pick_step = TaskStep(
-                                    kind="pick", object_name=obj_name,
-                                    xy=tuple(actual_xy), level=0,
-                                    is_rotate=old_obj.is_rotate, deg=old_obj.deg,
-                                    align_j6=True, note=f"stack pick {obj_name}",
-                                )
-                                place_step = TaskStep(
-                                    kind="place", object_name=obj_name,
-                                    xy=tuple(lower_xy), level=1,
-                                    is_rotate=new_obj.is_rotate, deg=new_obj.deg,
-                                    align_j6=True, note=f"stack place {obj_name} on {lower_name}",
-                                )
-                                temp_state = {
-                                    obj_name: {
-                                        "xy": list(actual_xy), "is_rotate": old_obj.is_rotate,
-                                        "deg": old_obj.deg, "standard_j6_rad": None,
-                                        "upper": None, "lower": None,
-                                    }
-                                }
-                                _, held = execute_step_sequence(
-                                    [pick_step, place_step], record=False,
-                                    lookup_scene_state=temp_state, result_scene_state=temp_state,
-                                )
-                                if held is not None:
-                                    raise RuntimeError(f"stacking ended while holding {held}")
-                            return_home(f"[stack {obj_name}] return home")
-
+                    print("  [layout] Rearranging obstacles with live sampling...")
+                    cycle_layout = rearrange_open_close_scene(open_close_reference.y_start)
                 oc_obstacle_scene = cycle_layout.copy()
 
                 # --- Step 3: Build clearing steps ---

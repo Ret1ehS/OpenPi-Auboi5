@@ -133,7 +133,7 @@ def build_close_episode_plan(
             MoveStep(x=x_rand, y=y_rand, z=float(target_z), note="close step 1 random approach"),
             MoveStep(x=x_start - 0.26, y=y_start, z=float(target_z), note="close step 2 align high"),
             MoveStep(x=x_start - 0.26, y=y_start, z=float(press_z - 0.02), note="close step 3 lower"),
-            MoveStep(x=x_start + 0.02, y=y_start, z=float(press_z - 0.02), note="close step 4 push"),
+            MoveStep(x=x_start, y=y_start, z=float(press_z - 0.02), note="close step 4 push"),
         ],
     )
 
@@ -277,16 +277,23 @@ def generate_random_layout(
     band_y_hi = min(band_y_hi, workspace_y_max)
     layout_x_max = _bounded_layout_x_max(workspace_x_min, workspace_x_max)
 
-    occupied: list[np.ndarray] = []
+    # Track ALL physical positions: start with every object's current (old) position.
+    # As each object gets a new position, remove its old pos and add the new one.
+    # This prevents new placements from landing on top of unmoved objects.
+    occupied: dict[str, np.ndarray] = {
+        n: np.asarray(scene.obstacles[n].xy, dtype=np.float64) for n in names
+    }
 
-    def _sample_xy(y_lo: float, y_hi: float) -> np.ndarray:
+    def _sample_xy(obj_name: str, y_lo: float, y_hi: float) -> np.ndarray:
+        # Check against all positions EXCEPT this object's own old position
+        others = [p for n, p in occupied.items() if n != obj_name]
         for _ in range(512):
             x = float(np.random.uniform(workspace_x_min, layout_x_max))
             y = float(np.random.uniform(y_lo, y_hi))
             c = np.array([x, y], dtype=np.float64)
-            if all(float(np.linalg.norm(c - p)) >= min_spacing for p in occupied):
+            if all(float(np.linalg.norm(c - p)) >= min_spacing for p in others):
                 return c
-        raise RuntimeError("failed to sample obstacle xy")
+        raise RuntimeError(f"failed to sample obstacle xy for {obj_name}")
 
     def _sample_orient() -> tuple[bool, float]:
         if np.random.random() < rotate_prob:
@@ -297,8 +304,8 @@ def generate_random_layout(
 
     # Place band objects on table first
     for name in band_names:
-        xy = _sample_xy(band_y_lo, band_y_hi)
-        occupied.append(xy)
+        xy = _sample_xy(name, band_y_lo, band_y_hi)
+        occupied[name] = xy  # replace old pos with new pos
         is_rot, deg = _sample_orient()
         result.place_on_table(name, (float(xy[0]), float(xy[1])), is_rotate=is_rot, deg=deg)
 
@@ -320,8 +327,8 @@ def generate_random_layout(
             # Fallback: full workspace
             outside_y_ranges = [(workspace_y_min, workspace_y_max)]
         chosen_range = outside_y_ranges[int(np.random.randint(len(outside_y_ranges)))]
-        xy = _sample_xy(chosen_range[0], chosen_range[1])
-        occupied.append(xy)
+        xy = _sample_xy(name, chosen_range[0], chosen_range[1])
+        occupied[name] = xy
         is_rot, deg = _sample_orient()
         result.place_on_table(name, (float(xy[0]), float(xy[1])), is_rotate=is_rot, deg=deg)
 

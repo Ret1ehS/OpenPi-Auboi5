@@ -1227,6 +1227,17 @@ def main() -> int:
         print(f"  Best-effort startup stop: {startup_stop_resp}")
     except Exception as exc:
         print(f"  Best-effort startup stop skipped: {exc}")
+
+    # Wait for robot to settle before issuing any motion
+    for _retry in range(10):
+        snap_check = get_robot_snapshot()
+        status = daemon.motion_status()
+        if _coerce_bool(status.get("is_steady")):
+            break
+        time.sleep(0.3)
+    else:
+        print("  WARNING: robot did not reach steady state after startup stop")
+
     startup_snap = get_robot_snapshot()
     startup_tcp_pose = np.asarray(startup_snap.tcp_pose, dtype=np.float64).reshape(6).copy()
 
@@ -1238,7 +1249,7 @@ def main() -> int:
             lift_pose[2] = lift_z
             print(f"  Lifting to z={lift_z:.4f} m at startup xy before homing...")
             execute_movel_and_wait(
-                _get_motion_daemon(),
+                daemon,
                 lift_pose,
                 "lift before homing",
                 speed_mps=LINEAR_SPEED,

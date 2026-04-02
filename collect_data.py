@@ -2150,7 +2150,6 @@ def main() -> int:
                 # --- Execute clearing steps (recorded, part of open episode) ---
                 clearing_frames: list[RecordedFrame] = []
                 if clearing_steps:
-                    # Convert ObstacleTaskStep -> TaskStep for execute_step_sequence
                     clear_task_steps: list[TaskStep] = []
                     for cs in clearing_steps:
                         clear_task_steps.append(TaskStep(
@@ -2163,7 +2162,6 @@ def main() -> int:
                             note=cs.note,
                             align_j6=cs.align_j6,
                         ))
-                    # Build a temporary scene state dict for execution
                     clear_scene_state: dict[str, dict[str, object]] = {}
                     for oname, ostate in oc_obstacle_scene.obstacles.items():
                         clear_scene_state[oname] = {

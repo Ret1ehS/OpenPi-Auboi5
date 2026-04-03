@@ -12,6 +12,7 @@ Primary purpose:
 from __future__ import annotations
 
 import argparse
+import atexit
 import math
 import re
 import subprocess
@@ -59,6 +60,10 @@ DEFAULT_MOVE_LINE_BLEND_RADIUS_M = 0.01
 
 RESET_ERR_M = 0.10
 DEFAULT_Z_MIN_M = 0.180  # TCP minimum z height (180 mm), clip anything below
+FORCE_GUARD_SOFT_FZ_N = 10.0
+FORCE_GUARD_HARD_FZ_N = 0.0
+FORCE_GUARD_FZ_SIGN = 1.0
+FORCE_GUARD_READING_TIMEOUT_S = 0.25
 
 JOINT_NAMES = [
     "base_link",
@@ -234,6 +239,154 @@ def _parse_helper_output(stdout: str) -> dict[str, object]:
     return result
 
 
+_force_sensor = None
+_force_sensor_lock = threading.Lock()
+_force_sensor_unavailable_reason: str | None = None
+
+
+def _stop_force_sensor() -> None:
+    global _force_sensor
+    sensor = _force_sensor
+    if sensor is None:
+        return
+    try:
+        sensor.stop()
+    except Exception:
+        pass
+    _force_sensor = None
+
+
+atexit.register(_stop_force_sensor)
+
+
+def _get_force_sensor():
+    global _force_sensor, _force_sensor_unavailable_reason
+    if _force_sensor_unavailable_reason is not None:
+        return None
+    if _force_sensor is not None:
+        return _force_sensor
+    with _force_sensor_lock:
+        if _force_sensor is not None:
+            return _force_sensor
+        if _force_sensor_unavailable_reason is not None:
+            return None
+        try:
+            from support.force_sensor import ForceSensor
+
+            sensor = ForceSensor()
+            sensor.start()
+            _force_sensor = sensor
+        except Exception as exc:
+            _force_sensor_unavailable_reason = str(exc)
+            return None
+    return _force_sensor
+
+
+def _get_force_guard_fz_n(timeout_s: float = FORCE_GUARD_READING_TIMEOUT_S) -> float | None:
+    sensor = _get_force_sensor()
+    if sensor is None:
+        return None
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    reading = sensor.get()
+    while reading is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+        reading = sensor.get()
+    if reading is None:
+        return None
+    return float(reading.fz) * float(FORCE_GUARD_FZ_SIGN)
+
+
+def _force_guard_scale(force_z_n: float | None) -> float | None:
+    if force_z_n is None:
+        return None
+    if force_z_n <= FORCE_GUARD_HARD_FZ_N:
+        return 0.0
+    if force_z_n >= FORCE_GUARD_SOFT_FZ_N:
+        return 1.0
+    span = FORCE_GUARD_SOFT_FZ_N - FORCE_GUARD_HARD_FZ_N
+    if span <= 1e-9:
+        return 0.0
+    return float((force_z_n - FORCE_GUARD_HARD_FZ_N) / span)
+
+
+def _get_live_tcp_pose_real() -> np.ndarray | None:
+    try:
+        status = _get_motion_daemon().motion_status()
+        tcp_pose = np.asarray(status.get("tcp_pose", []), dtype=np.float64)
+        if tcp_pose.size == POSE_DIM:
+            return tcp_pose.reshape(POSE_DIM).copy()
+    except Exception:
+        pass
+    try:
+        return np.asarray(get_robot_snapshot().tcp_pose, dtype=np.float64).reshape(POSE_DIM).copy()
+    except Exception:
+        return None
+
+
+def _apply_servo_force_guard(
+    requested_pose: np.ndarray,
+    reference_pose: np.ndarray | None,
+) -> tuple[np.ndarray, dict[str, object]]:
+    pose = np.asarray(requested_pose, dtype=np.float64).reshape(POSE_DIM).copy()
+    meta: dict[str, object] = {
+        "force_guard_fz_n": None,
+        "force_guard_scale": None,
+        "force_guard_adjusted": False,
+    }
+    if reference_pose is None:
+        return pose, meta
+    ref = np.asarray(reference_pose, dtype=np.float64).reshape(POSE_DIM)
+    downward_dist = float(ref[2] - pose[2])
+    if downward_dist <= 0.0:
+        return pose, meta
+    force_z_n = _get_force_guard_fz_n()
+    scale = _force_guard_scale(force_z_n)
+    meta["force_guard_fz_n"] = force_z_n
+    meta["force_guard_scale"] = scale
+    if scale is None or scale >= 1.0:
+        return pose, meta
+    pose[2] = float(ref[2] - downward_dist * max(0.0, scale))
+    meta["force_guard_adjusted"] = True
+    return pose, meta
+
+
+def _apply_movel_force_guard(
+    requested_pose: np.ndarray,
+    reference_pose: np.ndarray | None,
+    *,
+    speed_frac: float,
+    speed_mps: float | None,
+) -> tuple[np.ndarray, float, float | None, dict[str, object]]:
+    pose = np.asarray(requested_pose, dtype=np.float64).reshape(POSE_DIM).copy()
+    adj_speed_frac = float(speed_frac)
+    adj_speed_mps = None if speed_mps is None else float(speed_mps)
+    meta: dict[str, object] = {
+        "force_guard_fz_n": None,
+        "force_guard_scale": None,
+        "force_guard_adjusted": False,
+    }
+    if reference_pose is None:
+        return pose, adj_speed_frac, adj_speed_mps, meta
+    ref = np.asarray(reference_pose, dtype=np.float64).reshape(POSE_DIM)
+    downward_dist = float(ref[2] - pose[2])
+    if downward_dist <= 0.0:
+        return pose, adj_speed_frac, adj_speed_mps, meta
+    force_z_n = _get_force_guard_fz_n()
+    scale = _force_guard_scale(force_z_n)
+    meta["force_guard_fz_n"] = force_z_n
+    meta["force_guard_scale"] = scale
+    if scale is None or scale >= 1.0:
+        return pose, adj_speed_frac, adj_speed_mps, meta
+    if scale <= 0.0:
+        pose[2] = float(ref[2])
+    elif adj_speed_mps is not None:
+        adj_speed_mps = max(1e-4, adj_speed_mps * max(scale, 0.0))
+    elif adj_speed_frac > 0.0:
+        adj_speed_frac = max(1e-4, adj_speed_frac * max(scale, 0.0))
+    meta["force_guard_adjusted"] = True
+    return pose, adj_speed_frac, adj_speed_mps, meta
+
+
 def _run_helper(
     *,
     helper_bin: str = DEFAULT_HELPER_BIN,
@@ -317,6 +470,7 @@ class _DaemonHelper:
         ]
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
+        self._last_servo_pose_real: np.ndarray | None = None
 
     def _ensure_started(self) -> subprocess.Popen:
         if self._proc is not None and self._proc.poll() is None:
@@ -377,32 +531,59 @@ class _DaemonHelper:
     def servo_start(self, track_time_s: float = DEFAULT_TRACK_CONTROL_DT_S) -> dict[str, object]:
         """Enter servo mode on the daemon."""
         with self._lock:
+            self._last_servo_pose_real = None
             return self._send_cmd(f"servo_start {track_time_s:.12g}")
 
     def servo_pose(self, pose6: np.ndarray) -> dict[str, object]:
         """Send a single pose in servo mode. Returns parsed response.
         Used by data collection for frame-by-frame execution + capture."""
-        p = np.asarray(pose6, dtype=np.float64).reshape(POSE_DIM)
-        cmd = "servo_pose " + " ".join(f"{v:.12g}" for v in p)
+        requested = np.asarray(pose6, dtype=np.float64).reshape(POSE_DIM)
+        reference = self._last_servo_pose_real.copy() if self._last_servo_pose_real is not None else _get_live_tcp_pose_real()
+        guarded, guard_meta = _apply_servo_force_guard(requested, reference)
+        cmd = "servo_pose " + " ".join(f"{v:.12g}" for v in guarded)
         with self._lock:
-            return self._send_cmd(cmd)
+            resp = self._send_cmd(cmd)
+        resp.update(guard_meta)
+        self._last_servo_pose_real = guarded.copy()
+        return resp
 
     def servo_pose_j6(self, pose6: np.ndarray, joint6: float) -> dict[str, object]:
         """Send one absolute task target with explicit j6 target in servo mode."""
-        p = np.asarray(pose6, dtype=np.float64).reshape(POSE_DIM)
-        cmd = "servo_pose_j6 " + " ".join(f"{v:.12g}" for v in p) + f" {float(joint6):.12g}"
+        requested = np.asarray(pose6, dtype=np.float64).reshape(POSE_DIM)
+        reference = self._last_servo_pose_real.copy() if self._last_servo_pose_real is not None else _get_live_tcp_pose_real()
+        guarded, guard_meta = _apply_servo_force_guard(requested, reference)
+        cmd = "servo_pose_j6 " + " ".join(f"{v:.12g}" for v in guarded) + f" {float(joint6):.12g}"
         with self._lock:
-            return self._send_cmd(cmd)
+            resp = self._send_cmd(cmd)
+        resp.update(guard_meta)
+        self._last_servo_pose_real = guarded.copy()
+        return resp
 
     def servo_chunk(self, poses_real: list[np.ndarray]) -> dict[str, object]:
         """Send a batch of poses to execute with C++-side timing.
         All poses are sent at once; C++ handles the precise sleep intervals."""
+        guarded_poses: list[np.ndarray] = []
+        guard_meta: dict[str, object] = {
+            "force_guard_fz_n": None,
+            "force_guard_scale": None,
+            "force_guard_adjusted": False,
+        }
+        reference = self._last_servo_pose_real.copy() if self._last_servo_pose_real is not None else _get_live_tcp_pose_real()
+        for pose in poses_real:
+            guarded, step_meta = _apply_servo_force_guard(pose, reference)
+            guarded_poses.append(guarded)
+            if step_meta.get("force_guard_fz_n") is not None:
+                guard_meta["force_guard_fz_n"] = step_meta["force_guard_fz_n"]
+                guard_meta["force_guard_scale"] = step_meta["force_guard_scale"]
+            if bool(step_meta.get("force_guard_adjusted", False)):
+                guard_meta["force_guard_adjusted"] = True
+            reference = guarded
         with self._lock:
             proc = self._ensure_started()
             # Header: servo_chunk N
-            proc.stdin.write(f"servo_chunk {len(poses_real)}\n")
+            proc.stdin.write(f"servo_chunk {len(guarded_poses)}\n")
             # Body: one pose per line
-            for p in poses_real:
+            for p in guarded_poses:
                 vals = np.asarray(p, dtype=np.float64).reshape(POSE_DIM)
                 proc.stdin.write(" ".join(f"{v:.12g}" for v in vals) + "\n")
             proc.stdin.flush()
@@ -417,7 +598,11 @@ class _DaemonHelper:
                 if stripped == "END":
                     break
                 lines.append(line)
-            return _parse_helper_output("\n".join(lines))
+            resp = _parse_helper_output("\n".join(lines))
+        resp.update(guard_meta)
+        if guarded_poses:
+            self._last_servo_pose_real = guarded_poses[-1].copy()
+        return resp
 
     def movel(
         self,
@@ -433,23 +618,33 @@ class _DaemonHelper:
         accepted by the controller, and the caller can poll ``motion_status()``
         or wait via ``wait_motion_done()``.
         """
-        vals = np.asarray(pose, dtype=np.float64).reshape(POSE_DIM)
         if speed_mps is not None and speed_mps <= 0:
             raise ValueError(f"speed_mps must be positive, got {speed_mps}")
         if speed_mps is not None and speed_frac > 0:
             raise ValueError("Use either speed_frac or speed_mps for movel, not both.")
 
+        requested = np.asarray(pose, dtype=np.float64).reshape(POSE_DIM)
+        reference = _get_live_tcp_pose_real()
+        guarded, speed_frac, speed_mps, guard_meta = _apply_movel_force_guard(
+            requested,
+            reference,
+            speed_frac=speed_frac,
+            speed_mps=speed_mps,
+        )
+
         if speed_mps is not None:
             cmd_name = "movel_speed" if blocking else "movel_async_speed"
         else:
             cmd_name = "movel" if blocking else "movel_async"
-        cmd = cmd_name + " " + " ".join(f"{v:.12g}" for v in vals)
+        cmd = cmd_name + " " + " ".join(f"{v:.12g}" for v in guarded)
         if speed_mps is not None:
             cmd += f" {float(speed_mps):.6f}"
         elif speed_frac > 0:
             cmd += f" {speed_frac:.4f}"
         with self._lock:
-            return self._send_cmd(cmd)
+            resp = self._send_cmd(cmd)
+        resp.update(guard_meta)
+        return resp
 
     def movel_chunk(
         self,
@@ -500,7 +695,9 @@ class _DaemonHelper:
     def servo_stop(self) -> dict[str, object]:
         """Exit servo mode."""
         with self._lock:
-            return self._send_cmd("servo_stop")
+            resp = self._send_cmd("servo_stop")
+            self._last_servo_pose_real = None
+            return resp
 
     def stop(self) -> None:
         with self._lock:
@@ -950,10 +1147,13 @@ def retime_tcp_action_chunk(
             current_sim = integrate_delta_tcp_pose(current_sim, step_delta, lock_yaw=lock_yaw)
             # Convert to real frame for robot SDK
             current_real = sim_pose_to_real(current_sim)
+            current_real, _guard_meta = _apply_servo_force_guard(current_real, steps[-1].pose_real if steps else start_real)
             # Clip TCP z in real frame to minimum safe height
             if current_real[2] < z_min:
                 current_real[2] = z_min
                 # Reflect the clipped real pose back to sim frame
+                current_sim = real_pose_to_sim(current_real)
+            else:
                 current_sim = real_pose_to_sim(current_real)
             steps.append(RetimedTcpStep(
                 pose_real=current_real.copy(),

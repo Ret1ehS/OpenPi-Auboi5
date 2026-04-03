@@ -600,6 +600,7 @@ class _DaemonHelper:
         self._servo_force_guard_fz_n: float | None = None
         self._servo_force_guard_scale: float | None = None
         self._servo_force_guard_warning_active = False
+        self._servo_force_guard_force_live = False
         self._servo_force_guard_live_mode = False
 
     def _ensure_started(self) -> subprocess.Popen:
@@ -665,10 +666,16 @@ class _DaemonHelper:
             self._servo_force_guard_fz_n = None
             self._servo_force_guard_scale = None
             self._servo_force_guard_warning_active = False
+            self._servo_force_guard_force_live = False
             self._servo_force_guard_live_mode = False
             return self._send_cmd(f"servo_start {track_time_s:.12g}")
 
-    def servo_begin_chunk(self, pose6: np.ndarray | None = None) -> dict[str, object]:
+    def servo_begin_chunk(
+        self,
+        pose6: np.ndarray | None = None,
+        *,
+        force_live_mode: bool = False,
+    ) -> dict[str, object]:
         """Cache chunk-start pose and force. Live force polling only starts inside warning region."""
         with self._lock:
             if pose6 is not None:
@@ -677,11 +684,13 @@ class _DaemonHelper:
             self._servo_force_guard_fz_n = force_z_n
             self._servo_force_guard_scale = scale
             self._servo_force_guard_warning_active = warning_active
-            self._servo_force_guard_live_mode = bool(warning_active)
+            self._servo_force_guard_force_live = bool(force_live_mode)
+            self._servo_force_guard_live_mode = bool(force_live_mode or warning_active)
             return {
                 "force_guard_fz_n": force_z_n,
                 "force_guard_scale": scale,
                 "force_guard_warning_active": warning_active,
+                "force_guard_force_live": self._servo_force_guard_force_live,
                 "force_guard_live_mode": self._servo_force_guard_live_mode,
             }
 
@@ -695,7 +704,7 @@ class _DaemonHelper:
         Used by data collection for frame-by-frame execution + capture."""
         requested = np.asarray(pose6, dtype=np.float64).reshape(POSE_DIM)
         reference = self._current_servo_reference_pose()
-        if self._servo_force_guard_live_mode:
+        if self._servo_force_guard_force_live or self._servo_force_guard_live_mode:
             guarded, force_z_n, scale, adjusted, warning_active = _apply_servo_force_guard(requested, reference)
         else:
             guarded, force_z_n, scale, adjusted, warning_active = _apply_servo_force_guard_with_scale(
@@ -714,14 +723,14 @@ class _DaemonHelper:
             self._servo_force_guard_fz_n = force_z_n
             self._servo_force_guard_scale = scale
         self._servo_force_guard_warning_active = bool(warning_active)
-        self._servo_force_guard_live_mode = bool(warning_active)
+        self._servo_force_guard_live_mode = bool(self._servo_force_guard_force_live or warning_active)
         return resp
 
     def servo_pose_j6(self, pose6: np.ndarray, joint6: float) -> dict[str, object]:
         """Send one absolute task target with explicit j6 target in servo mode."""
         requested = np.asarray(pose6, dtype=np.float64).reshape(POSE_DIM)
         reference = self._current_servo_reference_pose()
-        if self._servo_force_guard_live_mode:
+        if self._servo_force_guard_force_live or self._servo_force_guard_live_mode:
             guarded, force_z_n, scale, adjusted, warning_active = _apply_servo_force_guard(requested, reference)
         else:
             guarded, force_z_n, scale, adjusted, warning_active = _apply_servo_force_guard_with_scale(
@@ -740,7 +749,7 @@ class _DaemonHelper:
             self._servo_force_guard_fz_n = force_z_n
             self._servo_force_guard_scale = scale
         self._servo_force_guard_warning_active = bool(warning_active)
-        self._servo_force_guard_live_mode = bool(warning_active)
+        self._servo_force_guard_live_mode = bool(self._servo_force_guard_force_live or warning_active)
         return resp
 
     def servo_chunk(self, poses_real: list[np.ndarray]) -> dict[str, object]:
@@ -753,7 +762,7 @@ class _DaemonHelper:
         warning_active = self._servo_force_guard_warning_active
         reference = self._current_servo_reference_pose()
         for pose in poses_real:
-            if self._servo_force_guard_live_mode:
+            if self._servo_force_guard_force_live or self._servo_force_guard_live_mode:
                 guarded, step_force_z_n, step_scale, step_adjusted, step_warning_active = _apply_servo_force_guard(
                     pose, reference
                 )
@@ -800,7 +809,7 @@ class _DaemonHelper:
             self._servo_force_guard_fz_n = force_z_n
             self._servo_force_guard_scale = scale
         self._servo_force_guard_warning_active = bool(warning_active)
-        self._servo_force_guard_live_mode = bool(warning_active)
+        self._servo_force_guard_live_mode = bool(self._servo_force_guard_force_live or warning_active)
         return resp
 
     def movel(
@@ -899,6 +908,7 @@ class _DaemonHelper:
             self._servo_force_guard_fz_n = None
             self._servo_force_guard_scale = None
             self._servo_force_guard_warning_active = False
+            self._servo_force_guard_force_live = False
             self._servo_force_guard_live_mode = False
             return resp
 

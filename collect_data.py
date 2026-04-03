@@ -74,6 +74,8 @@ UPSAMPLED_SAVE_FPS = 50
 # Motion speed (Cartesian linear velocity, m/s)
 LINEAR_SPEED = 0.10
 DEFAULT_ASYNC_MOVE_TIMEOUT_S = 30.0
+SERVO_CONTROL_DT = 0.01
+SERVO_ANGULAR_SPEED_RADPS = 0.60
 DEFAULT_J6_SPEED_RADPS = float(np.deg2rad(10.0))
 DEFAULT_J6_MOVE_SPEED_DEG = 10.0
 DEFAULT_J6_MOVE_ACC_DEG = 20.0
@@ -622,16 +624,195 @@ def _pose_close(actual_pose: np.ndarray, target_pose: np.ndarray, *, pos_tol: fl
     return pos_err <= pos_tol and float(np.linalg.norm(ang_err)) <= ang_tol
 
 
-def start_async_movel(
-    daemon,
+def _build_servo_pose_targets(
+    start_real: np.ndarray,
     target_real: np.ndarray,
-    label: str,
     *,
     speed_mps: float,
-) -> dict[str, object]:
-    resp = daemon.movel(target_real, speed_mps=speed_mps, blocking=False)
-    ensure_movel_ok(resp, f"{label} start")
-    return resp
+    start_joint6: float | None = None,
+    target_joint6: float | None = None,
+) -> tuple[list[np.ndarray], list[float] | None]:
+    start_pose = np.asarray(start_real, dtype=np.float64).reshape(6)
+    target_pose = np.asarray(target_real, dtype=np.float64).reshape(6)
+    delta = target_pose - start_pose
+    delta[3:] = np.array([_wrap_angle(target_pose[i] - start_pose[i]) for i in range(3, 6)], dtype=np.float64)
+
+    linear_dist = float(np.linalg.norm(delta[:3]))
+    angular_dist = float(np.linalg.norm(delta[3:]))
+    linear_time = linear_dist / max(float(speed_mps), 1e-6)
+    angular_time = angular_dist / max(float(SERVO_ANGULAR_SPEED_RADPS), 1e-6)
+    joint_time = 0.0
+    joint_targets: list[float] | None = None
+    joint_delta = 0.0
+    if target_joint6 is not None and start_joint6 is not None:
+        joint_delta = _wrap_angle(float(target_joint6) - float(start_joint6))
+        joint_time = abs(joint_delta) / max(float(DEFAULT_J6_SPEED_RADPS), 1e-6)
+
+    required_time = max(linear_time, angular_time, joint_time, float(SERVO_CONTROL_DT))
+    step_count = max(1, int(np.ceil(required_time / float(SERVO_CONTROL_DT))))
+    pose_targets = [
+        (start_pose + delta * (float(step_idx) / float(step_count))).copy()
+        for step_idx in range(1, step_count + 1)
+    ]
+    if target_joint6 is not None and start_joint6 is not None:
+        joint_targets = [
+            float(start_joint6 + joint_delta * (float(step_idx) / float(step_count)))
+            for step_idx in range(1, step_count + 1)
+        ]
+    return pose_targets, joint_targets
+
+
+def _capture_recorded_frame(
+    cameras: CameraPair,
+    actual_real: np.ndarray,
+    actual_joint6: float,
+    *,
+    gripper: float,
+    frame_idx: int,
+) -> RecordedFrame:
+    from support.pose_align import real_pose_to_sim
+
+    actual_sim = real_pose_to_sim(actual_real)
+    main_bgr, wrist_bgr = cameras.grab()
+    return RecordedFrame(
+        sim_pose6=actual_sim,
+        gripper=float(gripper),
+        joint6=float(actual_joint6),
+        main_image=preprocess_image(main_bgr),
+        wrist_image=preprocess_image(wrist_bgr),
+        timestamp=frame_idx * CONTROL_DT,
+    )
+
+
+def _execute_servo_segment(
+    daemon,
+    target_real: np.ndarray,
+    *,
+    label: str,
+    speed_mps: float,
+    record: bool,
+    cameras: CameraPair | None = None,
+    gripper: float = 1.0,
+    start_frame_idx: int = 0,
+    timeout_s: float = DEFAULT_ASYNC_MOVE_TIMEOUT_S,
+    target_joint6: float | None = None,
+    force_live_mode: bool = True,
+) -> list["RecordedFrame"]:
+    from support.tcp_control import get_robot_snapshot
+
+    target_real = np.asarray(target_real, dtype=np.float64).reshape(6).copy()
+    start_snap = get_robot_snapshot()
+    start_real = np.asarray(start_snap.tcp_pose, dtype=np.float64).reshape(6).copy()
+    start_joint_q = np.asarray(start_snap.joint_q, dtype=np.float64).reshape(-1)
+    start_joint6 = float(start_joint_q[5]) if start_joint_q.size >= 6 else float(target_joint6 or DEFAULT_J6_HOME_RAD)
+    pose_targets, joint_targets = _build_servo_pose_targets(
+        start_real,
+        target_real,
+        speed_mps=speed_mps,
+        start_joint6=start_joint6 if target_joint6 is not None else None,
+        target_joint6=target_joint6,
+    )
+
+    require_force_guard = bool(force_live_mode and float(target_real[2]) < float(start_real[2]) - 1e-6)
+    frames: list[RecordedFrame] = []
+    frame_idx = int(start_frame_idx)
+    next_record_deadline = time.monotonic()
+    last_record_ts: float | None = None
+    deadline = time.monotonic() + max(0.5, float(timeout_s))
+    servo_started = False
+
+    def _record_snapshot(snap, *, force: bool = False) -> None:
+        nonlocal frame_idx, next_record_deadline, last_record_ts
+        if not record or cameras is None:
+            return
+        now = time.monotonic()
+        if not force and frames and now < next_record_deadline:
+            return
+        actual_real = np.asarray(snap.tcp_pose, dtype=np.float64).reshape(6).copy()
+        joint_q = np.asarray(snap.joint_q, dtype=np.float64).reshape(-1)
+        actual_joint6 = float(joint_q[5]) if joint_q.size >= 6 else float(target_joint6 or start_joint6)
+        frames.append(
+            _capture_recorded_frame(
+                cameras,
+                actual_real,
+                actual_joint6,
+                gripper=gripper,
+                frame_idx=frame_idx,
+            )
+        )
+        frame_idx += 1
+        last_record_ts = now
+        next_record_deadline = now + CONTROL_DT
+
+    def _send_servo_command(pose_cmd: np.ndarray, joint6_cmd: float | None) -> dict[str, object]:
+        if joint6_cmd is None:
+            return daemon.servo_pose(pose_cmd)
+        return daemon.servo_pose_j6(pose_cmd, joint6_cmd)
+
+    try:
+        start_resp = daemon.servo_start(SERVO_CONTROL_DT)
+        servo_started = True
+        if int(start_resp.get("servo_start_ret", -1)) != 0:
+            raise RuntimeError(f"{label} servo_start failed: {start_resp}")
+
+        begin_resp = daemon.servo_begin_chunk(start_real, force_live_mode=force_live_mode)
+        if require_force_guard and begin_resp.get("force_guard_fz_n") is None:
+            raise RuntimeError(f"{label} aborted: force guard unavailable for downward motion")
+
+        for idx, pose_cmd in enumerate(pose_targets):
+            joint6_cmd = None if joint_targets is None else joint_targets[idx]
+            resp = _send_servo_command(pose_cmd, joint6_cmd)
+            pose_ret = int(resp.get("servo_pose_ret", -1))
+            if pose_ret != 0:
+                raise RuntimeError(f"{label} servo failed: {resp}")
+            if require_force_guard and resp.get("force_guard_fz_n") is None:
+                raise RuntimeError(f"{label} aborted: force guard lost during downward motion")
+            snap = get_robot_snapshot()
+            _record_snapshot(snap, force=not frames or idx == len(pose_targets) - 1)
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"{label} timed out while streaming to target {np.round(target_real, 5).tolist()}")
+
+        while True:
+            snap = get_robot_snapshot()
+            actual_real = np.asarray(snap.tcp_pose, dtype=np.float64).reshape(6).copy()
+            joint_q = np.asarray(snap.joint_q, dtype=np.float64).reshape(-1)
+            actual_joint6 = float(joint_q[5]) if joint_q.size >= 6 else float(target_joint6 or start_joint6)
+            joint6_ok = (
+                target_joint6 is None
+                or abs(_wrap_angle(actual_joint6 - float(target_joint6))) <= DEFAULT_J6_EXEC_TOL_RAD
+            )
+            if _pose_close(actual_real, target_real) and joint6_ok:
+                force_final_record = (
+                    record
+                    and (last_record_ts is None or (time.monotonic() - last_record_ts) > (0.5 * CONTROL_DT))
+                )
+                _record_snapshot(snap, force=force_final_record)
+                break
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"{label} timed out waiting for target "
+                    f"(target={np.round(target_real, 5).tolist()}, actual={np.round(actual_real, 5).tolist()}, "
+                    f"target_joint6={None if target_joint6 is None else round(float(target_joint6), 6)}, "
+                    f"actual_joint6={round(actual_joint6, 6)})"
+                )
+            resp = _send_servo_command(target_real, target_joint6)
+            pose_ret = int(resp.get("servo_pose_ret", -1))
+            if pose_ret != 0:
+                raise RuntimeError(f"{label} final servo hold failed: {resp}")
+            if require_force_guard and resp.get("force_guard_fz_n") is None:
+                raise RuntimeError(f"{label} aborted: force guard lost during downward hold")
+            _record_snapshot(get_robot_snapshot())
+    finally:
+        if servo_started:
+            try:
+                daemon.servo_stop()
+            except Exception:
+                try:
+                    stop_motion_and_confirm(daemon, f"{label} cleanup")
+                except Exception:
+                    pass
+
+    return frames
 
 
 def execute_movel_and_wait(
@@ -640,14 +821,21 @@ def execute_movel_and_wait(
     label: str,
     *,
     speed_mps: float,
+    target_joint6: float | None = None,
+    timeout_s: float = DEFAULT_ASYNC_MOVE_TIMEOUT_S,
+    force_live_mode: bool = True,
 ) -> dict[str, object]:
-    start_async_movel(daemon, target_real, label, speed_mps=speed_mps)
-    resp = daemon.wait_motion_done()
-    wait_ret_raw = resp.get("wait_ret")
-    wait_ret = int(wait_ret_raw) if wait_ret_raw is not None else None
-    if wait_ret is not None and wait_ret != 0:
-        raise RuntimeError(f"{label} wait failed: {resp}")
-    return resp
+    _execute_servo_segment(
+        daemon,
+        target_real,
+        label=label,
+        speed_mps=speed_mps,
+        record=False,
+        target_joint6=target_joint6,
+        timeout_s=timeout_s,
+        force_live_mode=force_live_mode,
+    )
+    return {"servo_execute": "ok"}
 
 
 def stop_motion_and_confirm(daemon, label: str) -> dict[str, object]:
@@ -689,80 +877,24 @@ def execute_and_record(
     start_frame_idx: int,
     speed_mps: float,
     timeout_s: float = DEFAULT_ASYNC_MOVE_TIMEOUT_S,
+    target_joint6: float | None = None,
+    force_live_mode: bool = True,
+    record: bool = True,
 ) -> list[RecordedFrame]:
-    """Execute one async moveLine segment and record raw executed state at 30Hz."""
-    from support.pose_align import real_pose_to_sim
-    from support.tcp_control import get_robot_snapshot
-
-    target_real = np.asarray(target_real, dtype=np.float64).reshape(6).copy()
-    frames: list[RecordedFrame] = []
-    start_resp = start_async_movel(
+    """Execute one servo segment at 100Hz and record executed state at 30Hz."""
+    return _execute_servo_segment(
         daemon,
         target_real,
-        f"recorded movel frame {start_frame_idx}",
+        label=f"recorded servo frame {start_frame_idx}",
         speed_mps=speed_mps,
+        record=record,
+        cameras=cameras,
+        gripper=gripper,
+        start_frame_idx=start_frame_idx,
+        timeout_s=timeout_s,
+        target_joint6=target_joint6,
+        force_live_mode=force_live_mode,
     )
-    saw_active = _coerce_exec_id(start_resp.get("exec_id")) != -1
-    deadline = time.monotonic() + max(0.5, timeout_s)
-    frame_idx = start_frame_idx
-
-    while True:
-        tick_start = time.monotonic()
-        status = daemon.motion_status()
-        tcp_pose = np.asarray(status.get("tcp_pose", []), dtype=np.float64)
-        joint_q = np.asarray(status.get("joint_q_rad", []), dtype=np.float64)
-        if tcp_pose.size == 6:
-            actual_real = tcp_pose.reshape(6).copy()
-        else:
-            snap = get_robot_snapshot()
-            actual_real = np.asarray(snap.tcp_pose, dtype=np.float64).reshape(6).copy()
-            joint_q = np.asarray(snap.joint_q, dtype=np.float64)
-        actual_sim = real_pose_to_sim(actual_real)
-        joint6 = float(joint_q[5]) if joint_q.size >= 6 else 0.0
-        main_bgr, wrist_bgr = cameras.grab()
-        main_img = preprocess_image(main_bgr)
-        wrist_img = preprocess_image(wrist_bgr)
-        timestamp = frame_idx * CONTROL_DT
-
-        frames.append(
-            RecordedFrame(
-                sim_pose6=actual_sim,
-                gripper=gripper,
-                joint6=joint6,
-                main_image=main_img,
-                wrist_image=wrist_img,
-                timestamp=timestamp,
-            )
-        )
-
-        exec_id = _coerce_exec_id(status.get("exec_id"))
-        is_steady = _coerce_bool(status.get("is_steady"))
-        if exec_id != -1:
-            saw_active = True
-
-        done = (saw_active and exec_id == -1 and is_steady) or (is_steady and _pose_close(actual_real, target_real))
-        if done:
-            break
-
-        if time.monotonic() > deadline:
-            stop_resp = stop_motion_and_confirm(daemon, f"recorded movel frame {start_frame_idx} timeout")
-            raise RuntimeError(
-                f"recorded movel timed out after {timeout_s:.1f}s "
-                f"(target={np.round(target_real, 5).tolist()}, stop={stop_resp})"
-            )
-
-        frame_idx += 1
-        remaining = CONTROL_DT - (time.monotonic() - tick_start)
-        if remaining > 0:
-            time.sleep(remaining)
-
-    wait_resp = daemon.wait_motion_done()
-    wait_ret_raw = wait_resp.get("wait_ret")
-    wait_ret = int(wait_ret_raw) if wait_ret_raw is not None else None
-    if wait_ret is not None and wait_ret != 0:
-        stop_resp = stop_motion_and_confirm(daemon, f"recorded movel frame {start_frame_idx} wait failure")
-        raise RuntimeError(f"recorded movel wait failed: {wait_resp}, stop={stop_resp}")
-    return frames
 
 
 def execute_joint6_rotation_and_record(
@@ -775,81 +907,23 @@ def execute_joint6_rotation_and_record(
     acc_deg: float = DEFAULT_J6_MOVE_ACC_DEG,
     timeout_s: float = DEFAULT_ASYNC_MOVE_TIMEOUT_S,
 ) -> list[RecordedFrame]:
-    """Rotate joint6 in joint space and record real observations at 30Hz."""
-    from support.joint_control import move_to_joint_positions
-    from support.pose_align import real_pose_to_sim
-    from support.tcp_control import get_robot_snapshot
+    """Rotate joint6 in servo mode and record real observations at 30Hz."""
+    from support.tcp_control import _get_motion_daemon, get_robot_snapshot
 
-    start_snap = get_robot_snapshot()
-    target_q = np.asarray(start_snap.joint_q, dtype=np.float64).reshape(6).copy()
-    target_q[5] = float(target_joint6)
-
-    outcome: dict[str, object] = {"result": None, "error": None}
-
-    def _worker() -> None:
-        try:
-            outcome["result"] = move_to_joint_positions(
-                target_q,
-                execute=True,
-                speed_deg=speed_deg,
-                acc_deg=acc_deg,
-            )
-        except Exception as exc:
-            outcome["error"] = exc
-
-    worker = threading.Thread(target=_worker, daemon=True)
-    worker.start()
-
-    frames: list[RecordedFrame] = []
-    frame_idx = start_frame_idx
-    deadline = time.monotonic() + max(0.5, timeout_s)
-
-    while True:
-        tick_start = time.monotonic()
-        snap = get_robot_snapshot()
-        actual_real = np.asarray(snap.tcp_pose, dtype=np.float64).reshape(6).copy()
-        joint_q = np.asarray(snap.joint_q, dtype=np.float64).reshape(-1)
-        actual_joint6 = float(joint_q[5]) if joint_q.size >= 6 else float(target_joint6)
-        actual_sim = real_pose_to_sim(actual_real)
-        main_bgr, wrist_bgr = cameras.grab()
-        frames.append(
-            RecordedFrame(
-                sim_pose6=actual_sim,
-                gripper=gripper,
-                joint6=actual_joint6,
-                main_image=preprocess_image(main_bgr),
-                wrist_image=preprocess_image(wrist_bgr),
-                timestamp=frame_idx * CONTROL_DT,
-            )
-        )
-
-        done = not worker.is_alive()
-        if done:
-            break
-        if outcome["error"] is not None:
-            raise RuntimeError(f"joint6 rotation failed: {outcome['error']}")
-        if time.monotonic() > deadline:
-            raise RuntimeError(
-                f"joint6 rotation timed out after {timeout_s:.1f}s "
-                f"(target_joint6={float(target_joint6):.6f}, last_joint6={actual_joint6:.6f})"
-            )
-
-        frame_idx += 1
-        remaining = CONTROL_DT - (time.monotonic() - tick_start)
-        if remaining > 0:
-            time.sleep(remaining)
-
-    worker.join(timeout=0.1)
-    if outcome["error"] is not None:
-        raise RuntimeError(f"joint6 rotation failed: {outcome['error']}")
-    result = outcome["result"]
-    if result is None or not result.ok:
-        reason = "unknown"
-        if result is not None:
-            reason = result.reason
-        raise RuntimeError(f"joint6 rotation failed: {reason}")
-
-    return frames
+    start_pose = np.asarray(get_robot_snapshot().tcp_pose, dtype=np.float64).reshape(6).copy()
+    return _execute_servo_segment(
+        _get_motion_daemon(),
+        start_pose,
+        label=f"joint6 servo rotation @ frame {start_frame_idx}",
+        speed_mps=LINEAR_SPEED,
+        record=True,
+        cameras=cameras,
+        gripper=gripper,
+        start_frame_idx=start_frame_idx,
+        timeout_s=timeout_s,
+        target_joint6=float(target_joint6),
+        force_live_mode=False,
+    )
 
 
 def execute_joint6_rotation(
@@ -858,20 +932,19 @@ def execute_joint6_rotation(
     speed_deg: float = DEFAULT_J6_MOVE_SPEED_DEG,
     acc_deg: float = DEFAULT_J6_MOVE_ACC_DEG,
 ) -> None:
-    """Rotate joint6 without recording."""
-    from support.joint_control import move_to_joint_positions
-    from support.tcp_control import get_robot_snapshot
+    """Rotate joint6 in servo mode without recording."""
+    from support.tcp_control import _get_motion_daemon, get_robot_snapshot
 
-    snap = get_robot_snapshot()
-    target_q = np.asarray(snap.joint_q, dtype=np.float64).reshape(6).copy()
-    target_q[5] = float(target_joint6)
-    result = move_to_joint_positions(
-        target_q,
-        execute=True,
-        speed_deg=speed_deg,
-        acc_deg=acc_deg,
+    current_pose = np.asarray(get_robot_snapshot().tcp_pose, dtype=np.float64).reshape(6).copy()
+    _execute_servo_segment(
+        _get_motion_daemon(),
+        current_pose,
+        label=f"joint6 servo rotation to {float(target_joint6):.6f}rad",
+        speed_mps=LINEAR_SPEED,
+        record=False,
+        target_joint6=float(target_joint6),
+        force_live_mode=False,
     )
-    ensure_joint_move_ok(result, f"rotate joint6 to {float(target_joint6):.6f}rad")
 
 
 def prepare_episode_for_save(
@@ -1370,9 +1443,12 @@ def main() -> int:
     def return_home(label: str) -> np.ndarray:
         nonlocal home_real, origin_xy, local_exec_joint6_rad
         if not args.dry_run:
-            ensure_joint_move_ok(
-                move_to_joint_positions(REAL_INIT_QPOS_RAD, execute=True),
+            execute_movel_and_wait(
+                daemon,
+                home_real,
                 label,
+                speed_mps=LINEAR_SPEED,
+                target_joint6=float(DEFAULT_J6_HOME_RAD),
             )
             local_exec_joint6_rad = float(DEFAULT_J6_HOME_RAD)
             return refresh_home_pose()
@@ -1543,6 +1619,7 @@ def main() -> int:
             gripper=1.0,
             start_frame_idx=frame_idx,
             speed_mps=LINEAR_SPEED,
+            record=record,
         )
         if record:
             step_frames.extend(seg)
@@ -1571,6 +1648,7 @@ def main() -> int:
             gripper=1.0,
             start_frame_idx=frame_idx,
             speed_mps=LINEAR_SPEED,
+            record=record,
         )
         if record:
             step_frames.extend(seg)
@@ -1589,6 +1667,7 @@ def main() -> int:
             gripper=0.0,
             start_frame_idx=frame_idx,
             speed_mps=LINEAR_SPEED,
+            record=record,
         )
         if record:
             step_frames.extend(seg)
@@ -1647,6 +1726,7 @@ def main() -> int:
             gripper=0.0,
             start_frame_idx=frame_idx,
             speed_mps=LINEAR_SPEED,
+            record=record,
         )
         if record:
             step_frames.extend(seg)
@@ -1675,6 +1755,7 @@ def main() -> int:
             gripper=0.0,
             start_frame_idx=frame_idx,
             speed_mps=LINEAR_SPEED,
+            record=record,
         )
         if record:
             step_frames.extend(seg)
@@ -1700,6 +1781,7 @@ def main() -> int:
             gripper=1.0,
             start_frame_idx=frame_idx,
             speed_mps=LINEAR_SPEED,
+            record=record,
         )
         if record:
             step_frames.extend(seg)
@@ -1780,6 +1862,7 @@ def main() -> int:
             gripper=1.0,
             start_frame_idx=frame_idx,
             speed_mps=LINEAR_SPEED,
+            record=record,
         )
         if record:
             step_frames.extend(seg)

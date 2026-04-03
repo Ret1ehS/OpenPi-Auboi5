@@ -62,9 +62,14 @@ DEFAULT_MOVE_LINE_BLEND_RADIUS_M = 0.01
 RESET_ERR_M = 0.10
 DEFAULT_Z_MIN_M = 0.180  # TCP minimum z height (180 mm), clip anything below
 FORCE_GUARD_SOFT_FZ_N = 10.0
+FORCE_GUARD_SOFT_RELEASE_FZ_N = 12.0
 FORCE_GUARD_HARD_FZ_N = 0.0
+FORCE_GUARD_HARD_RELEASE_FZ_N = 2.0
 FORCE_GUARD_FZ_SIGN = 1.0
 FORCE_GUARD_READING_TIMEOUT_S = 0.25
+FORCE_GUARD_FILTER_TAU_S = 0.08
+FORCE_GUARD_FILTER_RESET_S = 0.5
+FORCE_GUARD_READING_HOLD_S = 0.15
 _FORCE_GUARD_UNSET = object()
 
 JOINT_NAMES = [
@@ -244,6 +249,21 @@ def _parse_helper_output(stdout: str) -> dict[str, object]:
 _force_sensor = None
 _force_sensor_lock = threading.Lock()
 _force_sensor_unavailable_reason: str | None = None
+_force_guard_state_lock = threading.Lock()
+_force_guard_filtered_fz_n: float | None = None
+_force_guard_last_ts_s: float | None = None
+_force_guard_warning_active = False
+_force_guard_hard_active = False
+
+
+def _reset_force_guard_state() -> None:
+    global _force_guard_filtered_fz_n, _force_guard_last_ts_s
+    global _force_guard_warning_active, _force_guard_hard_active
+    with _force_guard_state_lock:
+        _force_guard_filtered_fz_n = None
+        _force_guard_last_ts_s = None
+        _force_guard_warning_active = False
+        _force_guard_hard_active = False
 
 
 def _stop_force_sensor() -> None:
@@ -256,6 +276,7 @@ def _stop_force_sensor() -> None:
     except Exception:
         pass
     _force_sensor = None
+    _reset_force_guard_state()
 
 
 atexit.register(_stop_force_sensor)
@@ -311,15 +332,82 @@ def _force_guard_scale(force_z_n: float | None) -> float | None:
     return float((force_z_n - FORCE_GUARD_HARD_FZ_N) / span)
 
 
+def _get_force_guard_state(
+    timeout_s: float = FORCE_GUARD_READING_TIMEOUT_S,
+) -> tuple[float | None, float | None, bool]:
+    global _force_guard_filtered_fz_n, _force_guard_last_ts_s
+    global _force_guard_warning_active, _force_guard_hard_active
+
+    raw_force_z_n = _get_force_guard_fz_n(timeout_s)
+    now = time.monotonic()
+
+    with _force_guard_state_lock:
+        if raw_force_z_n is None:
+            if (
+                _force_guard_filtered_fz_n is None
+                or _force_guard_last_ts_s is None
+                or (now - _force_guard_last_ts_s) > FORCE_GUARD_READING_HOLD_S
+            ):
+                return None, None, False
+            return (
+                _force_guard_filtered_fz_n,
+                _force_guard_scale(_force_guard_filtered_fz_n),
+                bool(_force_guard_warning_active or _force_guard_hard_active),
+            )
+
+        if (
+            _force_guard_filtered_fz_n is None
+            or _force_guard_last_ts_s is None
+            or (now - _force_guard_last_ts_s) > FORCE_GUARD_FILTER_RESET_S
+        ):
+            filtered = float(raw_force_z_n)
+        else:
+            dt = max(0.0, now - _force_guard_last_ts_s)
+            if FORCE_GUARD_FILTER_TAU_S <= 1e-6:
+                filtered = float(raw_force_z_n)
+            else:
+                alpha = 1.0 - math.exp(-dt / FORCE_GUARD_FILTER_TAU_S)
+                filtered = float(
+                    _force_guard_filtered_fz_n
+                    + alpha * (float(raw_force_z_n) - _force_guard_filtered_fz_n)
+                )
+
+        _force_guard_filtered_fz_n = filtered
+        _force_guard_last_ts_s = now
+
+        if _force_guard_hard_active:
+            if filtered > FORCE_GUARD_HARD_RELEASE_FZ_N:
+                _force_guard_hard_active = False
+                _force_guard_warning_active = True
+        elif filtered <= FORCE_GUARD_HARD_FZ_N:
+            _force_guard_hard_active = True
+            _force_guard_warning_active = True
+
+        if not _force_guard_hard_active:
+            if _force_guard_warning_active:
+                if filtered >= FORCE_GUARD_SOFT_RELEASE_FZ_N:
+                    _force_guard_warning_active = False
+            elif filtered < FORCE_GUARD_SOFT_FZ_N:
+                _force_guard_warning_active = True
+
+        return (
+            filtered,
+            _force_guard_scale(filtered),
+            bool(_force_guard_warning_active or _force_guard_hard_active),
+        )
+
+
 def _force_guard_meta(
     force_z_n: float | None,
     scale: float | None,
     adjusted: bool,
+    warning_active: bool,
 ) -> dict[str, object]:
     return {
         "force_guard_fz_n": force_z_n,
         "force_guard_scale": scale,
         "force_guard_adjusted": bool(adjusted),
+        "force_guard_live_mode": bool(warning_active),
     }
 
 
@@ -329,17 +417,27 @@ def _prepare_force_guard(
     *,
     force_z_n: float | None | object = _FORCE_GUARD_UNSET,
     scale: float | None | object = _FORCE_GUARD_UNSET,
-) -> tuple[np.ndarray, np.ndarray | None, float, float | None, float | None]:
+    warning_active: bool | object = _FORCE_GUARD_UNSET,
+) -> tuple[np.ndarray, np.ndarray | None, float, float | None, float | None, bool]:
     pose = np.asarray(requested_pose, dtype=np.float64).reshape(POSE_DIM).copy()
     if reference_pose is None:
-        return pose, None, 0.0, None, None
+        return pose, None, 0.0, None, None, False
     ref = np.asarray(reference_pose, dtype=np.float64).reshape(POSE_DIM)
     downward_dist = float(ref[2] - pose[2])
     if downward_dist <= 0.0:
-        return pose, ref, downward_dist, None, None
-    force_val = _get_force_guard_fz_n() if force_z_n is _FORCE_GUARD_UNSET else force_z_n
-    scale_val = _force_guard_scale(force_val) if scale is _FORCE_GUARD_UNSET else scale
-    return pose, ref, downward_dist, force_val, scale_val
+        warning_val = False if warning_active is _FORCE_GUARD_UNSET else bool(warning_active)
+        return pose, ref, downward_dist, None, None, warning_val
+    if (
+        force_z_n is _FORCE_GUARD_UNSET
+        or scale is _FORCE_GUARD_UNSET
+        or warning_active is _FORCE_GUARD_UNSET
+    ):
+        force_val, scale_val, warning_val = _get_force_guard_state()
+    else:
+        force_val = force_z_n
+        scale_val = scale
+        warning_val = bool(warning_active)
+    return pose, ref, downward_dist, force_val, scale_val, warning_val
 
 
 def _get_live_tcp_pose_real() -> np.ndarray | None:
@@ -359,14 +457,14 @@ def _get_live_tcp_pose_real() -> np.ndarray | None:
 def _apply_servo_force_guard(
     requested_pose: np.ndarray,
     reference_pose: np.ndarray | None,
-) -> tuple[np.ndarray, float | None, float | None, bool]:
-    force_z_n = _get_force_guard_fz_n()
-    scale = _force_guard_scale(force_z_n)
+) -> tuple[np.ndarray, float | None, float | None, bool, bool]:
+    force_z_n, scale, warning_active = _get_force_guard_state()
     return _apply_servo_force_guard_with_scale(
         requested_pose,
         reference_pose,
         force_z_n=force_z_n,
         scale=scale,
+        warning_active=warning_active,
     )
 
 
@@ -376,17 +474,19 @@ def _apply_servo_force_guard_with_scale(
     *,
     force_z_n: float | None,
     scale: float | None,
-) -> tuple[np.ndarray, float | None, float | None, bool]:
-    pose, ref, downward_dist, force_z_n, scale = _prepare_force_guard(
+    warning_active: bool,
+) -> tuple[np.ndarray, float | None, float | None, bool, bool]:
+    pose, ref, downward_dist, force_z_n, scale, warning_active = _prepare_force_guard(
         requested_pose,
         reference_pose,
         force_z_n=force_z_n,
         scale=scale,
+        warning_active=warning_active,
     )
     if ref is None or downward_dist <= 0.0 or scale is None or scale >= 1.0:
-        return pose, force_z_n, scale, False
+        return pose, force_z_n, scale, False, warning_active
     pose[2] = float(ref[2] - downward_dist * max(0.0, scale))
-    return pose, force_z_n, scale, True
+    return pose, force_z_n, scale, True, warning_active
 
 
 def _apply_movel_force_guard(
@@ -395,22 +495,22 @@ def _apply_movel_force_guard(
     *,
     speed_frac: float,
     speed_mps: float | None,
-) -> tuple[np.ndarray, float, float | None, float | None, float | None, bool]:
+) -> tuple[np.ndarray, float, float | None, float | None, float | None, bool, bool]:
     adj_speed_frac = float(speed_frac)
     adj_speed_mps = None if speed_mps is None else float(speed_mps)
-    pose, ref, downward_dist, force_z_n, scale = _prepare_force_guard(
+    pose, ref, downward_dist, force_z_n, scale, warning_active = _prepare_force_guard(
         requested_pose,
         reference_pose,
     )
     if ref is None or downward_dist <= 0.0 or scale is None or scale >= 1.0:
-        return pose, adj_speed_frac, adj_speed_mps, force_z_n, scale, False
+        return pose, adj_speed_frac, adj_speed_mps, force_z_n, scale, False, warning_active
     if scale <= 0.0:
         pose[2] = float(ref[2])
     elif adj_speed_mps is not None:
         adj_speed_mps = max(1e-4, adj_speed_mps * max(scale, 0.0))
     elif adj_speed_frac > 0.0:
         adj_speed_frac = max(1e-4, adj_speed_frac * max(scale, 0.0))
-    return pose, adj_speed_frac, adj_speed_mps, force_z_n, scale, True
+    return pose, adj_speed_frac, adj_speed_mps, force_z_n, scale, True, warning_active
 
 
 def _run_helper(
@@ -499,6 +599,7 @@ class _DaemonHelper:
         self._last_servo_pose_real: np.ndarray | None = None
         self._servo_force_guard_fz_n: float | None = None
         self._servo_force_guard_scale: float | None = None
+        self._servo_force_guard_warning_active = False
         self._servo_force_guard_live_mode = False
 
     def _ensure_started(self) -> subprocess.Popen:
@@ -563,6 +664,7 @@ class _DaemonHelper:
             self._last_servo_pose_real = None
             self._servo_force_guard_fz_n = None
             self._servo_force_guard_scale = None
+            self._servo_force_guard_warning_active = False
             self._servo_force_guard_live_mode = False
             return self._send_cmd(f"servo_start {track_time_s:.12g}")
 
@@ -571,14 +673,15 @@ class _DaemonHelper:
         with self._lock:
             if pose6 is not None:
                 self._last_servo_pose_real = np.asarray(pose6, dtype=np.float64).reshape(POSE_DIM).copy()
-            force_z_n = _get_force_guard_fz_n()
-            scale = _force_guard_scale(force_z_n)
+            force_z_n, scale, warning_active = _get_force_guard_state()
             self._servo_force_guard_fz_n = force_z_n
             self._servo_force_guard_scale = scale
-            self._servo_force_guard_live_mode = bool(scale is not None and scale < 1.0)
+            self._servo_force_guard_warning_active = warning_active
+            self._servo_force_guard_live_mode = bool(warning_active)
             return {
                 "force_guard_fz_n": force_z_n,
                 "force_guard_scale": scale,
+                "force_guard_warning_active": warning_active,
                 "force_guard_live_mode": self._servo_force_guard_live_mode,
             }
 
@@ -593,25 +696,25 @@ class _DaemonHelper:
         requested = np.asarray(pose6, dtype=np.float64).reshape(POSE_DIM)
         reference = self._current_servo_reference_pose()
         if self._servo_force_guard_live_mode:
-            guarded, force_z_n, scale, adjusted = _apply_servo_force_guard(requested, reference)
+            guarded, force_z_n, scale, adjusted, warning_active = _apply_servo_force_guard(requested, reference)
         else:
-            guarded, force_z_n, scale, adjusted = _apply_servo_force_guard_with_scale(
+            guarded, force_z_n, scale, adjusted, warning_active = _apply_servo_force_guard_with_scale(
                 requested,
                 reference,
                 force_z_n=self._servo_force_guard_fz_n,
                 scale=self._servo_force_guard_scale,
+                warning_active=self._servo_force_guard_warning_active,
             )
         cmd = "servo_pose " + " ".join(f"{v:.12g}" for v in guarded)
         with self._lock:
             resp = self._send_cmd(cmd)
-        resp.update(_force_guard_meta(force_z_n, scale, adjusted))
+        resp.update(_force_guard_meta(force_z_n, scale, adjusted, warning_active))
         self._last_servo_pose_real = guarded
         if force_z_n is not None or scale is not None:
             self._servo_force_guard_fz_n = force_z_n
             self._servo_force_guard_scale = scale
-        self._servo_force_guard_live_mode = bool(
-            self._servo_force_guard_scale is not None and float(self._servo_force_guard_scale) < 1.0
-        )
+        self._servo_force_guard_warning_active = bool(warning_active)
+        self._servo_force_guard_live_mode = bool(warning_active)
         return resp
 
     def servo_pose_j6(self, pose6: np.ndarray, joint6: float) -> dict[str, object]:
@@ -619,25 +722,25 @@ class _DaemonHelper:
         requested = np.asarray(pose6, dtype=np.float64).reshape(POSE_DIM)
         reference = self._current_servo_reference_pose()
         if self._servo_force_guard_live_mode:
-            guarded, force_z_n, scale, adjusted = _apply_servo_force_guard(requested, reference)
+            guarded, force_z_n, scale, adjusted, warning_active = _apply_servo_force_guard(requested, reference)
         else:
-            guarded, force_z_n, scale, adjusted = _apply_servo_force_guard_with_scale(
+            guarded, force_z_n, scale, adjusted, warning_active = _apply_servo_force_guard_with_scale(
                 requested,
                 reference,
                 force_z_n=self._servo_force_guard_fz_n,
                 scale=self._servo_force_guard_scale,
+                warning_active=self._servo_force_guard_warning_active,
             )
         cmd = "servo_pose_j6 " + " ".join(f"{v:.12g}" for v in guarded) + f" {float(joint6):.12g}"
         with self._lock:
             resp = self._send_cmd(cmd)
-        resp.update(_force_guard_meta(force_z_n, scale, adjusted))
+        resp.update(_force_guard_meta(force_z_n, scale, adjusted, warning_active))
         self._last_servo_pose_real = guarded
         if force_z_n is not None or scale is not None:
             self._servo_force_guard_fz_n = force_z_n
             self._servo_force_guard_scale = scale
-        self._servo_force_guard_live_mode = bool(
-            self._servo_force_guard_scale is not None and float(self._servo_force_guard_scale) < 1.0
-        )
+        self._servo_force_guard_warning_active = bool(warning_active)
+        self._servo_force_guard_live_mode = bool(warning_active)
         return resp
 
     def servo_chunk(self, poses_real: list[np.ndarray]) -> dict[str, object]:
@@ -647,22 +750,27 @@ class _DaemonHelper:
         force_z_n: float | None = None
         scale: float | None = None
         adjusted = False
+        warning_active = self._servo_force_guard_warning_active
         reference = self._current_servo_reference_pose()
         for pose in poses_real:
             if self._servo_force_guard_live_mode:
-                guarded, step_force_z_n, step_scale, step_adjusted = _apply_servo_force_guard(pose, reference)
+                guarded, step_force_z_n, step_scale, step_adjusted, step_warning_active = _apply_servo_force_guard(
+                    pose, reference
+                )
             else:
-                guarded, step_force_z_n, step_scale, step_adjusted = _apply_servo_force_guard_with_scale(
+                guarded, step_force_z_n, step_scale, step_adjusted, step_warning_active = _apply_servo_force_guard_with_scale(
                     pose,
                     reference,
                     force_z_n=self._servo_force_guard_fz_n,
                     scale=self._servo_force_guard_scale,
+                    warning_active=self._servo_force_guard_warning_active,
                 )
             guarded_poses.append(guarded)
             if step_force_z_n is not None:
                 force_z_n = step_force_z_n
                 scale = step_scale
             adjusted = adjusted or bool(step_adjusted)
+            warning_active = bool(step_warning_active)
             reference = guarded
         with self._lock:
             proc = self._ensure_started()
@@ -685,15 +793,14 @@ class _DaemonHelper:
                     break
                 lines.append(line)
         resp = _parse_helper_output("\n".join(lines))
-        resp.update(_force_guard_meta(force_z_n, scale, adjusted))
+        resp.update(_force_guard_meta(force_z_n, scale, adjusted, warning_active))
         if guarded_poses:
             self._last_servo_pose_real = guarded_poses[-1]
         if force_z_n is not None or scale is not None:
             self._servo_force_guard_fz_n = force_z_n
             self._servo_force_guard_scale = scale
-        self._servo_force_guard_live_mode = bool(
-            self._servo_force_guard_scale is not None and float(self._servo_force_guard_scale) < 1.0
-        )
+        self._servo_force_guard_warning_active = bool(warning_active)
+        self._servo_force_guard_live_mode = bool(warning_active)
         return resp
 
     def movel(
@@ -717,7 +824,7 @@ class _DaemonHelper:
 
         requested = np.asarray(pose, dtype=np.float64).reshape(POSE_DIM)
         reference = _get_live_tcp_pose_real()
-        guarded, speed_frac, speed_mps, force_z_n, scale, adjusted = _apply_movel_force_guard(
+        guarded, speed_frac, speed_mps, force_z_n, scale, adjusted, warning_active = _apply_movel_force_guard(
             requested,
             reference,
             speed_frac=speed_frac,
@@ -735,7 +842,7 @@ class _DaemonHelper:
             cmd += f" {speed_frac:.4f}"
         with self._lock:
             resp = self._send_cmd(cmd)
-        resp.update(_force_guard_meta(force_z_n, scale, adjusted))
+        resp.update(_force_guard_meta(force_z_n, scale, adjusted, warning_active))
         return resp
 
     def movel_chunk(
@@ -791,6 +898,7 @@ class _DaemonHelper:
             self._last_servo_pose_real = None
             self._servo_force_guard_fz_n = None
             self._servo_force_guard_scale = None
+            self._servo_force_guard_warning_active = False
             self._servo_force_guard_live_mode = False
             return resp
 

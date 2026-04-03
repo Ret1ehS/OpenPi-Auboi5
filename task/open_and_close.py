@@ -5,6 +5,8 @@ from typing import Any
 
 import numpy as np
 
+from task.pick_and_place import TaskStep
+
 
 OPEN_PROMPT = "open the storage box"
 CLOSE_PROMPT = "close the storage box"
@@ -12,8 +14,8 @@ CLOSE_PROMPT = "close the storage box"
 # Obstacle constants
 NUM_OBSTACLES = 5
 OBSTACLE_NAMES = tuple(f"obj{i}" for i in range(1, NUM_OBSTACLES + 1))
-CLEAR_BAND_M = 0.12  # ±12 cm around target y
-CLEAR_MIN_SPACING_M = 0.10  # obstacles must be ≥10 cm apart after clearing
+CLEAR_BAND_M = 0.12
+CLEAR_MIN_SPACING_M = 0.10
 BAND_OBJECT_COUNT_MIN = 2
 BAND_OBJECT_COUNT_MAX = 4
 STACK_PROBABILITY = 0.70
@@ -61,24 +63,6 @@ class ObstacleState:
     lower: str | None = None
 
 
-# ---- TaskStep for obstacle pick/place (reuses pick_and_place's step structure) ----
-
-@dataclass
-class ObstacleTaskStep:
-    kind: str  # "pick" | "place"
-    object_name: str
-    xy: tuple[float, float]
-    level: int
-    is_rotate: bool
-    deg: float
-    note: str
-    align_j6: bool = True
-
-
-# ---------------------------------------------------------------------------
-# Reference
-# ---------------------------------------------------------------------------
-
 def build_reference_from_tcp_pose(tcp_pose6: np.ndarray) -> OpenCloseReference:
     pose = np.asarray(tcp_pose6, dtype=np.float64).reshape(6).copy()
     return OpenCloseReference(
@@ -87,10 +71,6 @@ def build_reference_from_tcp_pose(tcp_pose6: np.ndarray) -> OpenCloseReference:
         reference_pose6=pose,
     )
 
-
-# ---------------------------------------------------------------------------
-# Episode plans (open / close)
-# ---------------------------------------------------------------------------
 
 def build_open_episode_plan(
     reference: OpenCloseReference,
@@ -138,10 +118,6 @@ def build_close_episode_plan(
     )
 
 
-# ---------------------------------------------------------------------------
-# Obstacle scene state
-# ---------------------------------------------------------------------------
-
 class ObstacleScene:
     def __init__(self, obstacles: dict[str, ObstacleState]) -> None:
         self.obstacles = obstacles
@@ -174,13 +150,19 @@ class ObstacleScene:
         return cls(obstacles)
 
     def copy(self) -> "ObstacleScene":
-        return ObstacleScene({
-            n: ObstacleState(
-                name=o.name, xy=tuple(o.xy), is_rotate=o.is_rotate, deg=o.deg,
-                upper=o.upper, lower=o.lower,
-            )
-            for n, o in self.obstacles.items()
-        })
+        return ObstacleScene(
+            {
+                n: ObstacleState(
+                    name=o.name,
+                    xy=tuple(o.xy),
+                    is_rotate=o.is_rotate,
+                    deg=o.deg,
+                    upper=o.upper,
+                    lower=o.lower,
+                )
+                for n, o in self.obstacles.items()
+            }
+        )
 
     def to_serializable(self) -> dict[str, dict[str, Any]]:
         return {
@@ -205,7 +187,7 @@ class ObstacleScene:
             if current in seen:
                 raise RuntimeError(f"cycle in upper chain from {name}")
             seen.add(current)
-            current = self.obstacles[current].upper  # type: ignore
+            current = self.obstacles[current].upper  # type: ignore[assignment]
         return current
 
     def detach_top(self, name: str) -> None:
@@ -270,113 +252,6 @@ def sample_obstacle_xy(
     raise RuntimeError(f"failed to sample obstacle xy for {object_name}")
 
 
-# ---------------------------------------------------------------------------
-# Layout generation: random placement for each cycle
-# ---------------------------------------------------------------------------
-
-def generate_random_layout(
-    scene: ObstacleScene,
-    *,
-    y_target: float,
-    workspace_x_min: float,
-    workspace_x_max: float,
-    workspace_y_min: float,
-    workspace_y_max: float,
-    min_spacing: float = CLEAR_MIN_SPACING_M,
-    rotate_prob: float = 0.5,
-    rotate_deg_min: float = 12.0,
-    rotate_deg_max: float = 22.5,
-) -> ObstacleScene:
-    """Generate a random layout for all 5 obstacles.
-
-    - Pick 2~4 to fall inside y_target ± CLEAR_BAND_M
-    - 70% chance to stack 2 of those band objects
-    - Rest go outside the band
-    """
-    result = scene.copy()
-    names = list(OBSTACLE_NAMES)
-    np.random.shuffle(names)
-
-    # Clear all links
-    for n in names:
-        result.obstacles[n].upper = None
-        result.obstacles[n].lower = None
-
-    # Decide band membership
-    n_in_band = int(np.random.randint(BAND_OBJECT_COUNT_MIN, BAND_OBJECT_COUNT_MAX + 1))
-    band_names = names[:n_in_band]
-    outside_names = names[n_in_band:]
-
-    band_y_lo = y_target - CLEAR_BAND_M
-    band_y_hi = y_target + CLEAR_BAND_M
-    # Clamp band to workspace
-    band_y_lo = max(band_y_lo, workspace_y_min)
-    band_y_hi = min(band_y_hi, workspace_y_max)
-    bottom: str | None = None
-    top: str | None = None
-    if len(band_names) >= 2 and np.random.random() < STACK_PROBABILITY:
-        stack_pair = list(np.random.choice(band_names, size=2, replace=False))
-        bottom, top = str(stack_pair[0]), str(stack_pair[1])
-
-    # Sample against the current scene occupancy one object at a time.
-    # The future stack-top keeps its current location occupied until the final stack move.
-    for name in band_names:
-        if name == top:
-            continue
-        xy = sample_obstacle_xy(
-            result,
-            object_name=name,
-            workspace_x_min=workspace_x_min,
-            workspace_x_max=workspace_x_max,
-            y_min=band_y_lo,
-            y_max=band_y_hi,
-            min_spacing=min_spacing,
-        )
-        is_rot, deg = sample_obstacle_orientation(
-            rotate_prob=rotate_prob,
-            rotate_deg_min=rotate_deg_min,
-            rotate_deg_max=rotate_deg_max,
-        )
-        result.place_on_table(name, xy, is_rotate=is_rot, deg=deg)
-
-    # Place outside objects
-    for name in outside_names:
-        # Sample outside the band
-        outside_y_ranges = []
-        if workspace_y_min < band_y_lo - min_spacing:
-            outside_y_ranges.append((workspace_y_min, band_y_lo - min_spacing))
-        if band_y_hi + min_spacing < workspace_y_max:
-            outside_y_ranges.append((band_y_hi + min_spacing, workspace_y_max))
-        if not outside_y_ranges:
-            # Fallback: full workspace
-            outside_y_ranges = [(workspace_y_min, workspace_y_max)]
-        chosen_range = outside_y_ranges[int(np.random.randint(len(outside_y_ranges)))]
-        xy = sample_obstacle_xy(
-            result,
-            object_name=name,
-            workspace_x_min=workspace_x_min,
-            workspace_x_max=workspace_x_max,
-            y_min=float(chosen_range[0]),
-            y_max=float(chosen_range[1]),
-            min_spacing=min_spacing,
-        )
-        is_rot, deg = sample_obstacle_orientation(
-            rotate_prob=rotate_prob,
-            rotate_deg_min=rotate_deg_min,
-            rotate_deg_max=rotate_deg_max,
-        )
-        result.place_on_table(name, xy, is_rotate=is_rot, deg=deg)
-
-    if top is not None and bottom is not None:
-        result.place_on_object(top, bottom)
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Clearing plan: move band objects outside y_target ± 12cm
-# ---------------------------------------------------------------------------
-
 def build_clearing_steps(
     scene: ObstacleScene,
     *,
@@ -386,45 +261,34 @@ def build_clearing_steps(
     workspace_y_min: float,
     workspace_y_max: float,
     min_spacing: float = CLEAR_MIN_SPACING_M,
-) -> tuple[list[ObstacleTaskStep], ObstacleScene]:
-    """Build pick/place steps to clear all obstacles inside y_target ± CLEAR_BAND_M.
-
-    Returns (steps, updated_scene). Steps are recorded into the open episode.
-    If stacked, clears upper first then lower.
-    Clearing places use is_rotate=False, deg=0 (default angle).
-    """
+) -> tuple[list[TaskStep], ObstacleScene]:
+    """Build pick/place steps to clear all obstacles inside the y-target band."""
     result = scene.copy()
     band_lo = y_target - CLEAR_BAND_M
     band_hi = y_target + CLEAR_BAND_M
     layout_x_max = _bounded_layout_x_max(workspace_x_min, workspace_x_max)
 
-    # Determine which side to clear to
-    # Check if each side has room (at least min_spacing from workspace edge)
     can_go_upper = (workspace_y_max - band_hi) >= min_spacing
     can_go_lower = (band_lo - workspace_y_min) >= min_spacing
 
     def _objects_in_band() -> list[str]:
-        """Names of objects whose y is within [band_lo, band_hi] (inclusive)."""
-        in_band = []
+        in_band: list[str] = []
         for name, obj in result.obstacles.items():
             if band_lo <= obj.xy[1] <= band_hi:
                 in_band.append(name)
         return in_band
 
     def _pick_clear_y(obj_y: float) -> tuple[float, float]:
-        """Choose the target y range for clearing based on which side the object is on."""
         wants_upper = obj_y >= y_target
         if wants_upper and can_go_upper:
             return band_hi + min_spacing, workspace_y_max
-        elif not wants_upper and can_go_lower:
+        if (not wants_upper) and can_go_lower:
             return workspace_y_min, band_lo - min_spacing
-        elif can_go_upper:
+        if can_go_upper:
             return band_hi + min_spacing, workspace_y_max
-        elif can_go_lower:
+        if can_go_lower:
             return workspace_y_min, band_lo - min_spacing
-        else:
-            # Fallback: just use full workspace
-            return workspace_y_min, workspace_y_max
+        return workspace_y_min, workspace_y_max
 
     def _sample_clear_xy(obj_name: str, obj_y: float) -> np.ndarray:
         y_lo, y_hi = _pick_clear_y(obj_y)
@@ -437,21 +301,18 @@ def build_clearing_steps(
             for _ in range(512):
                 x = float(np.random.uniform(workspace_x_min, layout_x_max))
                 y = float(np.random.uniform(y_range_lo, y_range_hi))
-                c = np.array([x, y], dtype=np.float64)
-                if all(float(np.linalg.norm(c - p)) >= min_spacing for p in occupied):
-                    return c
+                candidate = np.array([x, y], dtype=np.float64)
+                if all(float(np.linalg.norm(candidate - p)) >= min_spacing for p in occupied):
+                    return candidate
         raise RuntimeError(f"failed to sample clearing xy for {obj_name}")
 
-    steps: list[ObstacleTaskStep] = []
-
-    # Collect objects in band, process stacked ones first (upper before lower)
+    steps: list[TaskStep] = []
     processed: set[str] = set()
 
     def _clear_object(name: str) -> None:
         if name in processed:
             return
         obj = result.obstacles[name]
-        # If it has something on top, clear that first
         if obj.upper is not None:
             _clear_object(obj.upper)
 
@@ -459,34 +320,34 @@ def build_clearing_steps(
             return
 
         obj = result.obstacles[name]
-        level = 0
-        lower = obj.lower
-        if lower is not None:
-            level = 1  # it's stacked
-
-        # Pick step
-        steps.append(ObstacleTaskStep(
-            kind="pick",
-            object_name=name,
-            xy=tuple(obj.xy),
-            level=level,
-            is_rotate=obj.is_rotate,
-            deg=obj.deg,
-            note=f"clear pick {name}",
-        ))
+        level = 1 if obj.lower is not None else 0
+        steps.append(
+            TaskStep(
+                kind="pick",
+                object_name=name,
+                xy=tuple(obj.xy),
+                level=level,
+                is_rotate=obj.is_rotate,
+                deg=obj.deg,
+                note=f"clear pick {name}",
+                align_j6=True,
+            )
+        )
         result.detach_top(name)
 
-        # Place step: outside band, no rotation
         clear_xy = _sample_clear_xy(name, obj.xy[1])
-        steps.append(ObstacleTaskStep(
-            kind="place",
-            object_name=name,
-            xy=(float(clear_xy[0]), float(clear_xy[1])),
-            level=0,
-            is_rotate=False,
-            deg=0.0,
-            note=f"clear place {name}",
-        ))
+        steps.append(
+            TaskStep(
+                kind="place",
+                object_name=name,
+                xy=(float(clear_xy[0]), float(clear_xy[1])),
+                level=0,
+                is_rotate=False,
+                deg=0.0,
+                note=f"clear place {name}",
+                align_j6=True,
+            )
+        )
         result.place_on_table(name, (float(clear_xy[0]), float(clear_xy[1])), is_rotate=False, deg=0.0)
         processed.add(name)
 
@@ -496,12 +357,8 @@ def build_clearing_steps(
     return steps, result
 
 
-# ---------------------------------------------------------------------------
-# Serialization helpers
-# ---------------------------------------------------------------------------
-
 def _norm_link(v: Any) -> str | None:
     if v is None:
         return None
-    t = str(v).strip()
-    return t if t else None
+    text = str(v).strip()
+    return text if text else None

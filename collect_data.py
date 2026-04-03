@@ -122,7 +122,6 @@ from task.open_and_close import (
     OBSTACLE_LAYOUT_X_MAX_M as OC_LAYOUT_X_MAX,
     ObstacleScene,
     ObstacleState,
-    ObstacleTaskStep,
     OpenCloseReference,
     build_clearing_steps,
     build_close_episode_plan,
@@ -1204,6 +1203,7 @@ def main() -> int:
                 task_index,
                 episode_count,
                 open_close_reference=open_close_reference,
+                obstacle_scene=oc_obstacle_scene,
             )
             print(f"  State saved to {_state_file_path(save_dir)}")
         if daemon is not None:
@@ -2247,18 +2247,6 @@ def main() -> int:
                 # --- Execute clearing steps (recorded, part of open episode) ---
                 clearing_frames: list[RecordedFrame] = []
                 if clearing_steps:
-                    clear_task_steps: list[TaskStep] = []
-                    for cs in clearing_steps:
-                        clear_task_steps.append(TaskStep(
-                            kind=cs.kind,
-                            object_name=cs.object_name,
-                            xy=cs.xy,
-                            level=cs.level,
-                            is_rotate=cs.is_rotate,
-                            deg=cs.deg,
-                            note=cs.note,
-                            align_j6=cs.align_j6,
-                        ))
                     clear_scene_state: dict[str, dict[str, object]] = {}
                     for oname, ostate in oc_obstacle_scene.obstacles.items():
                         clear_scene_state[oname] = {
@@ -2270,7 +2258,7 @@ def main() -> int:
                             "lower": ostate.lower,
                         }
                     clearing_frames, held_after_clear = execute_step_sequence(
-                        clear_task_steps,
+                        clearing_steps,
                         record=True,
                         lookup_scene_state=clear_scene_state,
                         result_scene_state=clear_scene_state,

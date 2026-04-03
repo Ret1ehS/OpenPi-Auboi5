@@ -607,6 +607,15 @@ def _coerce_bool(value: object) -> bool:
     return False
 
 
+def _coerce_optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _coerce_exec_id(value: object) -> int:
     if value is None:
         return -1
@@ -801,6 +810,14 @@ def _execute_servo_segment(
                 raise RuntimeError(f"{label} final servo hold failed: {resp}")
             if require_force_guard and resp.get("force_guard_fz_n") is None:
                 raise RuntimeError(f"{label} aborted: force guard lost during downward hold")
+            force_guard_adjusted = _coerce_bool(resp.get("force_guard_adjusted"))
+            force_guard_scale = _coerce_optional_float(resp.get("force_guard_scale"))
+            if require_force_guard and force_guard_adjusted:
+                deadline = max(deadline, time.monotonic() + max(0.5, float(CONTROL_DT) * 4.0))
+                if force_guard_scale is not None and force_guard_scale <= 1e-6:
+                    hold_snap = get_robot_snapshot()
+                    _record_snapshot(hold_snap, force=True)
+                    break
             _record_snapshot(get_robot_snapshot())
     finally:
         if servo_started:

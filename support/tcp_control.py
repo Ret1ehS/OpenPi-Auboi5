@@ -309,10 +309,18 @@ def _get_force_guard_fz_n(timeout_s: float = FORCE_GUARD_READING_TIMEOUT_S) -> f
     sensor = _get_force_sensor()
     if sensor is None:
         return None
-    deadline = time.monotonic() + max(0.0, float(timeout_s))
     reading = sensor.get()
-    while reading is None and time.monotonic() < deadline:
-        time.sleep(0.01)
+    if reading is not None:
+        return float(reading.fz) * float(FORCE_GUARD_FZ_SIGN)
+    remaining_s = max(0.0, float(timeout_s))
+    if remaining_s <= 0.0:
+        return None
+    deadline = time.monotonic() + remaining_s
+    while reading is None:
+        sleep_s = min(0.01, max(0.0, deadline - time.monotonic()))
+        if sleep_s <= 0.0:
+            break
+        time.sleep(sleep_s)
         reading = sensor.get()
     if reading is None:
         return None
@@ -457,8 +465,10 @@ def _get_live_tcp_pose_real() -> np.ndarray | None:
 def _apply_servo_force_guard(
     requested_pose: np.ndarray,
     reference_pose: np.ndarray | None,
+    *,
+    timeout_s: float = 0.0,
 ) -> tuple[np.ndarray, float | None, float | None, bool, bool]:
-    force_z_n, scale, warning_active = _get_force_guard_state()
+    force_z_n, scale, warning_active = _get_force_guard_state(timeout_s=timeout_s)
     return _apply_servo_force_guard_with_scale(
         requested_pose,
         reference_pose,
@@ -705,7 +715,11 @@ class _DaemonHelper:
         requested = np.asarray(pose6, dtype=np.float64).reshape(POSE_DIM)
         reference = self._current_servo_reference_pose()
         if self._servo_force_guard_force_live or self._servo_force_guard_live_mode:
-            guarded, force_z_n, scale, adjusted, warning_active = _apply_servo_force_guard(requested, reference)
+            guarded, force_z_n, scale, adjusted, warning_active = _apply_servo_force_guard(
+                requested,
+                reference,
+                timeout_s=0.0,
+            )
         else:
             guarded, force_z_n, scale, adjusted, warning_active = _apply_servo_force_guard_with_scale(
                 requested,
@@ -731,7 +745,11 @@ class _DaemonHelper:
         requested = np.asarray(pose6, dtype=np.float64).reshape(POSE_DIM)
         reference = self._current_servo_reference_pose()
         if self._servo_force_guard_force_live or self._servo_force_guard_live_mode:
-            guarded, force_z_n, scale, adjusted, warning_active = _apply_servo_force_guard(requested, reference)
+            guarded, force_z_n, scale, adjusted, warning_active = _apply_servo_force_guard(
+                requested,
+                reference,
+                timeout_s=0.0,
+            )
         else:
             guarded, force_z_n, scale, adjusted, warning_active = _apply_servo_force_guard_with_scale(
                 requested,
@@ -764,7 +782,9 @@ class _DaemonHelper:
         for pose in poses_real:
             if self._servo_force_guard_force_live or self._servo_force_guard_live_mode:
                 guarded, step_force_z_n, step_scale, step_adjusted, step_warning_active = _apply_servo_force_guard(
-                    pose, reference
+                    pose,
+                    reference,
+                    timeout_s=0.0,
                 )
             else:
                 guarded, step_force_z_n, step_scale, step_adjusted, step_warning_active = _apply_servo_force_guard_with_scale(

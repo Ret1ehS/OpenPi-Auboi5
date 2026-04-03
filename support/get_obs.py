@@ -133,6 +133,8 @@ class AlignedObservation:
     robot_snapshot: RobotSnapshot
     aligned_tcp_pose_sim: np.ndarray
     gripper_open_scalar: float
+    joint6_state_scalar: float | None
+    joint6_readback_scalar: float | None
     main_frame: TimedFrame
     wrist_frame: TimedFrame
     image_pair_system_diff_us: int
@@ -362,6 +364,7 @@ class RealRobotOpenPIObservationBuilder:
         self._pool = ThreadPoolExecutor(max_workers=6)
         # Observation path uses the local cache as the authoritative gripper state.
         self._gripper_open_scalar: float = 1.0  # default: open
+        self._semantic_joint6_scalar: float | None = None
         self.set_state_mode(state_mode)
 
     def _apply_camera_profile(self, role: str, dev) -> None:
@@ -370,6 +373,10 @@ class RealRobotOpenPIObservationBuilder:
     def set_gripper_open_scalar(self, value: float) -> None:
         """Update the locally-cached fallback gripper scalar (1.0=open, 0.0=closed)."""
         self._gripper_open_scalar = float(value)
+
+    def set_semantic_joint6_scalar(self, value: float | None) -> None:
+        """Update the local semantic j6 state used by j6-mode observations."""
+        self._semantic_joint6_scalar = None if value is None else float(value)
 
     def set_state_mode(self, mode: str) -> None:
         mode_norm = str(mode).strip().lower()
@@ -541,9 +548,14 @@ class RealRobotOpenPIObservationBuilder:
 
         aligned_tcp_pose_sim = real_pose_to_sim(robot_snapshot.tcp_pose)
         joint_q = np.asarray(robot_snapshot.joint_q, dtype=np.float64).reshape(-1)
-        joint6 = float(joint_q[5]) if joint_q.size >= 6 else 0.0
+        joint6_readback = float(joint_q[5]) if joint_q.size >= 6 else 0.0
+        joint6_state = (
+            joint6_readback
+            if self._semantic_joint6_scalar is None
+            else float(self._semantic_joint6_scalar)
+        )
         if self._state_mode == STATE_MODE_J6:
-            state = pose6_to_openpi_state_j6(aligned_tcp_pose_sim, gripper_open, joint6)
+            state = pose6_to_openpi_state_j6(aligned_tcp_pose_sim, gripper_open, joint6_state)
         else:
             state = pose6_to_openpi_state(aligned_tcp_pose_sim, gripper_open)
 
@@ -559,6 +571,8 @@ class RealRobotOpenPIObservationBuilder:
             robot_snapshot=robot_snapshot,
             aligned_tcp_pose_sim=aligned_tcp_pose_sim,
             gripper_open_scalar=gripper_open,
+            joint6_state_scalar=joint6_state if self._state_mode == STATE_MODE_J6 else None,
+            joint6_readback_scalar=joint6_readback if joint_q.size >= 6 else None,
             main_frame=main_frame,
             wrist_frame=wrist_frame,
             image_pair_system_diff_us=pair_diff_us,

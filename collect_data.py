@@ -674,7 +674,8 @@ def _build_servo_pose_targets(
 def _capture_recorded_frame(
     cameras: CameraPair,
     actual_real: np.ndarray,
-    actual_joint6: float,
+    semantic_joint6: float,
+    readback_joint6: float,
     *,
     gripper: float,
     frame_idx: int,
@@ -686,7 +687,8 @@ def _capture_recorded_frame(
     return RecordedFrame(
         sim_pose6=actual_sim,
         gripper=float(gripper),
-        joint6=float(actual_joint6),
+        joint6=float(semantic_joint6),
+        joint6_readback=float(readback_joint6),
         main_image=preprocess_image(main_bgr),
         wrist_image=preprocess_image(wrist_bgr),
         timestamp=frame_idx * CONTROL_DT,
@@ -705,6 +707,7 @@ def _execute_servo_segment(
     start_frame_idx: int = 0,
     timeout_s: float = DEFAULT_ASYNC_MOVE_TIMEOUT_S,
     target_joint6: float | None = None,
+    semantic_joint6: float | None = None,
     force_live_mode: bool = True,
 ) -> list["RecordedFrame"]:
     from support.tcp_control import get_robot_snapshot
@@ -729,6 +732,7 @@ def _execute_servo_segment(
     last_record_ts: float | None = None
     deadline = time.monotonic() + max(0.5, float(timeout_s))
     servo_started = False
+    current_semantic_joint6 = float(start_joint6 if semantic_joint6 is None else semantic_joint6)
 
     def _record_snapshot(snap, *, force: bool = False) -> None:
         nonlocal frame_idx, next_record_deadline, last_record_ts
@@ -739,11 +743,12 @@ def _execute_servo_segment(
             return
         actual_real = np.asarray(snap.tcp_pose, dtype=np.float64).reshape(6).copy()
         joint_q = np.asarray(snap.joint_q, dtype=np.float64).reshape(-1)
-        actual_joint6 = float(joint_q[5]) if joint_q.size >= 6 else float(target_joint6 or start_joint6)
+        actual_joint6 = float(joint_q[5]) if joint_q.size >= 6 else float(current_semantic_joint6)
         frames.append(
             _capture_recorded_frame(
                 cameras,
                 actual_real,
+                current_semantic_joint6,
                 actual_joint6,
                 gripper=gripper,
                 frame_idx=frame_idx,
@@ -770,6 +775,8 @@ def _execute_servo_segment(
 
         for idx, pose_cmd in enumerate(pose_targets):
             joint6_cmd = None if joint_targets is None else joint_targets[idx]
+            if joint6_cmd is not None:
+                current_semantic_joint6 = float(joint6_cmd)
             resp = _send_servo_command(pose_cmd, joint6_cmd)
             pose_ret = int(resp.get("servo_pose_ret", -1))
             if pose_ret != 0:
@@ -785,7 +792,7 @@ def _execute_servo_segment(
             snap = get_robot_snapshot()
             actual_real = np.asarray(snap.tcp_pose, dtype=np.float64).reshape(6).copy()
             joint_q = np.asarray(snap.joint_q, dtype=np.float64).reshape(-1)
-            actual_joint6 = float(joint_q[5]) if joint_q.size >= 6 else float(target_joint6 or start_joint6)
+            actual_joint6 = float(joint_q[5]) if joint_q.size >= 6 else float(current_semantic_joint6)
             joint6_ok = (
                 target_joint6 is None
                 or abs(_wrap_angle(actual_joint6 - float(target_joint6))) <= DEFAULT_J6_EXEC_TOL_RAD
@@ -804,6 +811,8 @@ def _execute_servo_segment(
                     f"target_joint6={None if target_joint6 is None else round(float(target_joint6), 6)}, "
                     f"actual_joint6={round(actual_joint6, 6)})"
                 )
+            if target_joint6 is not None:
+                current_semantic_joint6 = float(target_joint6)
             resp = _send_servo_command(target_real, target_joint6)
             pose_ret = int(resp.get("servo_pose_ret", -1))
             if pose_ret != 0:
@@ -881,6 +890,7 @@ class RecordedFrame:
     sim_pose6: np.ndarray
     gripper: float
     joint6: float
+    joint6_readback: float
     main_image: np.ndarray
     wrist_image: np.ndarray
     timestamp: float
@@ -895,6 +905,7 @@ def execute_and_record(
     speed_mps: float,
     timeout_s: float = DEFAULT_ASYNC_MOVE_TIMEOUT_S,
     target_joint6: float | None = None,
+    semantic_joint6: float | None = None,
     force_live_mode: bool = True,
     record: bool = True,
 ) -> list[RecordedFrame]:
@@ -910,6 +921,7 @@ def execute_and_record(
         start_frame_idx=start_frame_idx,
         timeout_s=timeout_s,
         target_joint6=target_joint6,
+        semantic_joint6=semantic_joint6,
         force_live_mode=force_live_mode,
     )
 
@@ -917,6 +929,7 @@ def execute_and_record(
 def execute_joint6_rotation_and_record(
     cameras: CameraPair,
     target_joint6: float,
+    start_joint6: float,
     gripper: float,
     start_frame_idx: int,
     *,
@@ -939,6 +952,7 @@ def execute_joint6_rotation_and_record(
         start_frame_idx=start_frame_idx,
         timeout_s=timeout_s,
         target_joint6=float(target_joint6),
+        semantic_joint6=float(start_joint6),
         force_live_mode=False,
     )
 
@@ -969,7 +983,7 @@ def prepare_episode_for_save(
     *,
     save_fps: int,
     state_mode: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Convert raw episode frames onto the target save grid."""
     if not frames:
         raise RuntimeError("no frames to resample")
@@ -981,6 +995,7 @@ def prepare_episode_for_save(
     raw_pose6 = np.stack([np.asarray(frame.sim_pose6, dtype=np.float64).reshape(6) for frame in frames], axis=0)
     raw_gripper = np.array([float(frame.gripper) for frame in frames], dtype=np.float32)
     raw_joint6 = np.array([float(frame.joint6) for frame in frames], dtype=np.float32)
+    raw_joint6_readback = np.array([float(frame.joint6_readback) for frame in frames], dtype=np.float32)
     raw_main_images = np.stack([frame.main_image for frame in frames], axis=0)
     raw_wrist_images = np.stack([frame.wrist_image for frame in frames], axis=0)
 
@@ -1003,7 +1018,15 @@ def prepare_episode_for_save(
                 state_mode=mode,
             )
         actions = compute_delta_actions(pose6_saved, gripper_saved, joint6_saved, state_mode=mode)
-        return states, actions, target_times.astype(np.float32), env_steps, main_images, wrist_images
+        return (
+            states,
+            actions,
+            target_times.astype(np.float32),
+            env_steps,
+            main_images,
+            wrist_images,
+            raw_joint6_readback.astype(np.float32, copy=True),
+        )
 
     save_control_dt = 1.0 / float(save_fps)
     target_count = max(1, int(round((len(frames) - 1) * save_fps / RAW_CAPTURE_FPS)) + 1)
@@ -1015,6 +1038,7 @@ def prepare_episode_for_save(
     pose6_resampled = np.zeros((target_count, 6), dtype=np.float32)
     gripper_resampled = np.zeros((target_count,), dtype=np.float32)
     joint6_resampled = np.zeros((target_count,), dtype=np.float32)
+    joint6_readback_resampled = np.zeros((target_count,), dtype=np.float32)
     main_images = np.zeros((target_count, IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
     wrist_images = np.zeros((target_count, IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
 
@@ -1050,13 +1074,17 @@ def prepare_episode_for_save(
         grip_idx = min(max(grip_idx, 0), len(raw_gripper) - 1)
         if left == right:
             interp_joint6 = float(raw_joint6[left])
+            interp_joint6_readback = float(raw_joint6_readback[left])
         else:
             joint6_delta = _wrap_angle(float(raw_joint6[right] - raw_joint6[left]))
             interp_joint6 = float(raw_joint6[left] + alpha * joint6_delta)
+            joint6_readback_delta = _wrap_angle(float(raw_joint6_readback[right] - raw_joint6_readback[left]))
+            interp_joint6_readback = float(raw_joint6_readback[left] + alpha * joint6_readback_delta)
 
         pose6_resampled[out_idx] = interp_pose6.astype(np.float32)
         gripper_resampled[out_idx] = float(raw_gripper[grip_idx])
         joint6_resampled[out_idx] = np.float32(interp_joint6)
+        joint6_readback_resampled[out_idx] = np.float32(interp_joint6_readback)
         states[out_idx] = build_state_row(
             interp_pose6,
             gripper_resampled[out_idx],
@@ -1067,7 +1095,15 @@ def prepare_episode_for_save(
         wrist_images[out_idx] = raw_wrist_images[image_idx]
 
     actions = compute_delta_actions(pose6_resampled, gripper_resampled, joint6_resampled, state_mode=mode)
-    return states, actions, target_times.astype(np.float32), env_steps, main_images, wrist_images
+    return (
+        states,
+        actions,
+        target_times.astype(np.float32),
+        env_steps,
+        main_images,
+        wrist_images,
+        joint6_readback_resampled,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1096,7 +1132,7 @@ def save_episode(
     episode_dir = save_dir / f"episode_{episode_id:04d}"
     episode_dir.mkdir(parents=True, exist_ok=True)
 
-    states, actions, timestamps, env_steps, main_images, wrist_images = prepare_episode_for_save(
+    states, actions, timestamps, env_steps, main_images, wrist_images, joint6_readback = prepare_episode_for_save(
         frames,
         save_fps=save_fps,
         state_mode=state_mode,
@@ -1108,6 +1144,7 @@ def save_episode(
     np.save(episode_dir / "actions.npy", actions)
     np.save(episode_dir / "timestamps.npy", timestamps)
     np.save(episode_dir / "env_steps.npy", env_steps)
+    np.save(episode_dir / "joint6_readback.npy", joint6_readback)
     np.savez_compressed(
         episode_dir / "images.npz",
         main_images=main_images,
@@ -1128,6 +1165,8 @@ def save_episode(
         "timestamp_mode": "env_step_times_control_dt",
         "timestamps_file": "timestamps.npy",
         "env_steps_file": "env_steps.npy",
+        "joint6_supervision": "semantic",
+        "joint6_readback_file": "joint6_readback.npy",
         "state_dim": len(state_schema),
         "action_dim": 7,
         "state_schema": state_schema,
@@ -1615,6 +1654,7 @@ def main() -> int:
                         sim_pose6=sim_pose.copy(),
                         gripper=1.0 if idx < dummy_count - 3 else 0.0,
                         joint6=joint6,
+                        joint6_readback=joint6,
                         main_image=np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8),
                         wrist_image=np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8),
                         timestamp=(frame_idx + idx) * CONTROL_DT,
@@ -1636,6 +1676,7 @@ def main() -> int:
             gripper=1.0,
             start_frame_idx=frame_idx,
             speed_mps=LINEAR_SPEED,
+            semantic_joint6=local_exec_joint6_rad,
             record=record,
         )
         if record:
@@ -1646,16 +1687,14 @@ def main() -> int:
             seg = execute_joint6_rotation_and_record(
                 cameras,
                 target_joint6=target_joint6_rad,
+                start_joint6=local_exec_joint6_rad,
                 gripper=1.0,
                 start_frame_idx=frame_idx,
             )
             if record:
                 step_frames.extend(seg)
             frame_idx += len(seg)
-            if seg:
-                local_exec_joint6_rad = _normalize_j6(seg[-1].joint6)
-            else:
-                local_exec_joint6_rad = target_joint6_rad
+            local_exec_joint6_rad = _normalize_j6(target_joint6_rad)
 
         down_pose = build_pose_from_live_orientation(float(target_xy[0]), float(target_xy[1]), float(target_z))
         seg = execute_and_record(
@@ -1665,6 +1704,7 @@ def main() -> int:
             gripper=1.0,
             start_frame_idx=frame_idx,
             speed_mps=LINEAR_SPEED,
+            semantic_joint6=local_exec_joint6_rad,
             record=record,
         )
         if record:
@@ -1684,6 +1724,7 @@ def main() -> int:
             gripper=0.0,
             start_frame_idx=frame_idx,
             speed_mps=LINEAR_SPEED,
+            semantic_joint6=local_exec_joint6_rad,
             record=record,
         )
         if record:
@@ -1716,6 +1757,7 @@ def main() -> int:
                         sim_pose6=sim_pose.copy(),
                         gripper=0.0 if idx < dummy_count - 3 else 1.0,
                         joint6=joint6,
+                        joint6_readback=joint6,
                         main_image=np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8),
                         wrist_image=np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8),
                         timestamp=(frame_idx + idx) * CONTROL_DT,
@@ -1743,6 +1785,7 @@ def main() -> int:
             gripper=0.0,
             start_frame_idx=frame_idx,
             speed_mps=LINEAR_SPEED,
+            semantic_joint6=local_exec_joint6_rad,
             record=record,
         )
         if record:
@@ -1753,16 +1796,14 @@ def main() -> int:
             seg = execute_joint6_rotation_and_record(
                 cameras,
                 target_joint6=target_joint6_rad,
+                start_joint6=local_exec_joint6_rad,
                 gripper=0.0,
                 start_frame_idx=frame_idx,
             )
             if record:
                 step_frames.extend(seg)
             frame_idx += len(seg)
-            if seg:
-                local_exec_joint6_rad = _normalize_j6(seg[-1].joint6)
-            else:
-                local_exec_joint6_rad = target_joint6_rad
+            local_exec_joint6_rad = _normalize_j6(target_joint6_rad)
 
         down_pose = build_pose_from_live_orientation(float(target_xy[0]), float(target_xy[1]), float(target_z))
         seg = execute_and_record(
@@ -1772,16 +1813,16 @@ def main() -> int:
             gripper=0.0,
             start_frame_idx=frame_idx,
             speed_mps=LINEAR_SPEED,
+            semantic_joint6=local_exec_joint6_rad,
             record=record,
         )
         if record:
             step_frames.extend(seg)
         frame_idx += len(seg)
-        actual_standard_j6_rad = _normalize_j6(seg[-1].joint6) if seg else local_exec_joint6_rad
         set_object_standard_j6_rad(
             result_scene_state,
             step.object_name,
-            actual_standard_j6_rad if step.is_rotate else None,
+            local_exec_joint6_rad if step.is_rotate else None,
         )
 
         ensure_gripper_ok(
@@ -1798,6 +1839,7 @@ def main() -> int:
             gripper=1.0,
             start_frame_idx=frame_idx,
             speed_mps=LINEAR_SPEED,
+            semantic_joint6=local_exec_joint6_rad,
             record=record,
         )
         if record:
@@ -1864,6 +1906,7 @@ def main() -> int:
                         sim_pose6=sim_pose.copy(),
                         gripper=1.0,
                         joint6=float(DEFAULT_J6_HOME_RAD),
+                        joint6_readback=float(DEFAULT_J6_HOME_RAD),
                         main_image=np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8),
                         wrist_image=np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8),
                         timestamp=(frame_idx + idx) * CONTROL_DT,
@@ -1879,6 +1922,7 @@ def main() -> int:
             gripper=1.0,
             start_frame_idx=frame_idx,
             speed_mps=LINEAR_SPEED,
+            semantic_joint6=float(DEFAULT_J6_HOME_RAD),
             record=record,
         )
         if record:

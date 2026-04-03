@@ -275,6 +275,7 @@ class TrajectoryExecutor:
                     return None
                 servo_active = True
 
+            daemon.servo_begin_chunk(snapshot.tcp_pose)
             return snapshot, plan, None
 
         # hold_pose_real: when a chunk finishes, keep sending this pose to

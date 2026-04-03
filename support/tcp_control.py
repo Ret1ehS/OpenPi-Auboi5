@@ -18,6 +18,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -64,6 +65,7 @@ FORCE_GUARD_SOFT_FZ_N = 10.0
 FORCE_GUARD_HARD_FZ_N = 0.0
 FORCE_GUARD_FZ_SIGN = 1.0
 FORCE_GUARD_READING_TIMEOUT_S = 0.25
+_FORCE_GUARD_UNSET = object()
 
 JOINT_NAMES = [
     "base_link",
@@ -309,6 +311,37 @@ def _force_guard_scale(force_z_n: float | None) -> float | None:
     return float((force_z_n - FORCE_GUARD_HARD_FZ_N) / span)
 
 
+def _force_guard_meta(
+    force_z_n: float | None,
+    scale: float | None,
+    adjusted: bool,
+) -> dict[str, object]:
+    return {
+        "force_guard_fz_n": force_z_n,
+        "force_guard_scale": scale,
+        "force_guard_adjusted": bool(adjusted),
+    }
+
+
+def _prepare_force_guard(
+    requested_pose: np.ndarray,
+    reference_pose: np.ndarray | None,
+    *,
+    force_z_n: float | None | object = _FORCE_GUARD_UNSET,
+    scale: float | None | object = _FORCE_GUARD_UNSET,
+) -> tuple[np.ndarray, np.ndarray | None, float, float | None, float | None]:
+    pose = np.asarray(requested_pose, dtype=np.float64).reshape(POSE_DIM).copy()
+    if reference_pose is None:
+        return pose, None, 0.0, None, None
+    ref = np.asarray(reference_pose, dtype=np.float64).reshape(POSE_DIM)
+    downward_dist = float(ref[2] - pose[2])
+    if downward_dist <= 0.0:
+        return pose, ref, downward_dist, None, None
+    force_val = _get_force_guard_fz_n() if force_z_n is _FORCE_GUARD_UNSET else force_z_n
+    scale_val = _force_guard_scale(force_val) if scale is _FORCE_GUARD_UNSET else scale
+    return pose, ref, downward_dist, force_val, scale_val
+
+
 def _get_live_tcp_pose_real() -> np.ndarray | None:
     try:
         status = _get_motion_daemon().motion_status()
@@ -326,28 +359,34 @@ def _get_live_tcp_pose_real() -> np.ndarray | None:
 def _apply_servo_force_guard(
     requested_pose: np.ndarray,
     reference_pose: np.ndarray | None,
-) -> tuple[np.ndarray, dict[str, object]]:
-    pose = np.asarray(requested_pose, dtype=np.float64).reshape(POSE_DIM).copy()
-    meta: dict[str, object] = {
-        "force_guard_fz_n": None,
-        "force_guard_scale": None,
-        "force_guard_adjusted": False,
-    }
-    if reference_pose is None:
-        return pose, meta
-    ref = np.asarray(reference_pose, dtype=np.float64).reshape(POSE_DIM)
-    downward_dist = float(ref[2] - pose[2])
-    if downward_dist <= 0.0:
-        return pose, meta
+) -> tuple[np.ndarray, float | None, float | None, bool]:
     force_z_n = _get_force_guard_fz_n()
     scale = _force_guard_scale(force_z_n)
-    meta["force_guard_fz_n"] = force_z_n
-    meta["force_guard_scale"] = scale
-    if scale is None or scale >= 1.0:
-        return pose, meta
+    return _apply_servo_force_guard_with_scale(
+        requested_pose,
+        reference_pose,
+        force_z_n=force_z_n,
+        scale=scale,
+    )
+
+
+def _apply_servo_force_guard_with_scale(
+    requested_pose: np.ndarray,
+    reference_pose: np.ndarray | None,
+    *,
+    force_z_n: float | None,
+    scale: float | None,
+) -> tuple[np.ndarray, float | None, float | None, bool]:
+    pose, ref, downward_dist, force_z_n, scale = _prepare_force_guard(
+        requested_pose,
+        reference_pose,
+        force_z_n=force_z_n,
+        scale=scale,
+    )
+    if ref is None or downward_dist <= 0.0 or scale is None or scale >= 1.0:
+        return pose, force_z_n, scale, False
     pose[2] = float(ref[2] - downward_dist * max(0.0, scale))
-    meta["force_guard_adjusted"] = True
-    return pose, meta
+    return pose, force_z_n, scale, True
 
 
 def _apply_movel_force_guard(
@@ -356,35 +395,22 @@ def _apply_movel_force_guard(
     *,
     speed_frac: float,
     speed_mps: float | None,
-) -> tuple[np.ndarray, float, float | None, dict[str, object]]:
-    pose = np.asarray(requested_pose, dtype=np.float64).reshape(POSE_DIM).copy()
+) -> tuple[np.ndarray, float, float | None, float | None, float | None, bool]:
     adj_speed_frac = float(speed_frac)
     adj_speed_mps = None if speed_mps is None else float(speed_mps)
-    meta: dict[str, object] = {
-        "force_guard_fz_n": None,
-        "force_guard_scale": None,
-        "force_guard_adjusted": False,
-    }
-    if reference_pose is None:
-        return pose, adj_speed_frac, adj_speed_mps, meta
-    ref = np.asarray(reference_pose, dtype=np.float64).reshape(POSE_DIM)
-    downward_dist = float(ref[2] - pose[2])
-    if downward_dist <= 0.0:
-        return pose, adj_speed_frac, adj_speed_mps, meta
-    force_z_n = _get_force_guard_fz_n()
-    scale = _force_guard_scale(force_z_n)
-    meta["force_guard_fz_n"] = force_z_n
-    meta["force_guard_scale"] = scale
-    if scale is None or scale >= 1.0:
-        return pose, adj_speed_frac, adj_speed_mps, meta
+    pose, ref, downward_dist, force_z_n, scale = _prepare_force_guard(
+        requested_pose,
+        reference_pose,
+    )
+    if ref is None or downward_dist <= 0.0 or scale is None or scale >= 1.0:
+        return pose, adj_speed_frac, adj_speed_mps, force_z_n, scale, False
     if scale <= 0.0:
         pose[2] = float(ref[2])
     elif adj_speed_mps is not None:
         adj_speed_mps = max(1e-4, adj_speed_mps * max(scale, 0.0))
     elif adj_speed_frac > 0.0:
         adj_speed_frac = max(1e-4, adj_speed_frac * max(scale, 0.0))
-    meta["force_guard_adjusted"] = True
-    return pose, adj_speed_frac, adj_speed_mps, meta
+    return pose, adj_speed_frac, adj_speed_mps, force_z_n, scale, True
 
 
 def _run_helper(
@@ -471,6 +497,9 @@ class _DaemonHelper:
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
         self._last_servo_pose_real: np.ndarray | None = None
+        self._servo_force_guard_fz_n: float | None = None
+        self._servo_force_guard_scale: float | None = None
+        self._servo_force_guard_live_mode = False
 
     def _ensure_started(self) -> subprocess.Popen:
         if self._proc is not None and self._proc.poll() is None:
@@ -532,51 +561,108 @@ class _DaemonHelper:
         """Enter servo mode on the daemon."""
         with self._lock:
             self._last_servo_pose_real = None
+            self._servo_force_guard_fz_n = None
+            self._servo_force_guard_scale = None
+            self._servo_force_guard_live_mode = False
             return self._send_cmd(f"servo_start {track_time_s:.12g}")
+
+    def servo_begin_chunk(self, pose6: np.ndarray | None = None) -> dict[str, object]:
+        """Cache chunk-start pose and force. Live force polling only starts inside warning region."""
+        with self._lock:
+            if pose6 is not None:
+                self._last_servo_pose_real = np.asarray(pose6, dtype=np.float64).reshape(POSE_DIM).copy()
+            force_z_n = _get_force_guard_fz_n()
+            scale = _force_guard_scale(force_z_n)
+            self._servo_force_guard_fz_n = force_z_n
+            self._servo_force_guard_scale = scale
+            self._servo_force_guard_live_mode = bool(scale is not None and scale < 1.0)
+            return {
+                "force_guard_fz_n": force_z_n,
+                "force_guard_scale": scale,
+                "force_guard_live_mode": self._servo_force_guard_live_mode,
+            }
+
+    def _current_servo_reference_pose(self) -> np.ndarray | None:
+        if self._last_servo_pose_real is not None:
+            return self._last_servo_pose_real
+        return _get_live_tcp_pose_real()
 
     def servo_pose(self, pose6: np.ndarray) -> dict[str, object]:
         """Send a single pose in servo mode. Returns parsed response.
         Used by data collection for frame-by-frame execution + capture."""
         requested = np.asarray(pose6, dtype=np.float64).reshape(POSE_DIM)
-        reference = self._last_servo_pose_real.copy() if self._last_servo_pose_real is not None else _get_live_tcp_pose_real()
-        guarded, guard_meta = _apply_servo_force_guard(requested, reference)
+        reference = self._current_servo_reference_pose()
+        if self._servo_force_guard_live_mode:
+            guarded, force_z_n, scale, adjusted = _apply_servo_force_guard(requested, reference)
+        else:
+            guarded, force_z_n, scale, adjusted = _apply_servo_force_guard_with_scale(
+                requested,
+                reference,
+                force_z_n=self._servo_force_guard_fz_n,
+                scale=self._servo_force_guard_scale,
+            )
         cmd = "servo_pose " + " ".join(f"{v:.12g}" for v in guarded)
         with self._lock:
             resp = self._send_cmd(cmd)
-        resp.update(guard_meta)
-        self._last_servo_pose_real = guarded.copy()
+        resp.update(_force_guard_meta(force_z_n, scale, adjusted))
+        self._last_servo_pose_real = guarded
+        if force_z_n is not None or scale is not None:
+            self._servo_force_guard_fz_n = force_z_n
+            self._servo_force_guard_scale = scale
+        self._servo_force_guard_live_mode = bool(
+            self._servo_force_guard_scale is not None and float(self._servo_force_guard_scale) < 1.0
+        )
         return resp
 
     def servo_pose_j6(self, pose6: np.ndarray, joint6: float) -> dict[str, object]:
         """Send one absolute task target with explicit j6 target in servo mode."""
         requested = np.asarray(pose6, dtype=np.float64).reshape(POSE_DIM)
-        reference = self._last_servo_pose_real.copy() if self._last_servo_pose_real is not None else _get_live_tcp_pose_real()
-        guarded, guard_meta = _apply_servo_force_guard(requested, reference)
+        reference = self._current_servo_reference_pose()
+        if self._servo_force_guard_live_mode:
+            guarded, force_z_n, scale, adjusted = _apply_servo_force_guard(requested, reference)
+        else:
+            guarded, force_z_n, scale, adjusted = _apply_servo_force_guard_with_scale(
+                requested,
+                reference,
+                force_z_n=self._servo_force_guard_fz_n,
+                scale=self._servo_force_guard_scale,
+            )
         cmd = "servo_pose_j6 " + " ".join(f"{v:.12g}" for v in guarded) + f" {float(joint6):.12g}"
         with self._lock:
             resp = self._send_cmd(cmd)
-        resp.update(guard_meta)
-        self._last_servo_pose_real = guarded.copy()
+        resp.update(_force_guard_meta(force_z_n, scale, adjusted))
+        self._last_servo_pose_real = guarded
+        if force_z_n is not None or scale is not None:
+            self._servo_force_guard_fz_n = force_z_n
+            self._servo_force_guard_scale = scale
+        self._servo_force_guard_live_mode = bool(
+            self._servo_force_guard_scale is not None and float(self._servo_force_guard_scale) < 1.0
+        )
         return resp
 
     def servo_chunk(self, poses_real: list[np.ndarray]) -> dict[str, object]:
         """Send a batch of poses to execute with C++-side timing.
         All poses are sent at once; C++ handles the precise sleep intervals."""
         guarded_poses: list[np.ndarray] = []
-        guard_meta: dict[str, object] = {
-            "force_guard_fz_n": None,
-            "force_guard_scale": None,
-            "force_guard_adjusted": False,
-        }
-        reference = self._last_servo_pose_real.copy() if self._last_servo_pose_real is not None else _get_live_tcp_pose_real()
+        force_z_n: float | None = None
+        scale: float | None = None
+        adjusted = False
+        reference = self._current_servo_reference_pose()
         for pose in poses_real:
-            guarded, step_meta = _apply_servo_force_guard(pose, reference)
+            if self._servo_force_guard_live_mode:
+                guarded, step_force_z_n, step_scale, step_adjusted = _apply_servo_force_guard(pose, reference)
+            else:
+                guarded, step_force_z_n, step_scale, step_adjusted = _apply_servo_force_guard_with_scale(
+                    pose,
+                    reference,
+                    force_z_n=self._servo_force_guard_fz_n,
+                    scale=self._servo_force_guard_scale,
+                )
             guarded_poses.append(guarded)
-            if step_meta.get("force_guard_fz_n") is not None:
-                guard_meta["force_guard_fz_n"] = step_meta["force_guard_fz_n"]
-                guard_meta["force_guard_scale"] = step_meta["force_guard_scale"]
-            if bool(step_meta.get("force_guard_adjusted", False)):
-                guard_meta["force_guard_adjusted"] = True
+            if step_force_z_n is not None:
+                force_z_n = step_force_z_n
+                scale = step_scale
+            adjusted = adjusted or bool(step_adjusted)
             reference = guarded
         with self._lock:
             proc = self._ensure_started()
@@ -598,10 +684,16 @@ class _DaemonHelper:
                 if stripped == "END":
                     break
                 lines.append(line)
-            resp = _parse_helper_output("\n".join(lines))
-        resp.update(guard_meta)
+        resp = _parse_helper_output("\n".join(lines))
+        resp.update(_force_guard_meta(force_z_n, scale, adjusted))
         if guarded_poses:
-            self._last_servo_pose_real = guarded_poses[-1].copy()
+            self._last_servo_pose_real = guarded_poses[-1]
+        if force_z_n is not None or scale is not None:
+            self._servo_force_guard_fz_n = force_z_n
+            self._servo_force_guard_scale = scale
+        self._servo_force_guard_live_mode = bool(
+            self._servo_force_guard_scale is not None and float(self._servo_force_guard_scale) < 1.0
+        )
         return resp
 
     def movel(
@@ -625,7 +717,7 @@ class _DaemonHelper:
 
         requested = np.asarray(pose, dtype=np.float64).reshape(POSE_DIM)
         reference = _get_live_tcp_pose_real()
-        guarded, speed_frac, speed_mps, guard_meta = _apply_movel_force_guard(
+        guarded, speed_frac, speed_mps, force_z_n, scale, adjusted = _apply_movel_force_guard(
             requested,
             reference,
             speed_frac=speed_frac,
@@ -643,7 +735,7 @@ class _DaemonHelper:
             cmd += f" {speed_frac:.4f}"
         with self._lock:
             resp = self._send_cmd(cmd)
-        resp.update(guard_meta)
+        resp.update(_force_guard_meta(force_z_n, scale, adjusted))
         return resp
 
     def movel_chunk(
@@ -697,6 +789,9 @@ class _DaemonHelper:
         with self._lock:
             resp = self._send_cmd("servo_stop")
             self._last_servo_pose_real = None
+            self._servo_force_guard_fz_n = None
+            self._servo_force_guard_scale = None
+            self._servo_force_guard_live_mode = False
             return resp
 
     def stop(self) -> None:
@@ -1147,14 +1242,11 @@ def retime_tcp_action_chunk(
             current_sim = integrate_delta_tcp_pose(current_sim, step_delta, lock_yaw=lock_yaw)
             # Convert to real frame for robot SDK
             current_real = sim_pose_to_real(current_sim)
-            current_real, _guard_meta = _apply_servo_force_guard(current_real, steps[-1].pose_real if steps else start_real)
             # Clip TCP z in real frame to minimum safe height
             if current_real[2] < z_min:
                 current_real[2] = z_min
-                # Reflect the clipped real pose back to sim frame
-                current_sim = real_pose_to_sim(current_real)
-            else:
-                current_sim = real_pose_to_sim(current_real)
+            # Reflect the clipped real pose back to sim frame
+            current_sim = real_pose_to_sim(current_real)
             steps.append(RetimedTcpStep(
                 pose_real=current_real.copy(),
                 pose_sim=current_sim.copy(),

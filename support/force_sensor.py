@@ -224,12 +224,13 @@ class ForceSensor:
     @staticmethod
     def _parse_frame(frame: bytes) -> tuple[float, float, float, float, float, float]:
         """Parse 28-byte frame → (Fx, Fy, Fz, Mx, My, Mz) in N and N·m."""
-        fx = struct.unpack_from('<f', frame, 2)[0] * GRAVITY
-        fy = struct.unpack_from('<f', frame, 6)[0] * GRAVITY
-        fz = struct.unpack_from('<f', frame, 10)[0] * GRAVITY
-        mx = struct.unpack_from('<f', frame, 14)[0] * GRAVITY
-        my = struct.unpack_from('<f', frame, 18)[0] * GRAVITY
-        mz = struct.unpack_from('<f', frame, 22)[0] * GRAVITY
+        fx, fy, fz, mx, my, mz = struct.unpack_from('<6f', frame, 2)
+        fx *= GRAVITY
+        fy *= GRAVITY
+        fz *= GRAVITY
+        mx *= GRAVITY
+        my *= GRAVITY
+        mz *= GRAVITY
         return fx, fy, fz, mx, my, mz
 
     def _reader_loop(self) -> None:
@@ -259,17 +260,17 @@ class ForceSensor:
                     buf.clear()
                     break
                 if idx > 0:
-                    buf = buf[idx:]  # discard bytes before header
+                    del buf[:idx]  # discard bytes before header
                 if len(buf) < FRAME_SIZE:
                     break
 
                 # Check footer
                 if buf[FRAME_SIZE - 2 : FRAME_SIZE] != FOOTER:
-                    buf = buf[1:]  # bad frame, skip one byte
+                    del buf[:1]  # bad frame, skip one byte
                     continue
 
                 frame = bytes(buf[:FRAME_SIZE])
-                buf = buf[FRAME_SIZE:]
+                del buf[:FRAME_SIZE]
 
                 raw = self._parse_frame(frame)
                 now = time.monotonic()

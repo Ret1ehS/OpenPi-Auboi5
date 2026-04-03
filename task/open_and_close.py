@@ -20,6 +20,9 @@ BAND_OBJECT_COUNT_MIN = 2
 BAND_OBJECT_COUNT_MAX = 4
 STACK_PROBABILITY = 0.70
 OBSTACLE_LAYOUT_X_MAX_M = 0.60
+OBSTACLE_ROTATE_PROB = 0.70
+OBSTACLE_ROTATE_DEG_MIN = float(np.degrees(np.pi / 15.0))
+OBSTACLE_ROTATE_DEG_MAX = float(np.degrees(np.pi / 8.0))
 
 
 def _bounded_layout_x_max(workspace_x_min: float, workspace_x_max: float) -> float:
@@ -217,9 +220,9 @@ class ObstacleScene:
 
 def sample_obstacle_orientation(
     *,
-    rotate_prob: float = 0.5,
-    rotate_deg_min: float = 12.0,
-    rotate_deg_max: float = 22.5,
+    rotate_prob: float = OBSTACLE_ROTATE_PROB,
+    rotate_deg_min: float = OBSTACLE_ROTATE_DEG_MIN,
+    rotate_deg_max: float = OBSTACLE_ROTATE_DEG_MAX,
 ) -> tuple[bool, float]:
     if np.random.random() < rotate_prob:
         abs_deg = float(np.random.uniform(rotate_deg_min, rotate_deg_max))

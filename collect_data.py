@@ -1753,12 +1753,9 @@ def main() -> int:
                 raise RuntimeError(f"unknown step kind: {step.kind}")
         return frames, held_object
 
-    def build_pose_from_reference_orientation(reference_pose6: np.ndarray, x: float, y: float, z: float) -> np.ndarray:
-        return build_pose_at_xy(reference_pose6, x, y, z)
-
     def execute_move_step(step: OpenCloseMoveStep, *, record: bool, frame_idx: int, base_pose6: np.ndarray) -> tuple[list[RecordedFrame], int]:
         step_frames: list[RecordedFrame] = []
-        target_pose = build_pose_from_reference_orientation(base_pose6, float(step.x), float(step.y), float(step.z))
+        target_pose = build_pose_at_xy(base_pose6, float(step.x), float(step.y), float(step.z))
         if args.dry_run:
             dummy_count = 6
             sim_pose = real_pose_to_sim(target_pose)
@@ -2052,11 +2049,7 @@ def main() -> int:
                     min_dist=OC_CLEAR_SPACING,
                     x_max=OC_LAYOUT_X_MAX,
                 )
-                is_rotate = bool(np.random.random() < 0.5)
-                deg = 0.0
-                if is_rotate:
-                    abs_deg = float(np.random.uniform(12.0, 22.5))
-                    deg = -abs_deg if np.random.random() < 0.5 else abs_deg
+                is_rotate, deg = sample_obstacle_orientation()
                 print(
                     f"  [{idx + 1}/{NUM_OBSTACLES}] {obj_name}: "
                     f"-> ({xy[0]:.4f}, {xy[1]:.4f}), rotate={is_rotate}, deg={deg:.1f}"
@@ -2283,12 +2276,11 @@ def main() -> int:
                     record=True,
                     base_pose6=open_close_reference.reference_pose6,
                 )
-                all_frames = [*clearing_frames, *open_frames, *close_frames]
                 held_after_recorded = None
-            if not all_frames:
-                raise RuntimeError("recorded episode produced no frames")
 
             if selected_task == "pick_and_place":
+                if not all_frames:
+                    raise RuntimeError("recorded episode produced no frames")
                 save_episode(
                     all_frames,
                     save_dir,
@@ -2298,12 +2290,12 @@ def main() -> int:
                 )
                 episode_count += 1
             else:
+                if not open_frames:
+                    raise RuntimeError("open episode produced no recorded move frames")
+                if not close_frames:
+                    raise RuntimeError("close episode produced no recorded move frames")
                 # Clearing frames are part of the open episode
                 combined_open_frames = [*clearing_frames, *open_frames]
-                if not combined_open_frames:
-                    raise RuntimeError("open episode produced no frames")
-                if not close_frames:
-                    raise RuntimeError("close episode produced no frames")
                 save_episode(
                     combined_open_frames,
                     save_dir,

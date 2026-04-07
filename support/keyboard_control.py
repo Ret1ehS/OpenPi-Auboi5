@@ -132,25 +132,42 @@ def drain_keys(fd: int) -> list[str]:
 class ContinuousKeyState:
     _listener: object | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    _backend: str = "none"
     _up: bool = False
     _down: bool = False
     _left: bool = False
     _right: bool = False
     _ctrl: bool = False
+    _last_up_ts: float = -1.0
+    _last_down_ts: float = -1.0
+    _last_left_ts: float = -1.0
+    _last_right_ts: float = -1.0
+    _last_ctrl_up_ts: float = -1.0
+    _last_ctrl_down_ts: float = -1.0
+    _last_ctrl_left_ts: float = -1.0
+    _last_ctrl_right_ts: float = -1.0
+    _repeat_hold_s: float = 0.08
 
     @property
     def available(self) -> bool:
-        return pynput_keyboard is not None
+        return True
 
-    def start(self) -> bool:
-        if pynput_keyboard is None:
-            return False
+    @property
+    def backend(self) -> str:
+        return self._backend
+
+    def start(self, *, fd: int | None = None, repeat_hold_s: float = 0.08) -> bool:
         self.stop()
+        self._repeat_hold_s = float(repeat_hold_s)
+        if pynput_keyboard is None:
+            self._backend = "terminal_repeat" if fd is not None else "none"
+            return self._backend != "none"
         self._listener = pynput_keyboard.Listener(
             on_press=self._on_press,
             on_release=self._on_release,
         )
         self._listener.start()
+        self._backend = "pynput"
         return True
 
     def stop(self) -> None:
@@ -162,20 +179,83 @@ class ContinuousKeyState:
             except Exception:
                 pass
         with self._lock:
+            self._backend = "none"
             self._up = False
             self._down = False
             self._left = False
             self._right = False
             self._ctrl = False
+            self._last_up_ts = -1.0
+            self._last_down_ts = -1.0
+            self._last_left_ts = -1.0
+            self._last_right_ts = -1.0
+            self._last_ctrl_up_ts = -1.0
+            self._last_ctrl_down_ts = -1.0
+            self._last_ctrl_left_ts = -1.0
+            self._last_ctrl_right_ts = -1.0
 
-    def axes(self) -> tuple[float, float, float, float]:
+    def feed_terminal_keys(self, keys: list[str], now_ts: float) -> list[str]:
+        if self._backend != "terminal_repeat":
+            return [
+                key for key in keys
+                if key not in {
+                    KEY_UP,
+                    KEY_DOWN,
+                    KEY_LEFT,
+                    KEY_RIGHT,
+                    KEY_CTRL_UP,
+                    KEY_CTRL_DOWN,
+                    KEY_CTRL_LEFT,
+                    KEY_CTRL_RIGHT,
+                }
+            ]
+
+        discrete: list[str] = []
         with self._lock:
+            for key in keys:
+                if key == KEY_UP:
+                    self._last_up_ts = now_ts
+                elif key == KEY_DOWN:
+                    self._last_down_ts = now_ts
+                elif key == KEY_LEFT:
+                    self._last_left_ts = now_ts
+                elif key == KEY_RIGHT:
+                    self._last_right_ts = now_ts
+                elif key == KEY_CTRL_UP:
+                    self._last_ctrl_up_ts = now_ts
+                elif key == KEY_CTRL_DOWN:
+                    self._last_ctrl_down_ts = now_ts
+                elif key == KEY_CTRL_LEFT:
+                    self._last_ctrl_left_ts = now_ts
+                elif key == KEY_CTRL_RIGHT:
+                    self._last_ctrl_right_ts = now_ts
+                else:
+                    discrete.append(key)
+        return discrete
+
+    def axes(self, now_ts: float | None = None) -> tuple[float, float, float, float]:
+        with self._lock:
+            if self._backend == "terminal_repeat":
+                ts = 0.0 if now_ts is None else float(now_ts)
+                up = (ts - self._last_up_ts) <= self._repeat_hold_s
+                down = (ts - self._last_down_ts) <= self._repeat_hold_s
+                left = (ts - self._last_left_ts) <= self._repeat_hold_s
+                right = (ts - self._last_right_ts) <= self._repeat_hold_s
+                ctrl_up = (ts - self._last_ctrl_up_ts) <= self._repeat_hold_s
+                ctrl_down = (ts - self._last_ctrl_down_ts) <= self._repeat_hold_s
+                ctrl_left = (ts - self._last_ctrl_left_ts) <= self._repeat_hold_s
+                ctrl_right = (ts - self._last_ctrl_right_ts) <= self._repeat_hold_s
+                vertical = (1.0 if up else 0.0) - (1.0 if down else 0.0)
+                horizontal = (1.0 if left else 0.0) - (1.0 if right else 0.0)
+                z_axis = (1.0 if ctrl_up else 0.0) - (1.0 if ctrl_down else 0.0)
+                yaw_axis = (1.0 if ctrl_left else 0.0) - (1.0 if ctrl_right else 0.0)
+                return vertical, horizontal, z_axis, yaw_axis
+
             up = self._up
             down = self._down
             left = self._left
             right = self._right
             ctrl = self._ctrl
-
         vertical = (1.0 if up else 0.0) - (1.0 if down else 0.0)
         horizontal = (1.0 if left else 0.0) - (1.0 if right else 0.0)
         if ctrl:

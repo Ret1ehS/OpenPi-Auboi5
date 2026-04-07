@@ -75,9 +75,6 @@ def run_session(
     last_motion_ts = time.monotonic()
     key_state = ContinuousKeyState()
 
-    if not key_state.start():
-        raise RuntimeError("continuous keyboard teleop requires pynput and an active desktop input session")
-
     def _append_current_snapshot() -> None:
         nonlocal frame_idx, next_record_ts
         if not recording:
@@ -193,6 +190,8 @@ def run_session(
 
     term = RawTerminal.open()
     try:
+        if not key_state.start(fd=term.fd):
+            raise RuntimeError("continuous keyboard teleop backend unavailable")
         while True:
             now_ts = time.monotonic()
             if now_ts >= next_ui_refresh_ts:
@@ -211,13 +210,14 @@ def run_session(
                 )
                 next_ui_refresh_ts = now_ts + float(UI_REFRESH_DT_S)
 
-            for key in drain_keys(term.fd):
+            discrete_keys = key_state.feed_terminal_keys(drain_keys(term.fd), now_ts)
+            for key in discrete_keys:
                 if key in {KEY_QUIT, KEY_CTRL_C}:
                     status_line = "Exiting keyboard teleop."
                     return saved_episode_count
                 if _handle_discrete_key(key):
                     continue
-            move_x, move_y, move_z, rotate_axis = key_state.axes()
+            move_x, move_y, move_z, rotate_axis = key_state.axes(now_ts)
             move_axis = np.array([move_x, move_y, move_z], dtype=np.float64)
             linear_norm = float(np.linalg.norm(move_axis))
             has_linear = linear_norm > 1e-9

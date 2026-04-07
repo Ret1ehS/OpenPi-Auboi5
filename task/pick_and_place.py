@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from support.pose_align import real_pose_to_sim
 
 
 APPLE_NAME = "apple"
@@ -70,6 +71,22 @@ class EpisodePlan:
     recorded_steps: list[TaskStep]
     post_steps: list[TaskStep]
     scene_after: dict[str, dict[str, Any]]
+
+
+@dataclass
+class PickAndPlaceSession:
+    scene_state: dict[str, dict[str, Any]]
+    task_index: int = 0
+    episode_count: int = 0
+    skip_prep: bool = False
+
+
+@dataclass
+class PickAndPlaceRecordedEpisode:
+    plan: EpisodePlan
+    frames: list[Any]
+    held_after_recorded: str | None
+    execution_scene_state: dict[str, dict[str, Any]]
 
 
 def object_prompt_name(name: str) -> str:
@@ -612,6 +629,595 @@ def _normalize_optional_j6(value: Any) -> float | None:
         return None
 
 
+def clone_scene_state(scene_state: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    cloned = load_scene_state(scene_state)
+    if cloned is None:
+        raise RuntimeError("invalid scene_state payload")
+    return cloned
+
+
+def get_object_xy(scene_state: dict[str, dict[str, Any]], name: str) -> np.ndarray:
+    return np.asarray(scene_state[name]["xy"], dtype=np.float64).reshape(2).copy()
+
+
+def get_object_is_rotate(scene_state: dict[str, dict[str, Any]], name: str) -> bool:
+    return bool(scene_state[name]["is_rotate"])
+
+
+def get_object_deg(scene_state: dict[str, dict[str, Any]], name: str) -> float:
+    return float(scene_state[name]["deg"])
+
+
+def get_object_standard_j6_rad(scene_state: dict[str, dict[str, Any]], name: str) -> float | None:
+    raw = scene_state.get(name, {}).get("standard_j6_rad")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def set_object_standard_j6_rad(
+    scene_state: dict[str, dict[str, Any]],
+    name: str,
+    joint6_rad: float | None,
+) -> None:
+    state = scene_state.get(name)
+    if not isinstance(state, dict):
+        return
+    if name == APPLE_NAME or not bool(state.get("is_rotate", False)) or joint6_rad is None:
+        state["standard_j6_rad"] = None
+        return
+    state["standard_j6_rad"] = float(joint6_rad)
+
+
+def sample_initial_object_state(
+    scene_state: dict[str, dict[str, Any]],
+    origin_xy: np.ndarray,
+    *,
+    object_name: str,
+    config: PlannerConfig,
+) -> dict[str, Any]:
+    occupied = [np.asarray(origin_xy, dtype=np.float64).reshape(2).copy()]
+    for existing_name in scene_state.keys():
+        occupied.append(get_object_xy(scene_state, existing_name))
+    x_min, x_max = _workspace_axis_bounds(
+        float(config.workspace_x_min),
+        float(config.workspace_x_max),
+        float(config.min_spacing_m),
+    )
+    y_min, y_max = _workspace_axis_bounds(
+        float(config.workspace_y_min),
+        float(config.workspace_y_max),
+        float(config.min_spacing_m),
+    )
+    for _ in range(512):
+        candidate = np.array(
+            [
+                np.random.uniform(x_min, x_max),
+                np.random.uniform(y_min, y_max),
+            ],
+            dtype=np.float64,
+        )
+        if _is_far_enough(candidate, occupied, config.min_spacing_m):
+            break
+    else:
+        raise RuntimeError("failed to sample initial object state")
+
+    if object_name == APPLE_NAME:
+        is_rotate = False
+        deg = 0.0
+    else:
+        is_rotate, deg = sample_random_orientation(object_name, config=config)
+    return {
+        "xy": [float(candidate[0]), float(candidate[1])],
+        "is_rotate": bool(is_rotate),
+        "deg": float(deg),
+        "standard_j6_rad": None,
+        "upper": None,
+        "lower": None,
+    }
+
+
+def restore_session(
+    saved: dict[str, Any] | None,
+    *,
+    resume_mode: str,
+) -> tuple[PickAndPlaceSession, bool]:
+    session = PickAndPlaceSession(scene_state={})
+    should_clear_saved_state = False
+    saved_scene_state = saved.get("scene_state", {}) if isinstance(saved, dict) else {}
+
+    if saved_scene_state:
+        print("\n  Found saved object states from previous run:")
+        for name, state in saved_scene_state.items():
+            xy = get_object_xy(saved_scene_state, name)
+            is_rotate = get_object_is_rotate(saved_scene_state, name)
+            deg = get_object_deg(saved_scene_state, name)
+            upper = state.get("upper")
+            lower = state.get("lower")
+            print(
+                f"    {name}: xy=({xy[0]:.4f}, {xy[1]:.4f}), "
+                f"is_rotate={is_rotate}, deg={deg:.1f}, upper={upper}, lower={lower}"
+            )
+        print(
+            f"    task_index={int(saved.get('color_index', 0))}, "
+            f"episode_count={int(saved.get('episode_count', 0))}, "
+            f"held_object={saved.get('held_object')}"
+        )
+        if resume_mode == "reset":
+            should_clear_saved_state = True
+        else:
+            normalized_state = load_scene_state(saved_scene_state)
+            if normalized_state is None:
+                raise RuntimeError("saved pick/place scene state is invalid")
+            session.scene_state = normalized_state
+            session.task_index = int(saved.get("color_index", 0))
+            session.episode_count = int(saved.get("episode_count", 0))
+            session.skip_prep = True
+            print("  Resuming from saved state.")
+    elif resume_mode == "continue":
+        print("\n  Resume selected, but no saved state exists. Starting fresh.")
+
+    return session, should_clear_saved_state
+
+
+def prepare_session(
+    runtime,
+    session: PickAndPlaceSession,
+    *,
+    config: PlannerConfig,
+) -> None:
+    if session.skip_prep:
+        print("\n=== Skipping Preparation (resumed from saved state) ===")
+        return
+
+    print("\n=== Preparation Phase ===")
+    print(f"Seed order: {list(OBJECT_ORDER)}")
+    for object_name in OBJECT_ORDER:
+        placed_state = sample_initial_object_state(
+            session.scene_state,
+            runtime.origin_xy,
+            object_name=object_name,
+            config=config,
+        )
+        print(
+            f"[prep] {object_name}: origin -> ({placed_state['xy'][0]:.4f}, {placed_state['xy'][1]:.4f}), "
+            f"is_rotate={placed_state['is_rotate']}, deg={placed_state['deg']:.1f}"
+        )
+        if not runtime.dry_run:
+            pick_step = TaskStep(
+                kind="pick",
+                object_name=object_name,
+                xy=(float(runtime.origin_xy[0]), float(runtime.origin_xy[1])),
+                level=0,
+                is_rotate=False,
+                deg=0.0,
+                align_j6=bool(object_name != APPLE_NAME),
+                note=f"prep pick {object_name}",
+            )
+            place_step = TaskStep(
+                kind="place",
+                object_name=object_name,
+                xy=(float(placed_state["xy"][0]), float(placed_state["xy"][1])),
+                level=0,
+                is_rotate=bool(placed_state["is_rotate"]),
+                deg=float(placed_state["deg"]),
+                align_j6=bool(object_name != APPLE_NAME),
+                note=f"prep place {object_name}",
+            )
+            _, held_after_prep = execute_step_sequence(
+                runtime,
+                [pick_step, place_step],
+                record=False,
+                scene_state=session.scene_state,
+                lookup_scene_state=session.scene_state,
+                result_scene_state={object_name: placed_state},
+            )
+            if held_after_prep is not None:
+                raise RuntimeError(f"prep sequence ended while still holding {held_after_prep}")
+            runtime.return_home(f"[prep {object_name}] return home")
+        session.scene_state[object_name] = placed_state
+
+    session.skip_prep = False
+
+
+def describe_episode(plan: EpisodePlan, *, episode_count: int) -> None:
+    episode_label = f"Episode {episode_count} [{plan.task_kind}]"
+    print(f"\n--- {episode_label} ---")
+    print(f"  Prompt: \"{plan.prompt}\"")
+    print(f"  Source: {plan.source_name}")
+    if plan.target_name is not None:
+        print(f"  Target: {plan.target_name}")
+    print(f"  Recorded steps: {len(plan.recorded_steps)}")
+    print(f"  Post steps: {len(plan.post_steps)}")
+
+
+def plan_next_episode(
+    session: PickAndPlaceSession,
+    *,
+    config: PlannerConfig,
+) -> EpisodePlan:
+    if not session.scene_state:
+        raise RuntimeError("scene_state is empty; cannot plan next episode")
+    return build_random_episode_plan(session.scene_state, config=config)
+
+
+def record_episode(
+    runtime,
+    session: PickAndPlaceSession,
+    plan: EpisodePlan,
+) -> PickAndPlaceRecordedEpisode:
+    execution_scene_state = clone_scene_state(session.scene_state)
+    frames, held_after_recorded = execute_step_sequence(
+        runtime,
+        plan.recorded_steps,
+        record=True,
+        scene_state=session.scene_state,
+        result_scene_state=execution_scene_state,
+    )
+    if not frames:
+        raise RuntimeError("recorded episode produced no frames")
+    return PickAndPlaceRecordedEpisode(
+        plan=plan,
+        frames=frames,
+        held_after_recorded=held_after_recorded,
+        execution_scene_state=execution_scene_state,
+    )
+
+
+def finalize_episode(
+    runtime,
+    session: PickAndPlaceSession,
+    recorded: PickAndPlaceRecordedEpisode,
+) -> None:
+    if recorded.plan.post_steps:
+        _, held_after_post = execute_step_sequence(
+            runtime,
+            recorded.plan.post_steps,
+            record=False,
+            initial_held_object=recorded.held_after_recorded,
+            scene_state=recorded.execution_scene_state,
+            result_scene_state=recorded.execution_scene_state,
+        )
+    else:
+        held_after_post = recorded.held_after_recorded
+
+    if held_after_post is not None:
+        raise RuntimeError(f"episode ended while still holding {held_after_post}")
+
+    session.scene_state = clone_scene_state(recorded.execution_scene_state)
+    session.task_index += 1
+    session.episode_count += 1
+    runtime.cleanup_scene_state = None
+
+
+def scene_top_of(state: dict[str, dict[str, Any]], name: str) -> str:
+    current = name
+    seen: set[str] = set()
+    while True:
+        upper = state[current].get("upper")
+        if upper is None:
+            return current
+        if current in seen:
+            raise RuntimeError(f"cycle detected while following upper chain from {name}")
+        seen.add(current)
+        current = str(upper)
+
+
+def scene_detach_top(state: dict[str, dict[str, Any]], name: str) -> None:
+    obj = state[name]
+    upper = obj.get("upper")
+    if upper is not None:
+        raise RuntimeError(f"cannot detach {name}: upper={upper} still present")
+    lower = obj.get("lower")
+    if lower is not None:
+        state[str(lower)]["upper"] = None
+    obj["lower"] = None
+
+
+def scene_place_object(state: dict[str, dict[str, Any]], step: TaskStep) -> None:
+    obj = state[step.object_name]
+    if obj.get("upper") is not None:
+        raise RuntimeError(f"cannot place {step.object_name}: upper={obj.get('upper')} still present")
+    if step.support_name is None:
+        obj["xy"] = [float(step.xy[0]), float(step.xy[1])]
+        obj["lower"] = None
+    else:
+        actual_support = scene_top_of(state, step.support_name)
+        if actual_support == APPLE_NAME:
+            raise RuntimeError("apple cannot receive an upper object")
+        obj["xy"] = list(state[actual_support]["xy"])
+        obj["lower"] = actual_support
+        state[actual_support]["upper"] = step.object_name
+    if step.object_name == APPLE_NAME:
+        obj["is_rotate"] = False
+        obj["deg"] = 0.0
+        obj["standard_j6_rad"] = None
+    else:
+        obj["is_rotate"] = bool(step.is_rotate)
+        obj["deg"] = 0.0 if not step.is_rotate else float(step.deg)
+
+
+def commit_place_state(state: dict[str, dict[str, Any]], step: TaskStep) -> dict[str, dict[str, Any]] | None:
+    scene_place_object(state, step)
+    normalized_state = load_scene_state(state)
+    return normalized_state
+
+
+def resolve_step_target_joint6_rad(runtime, step: TaskStep, lookup_scene_state: dict[str, dict[str, Any]]) -> float:
+    target_joint6_rad = float(runtime.j6_target_from_deg(step.deg))
+    if step.object_name == APPLE_NAME or not step.is_rotate:
+        return target_joint6_rad
+
+    if step.kind == "pick":
+        reference_name = step.object_name
+    elif step.support_name is not None:
+        reference_name = step.support_name
+    else:
+        reference_name = None
+
+    if reference_name is None:
+        return target_joint6_rad
+
+    saved_joint6_rad = get_object_standard_j6_rad(lookup_scene_state, reference_name)
+    if saved_joint6_rad is None:
+        return target_joint6_rad
+    return float(saved_joint6_rad)
+
+
+def should_align_joint6_for_step(runtime, step: TaskStep, lookup_scene_state: dict[str, dict[str, Any]]) -> tuple[bool, float]:
+    target_joint6_rad = resolve_step_target_joint6_rad(runtime, step, lookup_scene_state)
+    need_align = bool(step.align_j6) and (
+        abs(runtime.wrap_angle(float(runtime.local_exec_joint6_rad) - float(target_joint6_rad)))
+        > float(runtime.default_j6_exec_tol_rad)
+    )
+    return need_align, float(target_joint6_rad)
+
+
+def execute_pick_step(
+    runtime,
+    step: TaskStep,
+    *,
+    record: bool,
+    frame_idx: int,
+    lookup_scene_state: dict[str, dict[str, Any]],
+):
+    target_xy = np.asarray(step.xy, dtype=np.float64).reshape(2)
+    target_z = float(runtime.z_for_pick_level(step.level))
+    above_z = float(runtime.min_tcp_z + runtime.approach_z_offset_m)
+    step_frames: list[Any] = []
+    should_align_joint6, target_joint6_rad = should_align_joint6_for_step(runtime, step, lookup_scene_state)
+
+    if runtime.dry_run:
+        dummy_count = 12 + (3 if should_align_joint6 else 0)
+        sim_pose = real_pose_to_sim(runtime.home_real)
+        joint6 = target_joint6_rad if should_align_joint6 else runtime.local_exec_joint6_rad
+        for idx in range(dummy_count):
+            step_frames.append(
+                runtime.make_dummy_frame(
+                    sim_pose=sim_pose,
+                    gripper=1.0 if idx < dummy_count - 3 else 0.0,
+                    joint6=joint6,
+                    frame_idx=frame_idx + idx,
+                )
+            )
+        if should_align_joint6:
+            runtime.local_exec_joint6_rad = float(target_joint6_rad)
+        return step_frames, frame_idx + len(step_frames)
+
+    print(
+        f"    [{step.object_name}] pick @ ({target_xy[0]:.4f}, {target_xy[1]:.4f}), "
+        f"level={step.level}, rotate={step.is_rotate}, deg={step.deg:.1f}"
+    )
+    above_pose = runtime.build_pose_from_live_orientation(float(target_xy[0]), float(target_xy[1]), float(above_z))
+    seg = runtime.record_pose_move(
+        above_pose,
+        gripper=1.0,
+        start_frame_idx=frame_idx,
+        record=record,
+    )
+    if record:
+        step_frames.extend(seg)
+    frame_idx += len(seg)
+
+    if should_align_joint6:
+        seg = runtime.record_joint6_rotation(
+            target_joint6=float(target_joint6_rad),
+            gripper=1.0,
+            start_frame_idx=frame_idx,
+            record=record,
+        )
+        if record:
+            step_frames.extend(seg)
+        frame_idx += len(seg)
+        runtime.local_exec_joint6_rad = float(target_joint6_rad)
+
+    down_pose = runtime.build_pose_from_live_orientation(float(target_xy[0]), float(target_xy[1]), float(target_z))
+    seg = runtime.record_pose_move(
+        down_pose,
+        gripper=1.0,
+        start_frame_idx=frame_idx,
+        record=record,
+    )
+    if record:
+        step_frames.extend(seg)
+    frame_idx += len(seg)
+
+    runtime.ensure_gripper_ok(
+        runtime.command_gripper_state(0),
+        f"close gripper on {step.object_name}",
+    )
+
+    lift_pose = runtime.build_pose_from_live_orientation(float(target_xy[0]), float(target_xy[1]), float(above_z))
+    seg = runtime.record_pose_move(
+        lift_pose,
+        gripper=0.0,
+        start_frame_idx=frame_idx,
+        record=record,
+    )
+    if record:
+        step_frames.extend(seg)
+    frame_idx += len(seg)
+    return step_frames, frame_idx
+
+
+def execute_place_step(
+    runtime,
+    step: TaskStep,
+    *,
+    record: bool,
+    frame_idx: int,
+    lookup_scene_state: dict[str, dict[str, Any]],
+    result_scene_state: dict[str, dict[str, Any]],
+):
+    target_xy = np.asarray(step.xy, dtype=np.float64).reshape(2)
+    target_z = float(runtime.z_for_place_level(step.level))
+    above_z = float(runtime.min_tcp_z + runtime.approach_z_offset_m)
+    step_frames: list[Any] = []
+    should_align_joint6, target_joint6_rad = should_align_joint6_for_step(runtime, step, lookup_scene_state)
+
+    if runtime.dry_run:
+        dummy_count = 10 + (3 if should_align_joint6 else 0)
+        sim_pose = real_pose_to_sim(runtime.home_real)
+        joint6 = target_joint6_rad if should_align_joint6 else runtime.local_exec_joint6_rad
+        for idx in range(dummy_count):
+            step_frames.append(
+                runtime.make_dummy_frame(
+                    sim_pose=sim_pose,
+                    gripper=0.0 if idx < dummy_count - 3 else 1.0,
+                    joint6=joint6,
+                    frame_idx=frame_idx + idx,
+                )
+            )
+        if should_align_joint6:
+            runtime.local_exec_joint6_rad = float(target_joint6_rad)
+        set_object_standard_j6_rad(
+            result_scene_state,
+            step.object_name,
+            runtime.local_exec_joint6_rad if step.is_rotate else None,
+        )
+        normalized_state = commit_place_state(result_scene_state, step)
+        if normalized_state is not None:
+            runtime.cleanup_scene_state = normalized_state
+        return step_frames, frame_idx + len(step_frames)
+
+    print(
+        f"    [{step.object_name}] place @ ({target_xy[0]:.4f}, {target_xy[1]:.4f}), "
+        f"level={step.level}, rotate={step.is_rotate}, deg={step.deg:.1f}"
+    )
+    above_pose = runtime.build_pose_from_live_orientation(float(target_xy[0]), float(target_xy[1]), float(above_z))
+    seg = runtime.record_pose_move(
+        above_pose,
+        gripper=0.0,
+        start_frame_idx=frame_idx,
+        record=record,
+    )
+    if record:
+        step_frames.extend(seg)
+    frame_idx += len(seg)
+
+    if should_align_joint6:
+        seg = runtime.record_joint6_rotation(
+            target_joint6=float(target_joint6_rad),
+            gripper=0.0,
+            start_frame_idx=frame_idx,
+            record=record,
+        )
+        if record:
+            step_frames.extend(seg)
+        frame_idx += len(seg)
+        runtime.local_exec_joint6_rad = float(target_joint6_rad)
+
+    down_pose = runtime.build_pose_from_live_orientation(float(target_xy[0]), float(target_xy[1]), float(target_z))
+    seg = runtime.record_pose_move(
+        down_pose,
+        gripper=0.0,
+        start_frame_idx=frame_idx,
+        record=record,
+    )
+    if record:
+        step_frames.extend(seg)
+    frame_idx += len(seg)
+    set_object_standard_j6_rad(
+        result_scene_state,
+        step.object_name,
+        runtime.local_exec_joint6_rad if step.is_rotate else None,
+    )
+
+    runtime.ensure_gripper_ok(
+        runtime.command_gripper_state(1),
+        f"open gripper for {step.object_name}",
+    )
+    normalized_state = commit_place_state(result_scene_state, step)
+    if normalized_state is not None:
+        runtime.cleanup_scene_state = normalized_state
+
+    lift_pose = runtime.build_pose_from_live_orientation(float(target_xy[0]), float(target_xy[1]), float(above_z))
+    seg = runtime.record_pose_move(
+        lift_pose,
+        gripper=1.0,
+        start_frame_idx=frame_idx,
+        record=record,
+    )
+    if record:
+        step_frames.extend(seg)
+    frame_idx += len(seg)
+    return step_frames, frame_idx
+
+
+def execute_step_sequence(
+    runtime,
+    steps: list[TaskStep],
+    *,
+    record: bool,
+    initial_held_object: str | None = None,
+    scene_state: dict[str, dict[str, Any]],
+    lookup_scene_state: dict[str, dict[str, Any]] | None = None,
+    result_scene_state: dict[str, dict[str, Any]] | None = None,
+):
+    execution_state = scene_state if result_scene_state is None else result_scene_state
+    lookup_state = execution_state if lookup_scene_state is None else lookup_scene_state
+    frames: list[Any] = []
+    frame_idx = 0
+    held_object: str | None = initial_held_object
+    for step in steps:
+        if step.kind == "pick":
+            if held_object is not None:
+                raise RuntimeError(f"cannot pick {step.object_name} while holding {held_object}")
+            step_frames, frame_idx = execute_pick_step(
+                runtime,
+                step,
+                record=record,
+                frame_idx=frame_idx,
+                lookup_scene_state=lookup_state,
+            )
+            frames.extend(step_frames)
+            scene_detach_top(execution_state, step.object_name)
+            held_object = step.object_name
+            runtime.runtime_held_object = held_object
+        elif step.kind == "place":
+            if held_object != step.object_name:
+                raise RuntimeError(
+                    f"cannot place {step.object_name}: currently holding {held_object!r}"
+                )
+            step_frames, frame_idx = execute_place_step(
+                runtime,
+                step,
+                record=record,
+                frame_idx=frame_idx,
+                lookup_scene_state=lookup_state,
+                result_scene_state=execution_state,
+            )
+            frames.extend(step_frames)
+            held_object = None
+            runtime.runtime_held_object = None
+        else:
+            raise RuntimeError(f"unknown step kind: {step.kind}")
+    return frames, held_object
+
+
 __all__ = [
     "APPLE_NAME",
     "OBJECT_ORDER",
@@ -622,6 +1228,27 @@ __all__ = [
     "build_pick_prompt",
     "build_place_prompt",
     "build_random_episode_plan",
+    "clone_scene_state",
+    "commit_place_state",
+    "describe_episode",
+    "execute_step_sequence",
+    "finalize_episode",
+    "get_object_deg",
+    "get_object_is_rotate",
+    "get_object_standard_j6_rad",
+    "get_object_xy",
     "load_scene_state",
+    "PickAndPlaceRecordedEpisode",
+    "PickAndPlaceSession",
+    "plan_next_episode",
+    "prepare_session",
+    "sample_initial_object_state",
     "sample_random_table_state",
+    "record_episode",
+    "restore_session",
+    "scene_detach_top",
+    "scene_place_object",
+    "scene_top_of",
+    "set_object_standard_j6_rad",
+    "should_align_joint6_for_step",
 ]

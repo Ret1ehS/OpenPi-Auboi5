@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from support.pose_align import real_pose_to_sim
 
 from task.pick_and_place import TaskStep
 
@@ -54,6 +55,29 @@ class OpenCloseEpisodePlan:
     task_kind: str  # "open" | "close"
     prompt: str
     recorded_steps: list[MoveStep]
+
+
+@dataclass
+class OpenCloseSession:
+    reference: OpenCloseReference | None = None
+    obstacle_scene: "ObstacleScene | None" = None
+    episode_count: int = 0
+
+
+@dataclass(frozen=True)
+class OpenCloseCyclePlan:
+    cycle_index: int
+    clearing_steps: list[TaskStep]
+    scene_after_clear: "ObstacleScene"
+    open_plan: OpenCloseEpisodePlan
+    close_plan: OpenCloseEpisodePlan
+
+
+@dataclass
+class OpenCloseRecordedCycle:
+    plan: OpenCloseCyclePlan
+    combined_open_frames: list[Any]
+    close_frames: list[Any]
 
 
 @dataclass
@@ -119,6 +143,59 @@ def build_close_episode_plan(
             MoveStep(x=x_start + 0.01, y=y_start, z=float(press_z - 0.02), note="close step 4 push"),
         ],
     )
+
+
+def restore_session(
+    saved: dict[str, Any] | None,
+    *,
+    resume_mode: str,
+) -> tuple[OpenCloseSession, bool]:
+    session = OpenCloseSession()
+    should_clear_saved_state = False
+
+    if resume_mode == "reset":
+        if isinstance(saved, dict) and (
+            saved.get("open_close_reference") is not None
+            or saved.get("obstacle_scene") is not None
+            or bool(saved.get("has_valid_open_close_episode_count", False))
+        ):
+            should_clear_saved_state = True
+        return session, should_clear_saved_state
+
+    if resume_mode != "continue":
+        return session, should_clear_saved_state
+
+    if saved is None:
+        print("\n  Resume selected, but no saved state exists. Open/close reference will use startup TCP.")
+        return session, should_clear_saved_state
+
+    session.episode_count = int(saved.get("open_close_episode_count", 0))
+    saved_reference = saved.get("open_close_reference")
+    saved_obstacle_scene = saved.get("obstacle_scene")
+    if isinstance(saved_obstacle_scene, ObstacleScene):
+        session.obstacle_scene = saved_obstacle_scene
+    if isinstance(saved_reference, OpenCloseReference):
+        session.reference = saved_reference
+        print(
+            "\n  Found saved open/close reference: "
+            f"x_start={session.reference.x_start:.4f}, "
+            f"y_start={session.reference.y_start:.4f}"
+        )
+        if session.obstacle_scene is not None:
+            print(f"  Loaded obstacle scene with {len(session.obstacle_scene.obstacles)} objects.")
+        print(f"  Resuming with saved open/close reference (episode_count={session.episode_count}).")
+    else:
+        if saved.get("has_valid_open_close_episode_count", False):
+            print(
+                "\n  Restored open/close counters from saved state: "
+                f"episode_count={session.episode_count}."
+            )
+        print(
+            "  Saved state has no reusable open/close reference. "
+            "Open/close reference will use startup TCP."
+        )
+
+    return session, should_clear_saved_state
 
 
 class ObstacleScene:
@@ -365,3 +442,539 @@ def _norm_link(v: Any) -> str | None:
         return None
     text = str(v).strip()
     return text if text else None
+
+
+def execute_move_step(
+    runtime,
+    step: MoveStep,
+    *,
+    record: bool,
+    frame_idx: int,
+    base_pose6: np.ndarray,
+):
+    step_frames: list[Any] = []
+    target_pose = runtime.build_pose_at_xy(base_pose6, float(step.x), float(step.y), float(step.z))
+    if runtime.dry_run:
+        dummy_count = 6
+        sim_pose = real_pose_to_sim(target_pose)
+        for idx in range(dummy_count):
+            step_frames.append(
+                runtime.make_dummy_frame(
+                    sim_pose=sim_pose,
+                    gripper=1.0,
+                    joint6=float(runtime.default_joint6_rad),
+                    frame_idx=frame_idx + idx,
+                )
+            )
+        return step_frames, frame_idx + len(step_frames)
+
+    print(f"    [move] ({step.x:.4f}, {step.y:.4f}, {step.z:.4f})  {step.note}")
+    seg = runtime.record_pose_move(
+        target_pose,
+        gripper=1.0,
+        start_frame_idx=frame_idx,
+        record=record,
+        semantic_joint6=float(runtime.default_joint6_rad),
+    )
+    if record:
+        step_frames.extend(seg)
+    frame_idx += len(seg)
+    return step_frames, frame_idx
+
+
+def execute_move_step_sequence(
+    runtime,
+    steps: list[MoveStep],
+    *,
+    record: bool,
+    base_pose6: np.ndarray,
+):
+    frames: list[Any] = []
+    frame_idx = 0
+    for step in steps:
+        step_frames, frame_idx = execute_move_step(
+            runtime,
+            step,
+            record=record,
+            frame_idx=frame_idx,
+            base_pose6=base_pose6,
+        )
+        frames.extend(step_frames)
+    return frames
+
+
+def prepare_session(
+    runtime,
+    session: OpenCloseSession,
+    *,
+    startup_tcp_pose: np.ndarray,
+    origin_xy: np.ndarray,
+    workspace_x_min: float,
+    workspace_x_max: float,
+    workspace_y_min: float,
+    workspace_y_max: float,
+    min_spacing: float,
+) -> None:
+    print("\n=== Open/Close Reference Setup ===")
+    if session.reference is None:
+        print("Auto-capturing startup TCP as OPEN start point (x/y source).")
+        session.reference = build_reference_from_tcp_pose(startup_tcp_pose)
+        print(
+            "  Captured open reference: "
+            f"x_start={session.reference.x_start:.4f}, "
+            f"y_start={session.reference.y_start:.4f}"
+        )
+    else:
+        print(
+            "Using saved open reference: "
+            f"x_start={session.reference.x_start:.4f}, "
+            f"y_start={session.reference.y_start:.4f}"
+        )
+
+    if session.obstacle_scene is None:
+        print("Place objects one by one at the pickup point. The robot will grab continuously.")
+        session.obstacle_scene = initialize_obstacle_scene(
+            runtime,
+            origin_xy=origin_xy,
+            workspace_x_min=workspace_x_min,
+            workspace_x_max=workspace_x_max,
+            workspace_y_min=workspace_y_min,
+            workspace_y_max=workspace_y_max,
+            min_spacing=min_spacing,
+        )
+    else:
+        print(f"\n  Using saved obstacle scene ({len(session.obstacle_scene.obstacles)} objects).")
+
+
+def describe_cycle(plan: OpenCloseCyclePlan) -> None:
+    cycle_label = f"Cycle {plan.cycle_index}"
+    print(f"\n--- {cycle_label} [clear -> open -> close] ---")
+    print(f"  Clearing steps: {len(plan.clearing_steps)}")
+    print(f"  Open prompt:  \"{plan.open_plan.prompt}\"")
+    print(f"  Open steps:   {len(plan.open_plan.recorded_steps)}")
+    print(f"  Close prompt: \"{plan.close_plan.prompt}\"")
+    print(f"  Close steps:  {len(plan.close_plan.recorded_steps)}")
+
+
+def plan_cycle(
+    runtime,
+    session: OpenCloseSession,
+    *,
+    workspace_x_min: float,
+    workspace_x_max: float,
+    workspace_y_min: float,
+    workspace_y_max: float,
+    target_z: float,
+    press_z: float,
+    clear_spacing: float,
+    stack_probability: float,
+    band_count_min: int,
+    band_count_max: int,
+) -> OpenCloseCyclePlan:
+    if session.reference is None:
+        raise RuntimeError("open/close reference is not initialized")
+    if session.obstacle_scene is None:
+        raise RuntimeError("obstacle scene is not initialized")
+
+    is_first_cycle = session.episode_count == 0
+    cycle_layout = session.obstacle_scene.copy()
+    if is_first_cycle:
+        print("  [layout] First cycle: using initial placement, skip rearrange.")
+    else:
+        print("  [layout] Rearranging obstacles with live sampling...")
+        cycle_layout = rearrange_open_close_scene(
+            runtime,
+            session.obstacle_scene,
+            reference_y=session.reference.y_start,
+            workspace_x_min=workspace_x_min,
+            workspace_x_max=workspace_x_max,
+            workspace_y_min=workspace_y_min,
+            workspace_y_max=workspace_y_max,
+            clear_spacing=clear_spacing,
+            stack_probability=stack_probability,
+            band_count_min=band_count_min,
+            band_count_max=band_count_max,
+        )
+
+    session.obstacle_scene = cycle_layout.copy()
+    clearing_steps, scene_after_clear = build_clearing_steps(
+        session.obstacle_scene,
+        y_target=session.reference.y_start,
+        workspace_x_min=workspace_x_min,
+        workspace_x_max=workspace_x_max,
+        workspace_y_min=workspace_y_min,
+        workspace_y_max=workspace_y_max,
+        min_spacing=clear_spacing,
+    )
+    return OpenCloseCyclePlan(
+        cycle_index=session.episode_count // 2,
+        clearing_steps=clearing_steps,
+        scene_after_clear=scene_after_clear,
+        open_plan=build_open_episode_plan(
+            reference=session.reference,
+            target_z=float(target_z),
+            press_z=float(press_z),
+        ),
+        close_plan=build_close_episode_plan(
+            reference=session.reference,
+            target_z=float(target_z),
+            press_z=float(press_z),
+            workspace_x_min=workspace_x_min,
+            workspace_x_max=workspace_x_max,
+            workspace_y_min=workspace_y_min,
+            workspace_y_max=workspace_y_max,
+        ),
+    )
+
+
+def _obstacle_scene_to_pick_state(scene: ObstacleScene) -> dict[str, dict[str, Any]]:
+    return {
+        oname: {
+            "xy": [float(ostate.xy[0]), float(ostate.xy[1])],
+            "is_rotate": bool(ostate.is_rotate),
+            "deg": float(ostate.deg),
+            "standard_j6_rad": None,
+            "upper": ostate.upper,
+            "lower": ostate.lower,
+        }
+        for oname, ostate in scene.obstacles.items()
+    }
+
+
+def record_cycle(
+    runtime,
+    session: OpenCloseSession,
+    plan: OpenCloseCyclePlan,
+) -> OpenCloseRecordedCycle:
+    if session.reference is None:
+        raise RuntimeError("open/close reference is not initialized")
+    if session.obstacle_scene is None:
+        raise RuntimeError("obstacle scene is not initialized")
+
+    from task.pick_and_place import execute_step_sequence
+
+    clearing_frames: list[Any] = []
+    if plan.clearing_steps:
+        clear_scene_state = _obstacle_scene_to_pick_state(session.obstacle_scene)
+        clearing_frames, held_after_clear = execute_step_sequence(
+            runtime,
+            plan.clearing_steps,
+            record=True,
+            scene_state=clear_scene_state,
+            lookup_scene_state=clear_scene_state,
+            result_scene_state=clear_scene_state,
+        )
+        if held_after_clear is not None:
+            raise RuntimeError(f"clearing ended while holding {held_after_clear}")
+        if not runtime.dry_run:
+            runtime.return_home("post-clear return home")
+
+    open_frames = execute_move_step_sequence(
+        runtime,
+        plan.open_plan.recorded_steps,
+        record=True,
+        base_pose6=session.reference.reference_pose6,
+    )
+    close_frames = execute_move_step_sequence(
+        runtime,
+        plan.close_plan.recorded_steps,
+        record=True,
+        base_pose6=session.reference.reference_pose6,
+    )
+
+    if not open_frames:
+        raise RuntimeError("open episode produced no recorded move frames")
+    if not close_frames:
+        raise RuntimeError("close episode produced no recorded move frames")
+
+    return OpenCloseRecordedCycle(
+        plan=plan,
+        combined_open_frames=[*clearing_frames, *open_frames],
+        close_frames=close_frames,
+    )
+
+
+def finalize_cycle(
+    session: OpenCloseSession,
+    recorded: OpenCloseRecordedCycle,
+) -> None:
+    session.obstacle_scene = recorded.plan.scene_after_clear.copy()
+    session.episode_count += 2
+
+
+def initialize_obstacle_scene(
+    runtime,
+    *,
+    origin_xy: np.ndarray,
+    workspace_x_min: float,
+    workspace_x_max: float,
+    workspace_y_min: float,
+    workspace_y_max: float,
+    min_spacing: float,
+) -> ObstacleScene:
+    from task.pick_and_place import execute_step_sequence
+
+    scene = ObstacleScene({})
+
+    def _sample_with_origin_guard(obj_name: str) -> tuple[float, float]:
+        for _ in range(512):
+            xy = sample_obstacle_xy(
+                scene,
+                object_name=obj_name,
+                workspace_x_min=workspace_x_min,
+                workspace_x_max=workspace_x_max,
+                y_min=workspace_y_min,
+                y_max=workspace_y_max,
+                min_spacing=min_spacing,
+            )
+            if float(np.linalg.norm(np.asarray(xy, dtype=np.float64) - np.asarray(origin_xy, dtype=np.float64))) >= float(min_spacing):
+                return xy
+        raise RuntimeError(f"failed to sample obstacle xy for {obj_name} away from origin")
+
+    print(f"\n=== Obstacle Initialization ({NUM_OBSTACLES} objects) ===")
+    for idx, obj_name in enumerate(OBSTACLE_NAMES):
+        xy = _sample_with_origin_guard(obj_name)
+        is_rotate, deg = sample_obstacle_orientation()
+        print(
+            f"  [{idx + 1}/{NUM_OBSTACLES}] {obj_name}: "
+            f"-> ({xy[0]:.4f}, {xy[1]:.4f}), rotate={is_rotate}, deg={deg:.1f}"
+        )
+        if not runtime.dry_run:
+            pick_step = TaskStep(
+                kind="pick",
+                object_name=obj_name,
+                xy=(float(origin_xy[0]), float(origin_xy[1])),
+                level=0,
+                is_rotate=False,
+                deg=0.0,
+                align_j6=True,
+                note=f"obstacle prep pick {obj_name}",
+            )
+            place_step = TaskStep(
+                kind="place",
+                object_name=obj_name,
+                xy=(float(xy[0]), float(xy[1])),
+                level=0,
+                is_rotate=is_rotate,
+                deg=deg,
+                align_j6=True,
+                note=f"obstacle prep place {obj_name}",
+            )
+            temp_state = {
+                obj_name: {
+                    "xy": [float(origin_xy[0]), float(origin_xy[1])],
+                    "is_rotate": False,
+                    "deg": 0.0,
+                    "standard_j6_rad": None,
+                    "upper": None,
+                    "lower": None,
+                }
+            }
+            _, held_after = execute_step_sequence(
+                runtime,
+                [pick_step, place_step],
+                record=False,
+                scene_state=temp_state,
+                lookup_scene_state=temp_state,
+                result_scene_state=temp_state,
+            )
+            if held_after is not None:
+                raise RuntimeError(f"obstacle prep ended while holding {held_after}")
+            runtime.return_home(f"[obstacle prep {obj_name}] return home")
+        scene.obstacles[obj_name] = ObstacleState(
+            name=obj_name,
+            xy=(float(xy[0]), float(xy[1])),
+            is_rotate=bool(is_rotate),
+            deg=float(deg),
+        )
+    print(f"  All {NUM_OBSTACLES} obstacles placed.")
+    return scene
+
+
+def rearrange_open_close_scene(
+    runtime,
+    scene: ObstacleScene,
+    *,
+    reference_y: float,
+    workspace_x_min: float,
+    workspace_x_max: float,
+    workspace_y_min: float,
+    workspace_y_max: float,
+    clear_spacing: float,
+    stack_probability: float,
+    band_count_min: int,
+    band_count_max: int,
+) -> ObstacleScene:
+    from task.pick_and_place import execute_step_sequence
+
+    result_scene = scene.copy()
+    band_y_lo = max(float(reference_y - CLEAR_BAND_M), float(workspace_y_min))
+    band_y_hi = min(float(reference_y + CLEAR_BAND_M), float(workspace_y_max))
+
+    def _execute_rearrange_move(
+        obj_name: str,
+        source_xy: tuple[float, float],
+        source_is_rotate: bool,
+        source_deg: float,
+        target_xy: tuple[float, float],
+        *,
+        level: int,
+        target_is_rotate: bool,
+        target_deg: float,
+        pick_note: str,
+        place_note: str,
+        return_label: str,
+    ) -> None:
+        if level == 0:
+            print(
+                f"    {obj_name}: ({source_xy[0]:.3f},{source_xy[1]:.3f}) -> "
+                f"({target_xy[0]:.3f},{target_xy[1]:.3f}) rotate={target_is_rotate}"
+            )
+        else:
+            print(
+                f"    {obj_name}: ({source_xy[0]:.3f},{source_xy[1]:.3f}) "
+                f"stacking at ({target_xy[0]:.3f},{target_xy[1]:.3f})"
+            )
+
+        if runtime.dry_run:
+            return
+
+        pick_step = TaskStep(
+            kind="pick",
+            object_name=obj_name,
+            xy=tuple(source_xy),
+            level=0,
+            is_rotate=source_is_rotate,
+            deg=source_deg,
+            align_j6=True,
+            note=pick_note,
+        )
+        place_step = TaskStep(
+            kind="place",
+            object_name=obj_name,
+            xy=tuple(target_xy),
+            level=level,
+            is_rotate=target_is_rotate,
+            deg=target_deg,
+            align_j6=True,
+            note=place_note,
+        )
+        temp_state: dict[str, dict[str, Any]] = {
+            obj_name: {
+                "xy": [float(source_xy[0]), float(source_xy[1])],
+                "is_rotate": bool(source_is_rotate),
+                "deg": float(source_deg),
+                "standard_j6_rad": None,
+                "upper": None,
+                "lower": None,
+            }
+        }
+        _, held = execute_step_sequence(
+            runtime,
+            [pick_step, place_step],
+            record=False,
+            scene_state=temp_state,
+            lookup_scene_state=temp_state,
+            result_scene_state=temp_state,
+        )
+        if held is not None:
+            raise RuntimeError(f"layout rearrange ended while holding {held}")
+        runtime.return_home(return_label)
+
+    layout_names = list(OBSTACLE_NAMES)
+    np.random.shuffle(layout_names)
+    n_in_band = int(np.random.randint(int(band_count_min), int(band_count_max) + 1))
+    band_names = layout_names[:n_in_band]
+    outside_names = layout_names[n_in_band:]
+
+    stack_bottom: str | None = None
+    stack_top: str | None = None
+    if len(band_names) >= 2 and np.random.random() < float(stack_probability):
+        stack_pair = list(np.random.choice(band_names, size=2, replace=False))
+        stack_bottom = str(stack_pair[0])
+        stack_top = str(stack_pair[1])
+
+    for obj_name in band_names:
+        if obj_name == stack_top:
+            continue
+        old_obj = result_scene.obstacles[obj_name]
+        new_xy = sample_obstacle_xy(
+            result_scene,
+            object_name=obj_name,
+            workspace_x_min=workspace_x_min,
+            workspace_x_max=workspace_x_max,
+            y_min=band_y_lo,
+            y_max=band_y_hi,
+            min_spacing=clear_spacing,
+        )
+        new_is_rotate, new_deg = sample_obstacle_orientation()
+        _execute_rearrange_move(
+            obj_name,
+            tuple(old_obj.xy),
+            bool(old_obj.is_rotate),
+            float(old_obj.deg),
+            tuple(new_xy),
+            level=0,
+            target_is_rotate=new_is_rotate,
+            target_deg=new_deg,
+            pick_note=f"layout pick {obj_name}",
+            place_note=f"layout place {obj_name}",
+            return_label=f"[layout {obj_name}] return home",
+        )
+        result_scene.place_on_table(obj_name, tuple(new_xy), is_rotate=new_is_rotate, deg=new_deg)
+
+    outside_y_ranges: list[tuple[float, float]] = []
+    if workspace_y_min < band_y_lo - clear_spacing:
+        outside_y_ranges.append((workspace_y_min, band_y_lo - clear_spacing))
+    if band_y_hi + clear_spacing < workspace_y_max:
+        outside_y_ranges.append((band_y_hi + clear_spacing, workspace_y_max))
+    if not outside_y_ranges:
+        outside_y_ranges = [(workspace_y_min, workspace_y_max)]
+
+    for obj_name in outside_names:
+        chosen_range = outside_y_ranges[int(np.random.randint(len(outside_y_ranges)))]
+        old_obj = result_scene.obstacles[obj_name]
+        new_xy = sample_obstacle_xy(
+            result_scene,
+            object_name=obj_name,
+            workspace_x_min=workspace_x_min,
+            workspace_x_max=workspace_x_max,
+            y_min=float(chosen_range[0]),
+            y_max=float(chosen_range[1]),
+            min_spacing=clear_spacing,
+        )
+        new_is_rotate, new_deg = sample_obstacle_orientation()
+        _execute_rearrange_move(
+            obj_name,
+            tuple(old_obj.xy),
+            bool(old_obj.is_rotate),
+            float(old_obj.deg),
+            tuple(new_xy),
+            level=0,
+            target_is_rotate=new_is_rotate,
+            target_deg=new_deg,
+            pick_note=f"layout pick {obj_name}",
+            place_note=f"layout place {obj_name}",
+            return_label=f"[layout {obj_name}] return home",
+        )
+        result_scene.place_on_table(obj_name, tuple(new_xy), is_rotate=new_is_rotate, deg=new_deg)
+
+    if stack_top is not None and stack_bottom is not None:
+        top_obj = result_scene.obstacles[stack_top]
+        bottom_obj = result_scene.obstacles[stack_bottom]
+        _execute_rearrange_move(
+            stack_top,
+            tuple(top_obj.xy),
+            bool(top_obj.is_rotate),
+            float(top_obj.deg),
+            tuple(bottom_obj.xy),
+            level=1,
+            target_is_rotate=bool(bottom_obj.is_rotate),
+            target_deg=float(bottom_obj.deg),
+            pick_note=f"stack pick {stack_top}",
+            place_note=f"stack place {stack_top} on {stack_bottom}",
+            return_label=f"[stack {stack_top}] return home",
+        )
+        result_scene.place_on_object(stack_top, stack_bottom)
+
+    return result_scene

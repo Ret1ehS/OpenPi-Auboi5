@@ -1180,6 +1180,15 @@ class CollectTaskRuntime:
         snap_local = get_robot_snapshot()
         return np.asarray(snap_local.tcp_pose, dtype=np.float64).reshape(6).copy()
 
+    def get_live_joint6(self) -> float | None:
+        from support.tcp_control import get_robot_snapshot
+
+        snap_local = get_robot_snapshot()
+        joint_q = np.asarray(snap_local.joint_q, dtype=np.float64).reshape(-1)
+        if joint_q.size < 6:
+            return None
+        return float(joint_q[5])
+
     def return_home(self, label: str) -> np.ndarray:
         if not self.dry_run:
             execute_movel_and_wait(

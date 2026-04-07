@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+import time
 
 from support.get_obs import STATE_MODE_J6
 from support.keyboard_control import (
@@ -21,13 +22,19 @@ from support.keyboard_control import (
     KEY_SPACE,
     KEY_UP,
     RawTerminal,
-    read_key,
+    drain_keys,
     render_keyboard_ui,
 )
 
 
+CONTROL_DT_S = 0.01
+RAW_RECORD_DT_S = 1.0 / 30.0
+UI_REFRESH_DT_S = 0.05
+KEY_ACTIVE_LATCH_S = 0.12
+TARGET_HORIZON_SCALE = 1.2
+DEFAULT_ROTATE_SPEED_DEGPS = 10.0
 DEFAULT_MOVE_STEP_M = 0.005
-DEFAULT_ROTATE_STEP_DEG = 5.0
+DEFAULT_ROTATE_STEP_DEG = DEFAULT_ROTATE_SPEED_DEGPS * CONTROL_DT_S * TARGET_HORIZON_SCALE
 
 
 @dataclass(frozen=True)
@@ -58,12 +65,17 @@ def run_session(
     recorded_frames: list[Any] = []
     frame_idx = 0
     saved_episode_count = 0
-    move_step_m = float(config.move_step_m)
-    rotate_step_deg = float(config.rotate_step_deg)
+    move_step_m = float(runtime.linear_speed) * float(CONTROL_DT_S) * float(TARGET_HORIZON_SCALE)
+    rotate_step_deg = float(DEFAULT_ROTATE_SPEED_DEGPS) * float(CONTROL_DT_S) * float(TARGET_HORIZON_SCALE)
     status_line = "Ready. Enter starts recording. Idle periods are not recorded."
+    next_ui_refresh_ts = 0.0
+    next_record_ts = 0.0
+    servo_active = False
+    active_until: dict[str, float] = {}
+    command_pose_real = runtime.get_live_tcp_pose()
 
     def _append_current_snapshot() -> None:
-        nonlocal frame_idx
+        nonlocal frame_idx, next_record_ts
         if not recording:
             return
         recorded_frames.append(
@@ -74,144 +86,189 @@ def run_session(
             )
         )
         frame_idx += 1
+        next_record_ts = time.monotonic() + float(RAW_RECORD_DT_S)
 
-    def _execute_pose_target(target_pose: np.ndarray) -> None:
-        nonlocal frame_idx
-        target_pose = np.asarray(target_pose, dtype=np.float64).reshape(6).copy()
-        if recording:
-            seg = runtime.record_pose_move(
-                target_pose,
-                gripper=1.0 if local_gripper_open else 0.0,
-                start_frame_idx=frame_idx,
-                semantic_joint6=runtime.local_exec_joint6_rad,
-                record=True,
-            )
-            recorded_frames.extend(seg)
-            frame_idx += len(seg)
-        else:
-            runtime.move_pose(target_pose, "keyboard move")
-
-    def _execute_rotate(delta_deg: float) -> None:
-        nonlocal frame_idx
-        delta_rad = float(np.deg2rad(delta_deg))
-        if config.state_mode == STATE_MODE_J6:
-            target_joint6 = runtime.wrap_angle(runtime.local_exec_joint6_rad + delta_rad)
-            seg = runtime.record_joint6_rotation(
-                target_joint6=target_joint6,
-                gripper=1.0 if local_gripper_open else 0.0,
-                start_frame_idx=frame_idx,
-                record=recording,
-            )
-            if recording:
-                recorded_frames.extend(seg)
-                frame_idx += len(seg)
-            runtime.local_exec_joint6_rad = target_joint6
+    def _ensure_servo_active() -> None:
+        nonlocal servo_active, command_pose_real
+        if runtime.dry_run or servo_active:
             return
+        command_pose_real = runtime.get_live_tcp_pose()
+        resp = runtime.daemon.servo_start(CONTROL_DT_S)
+        if int(resp.get("servo_start_ret", -1)) != 0:
+            raise RuntimeError(f"servo_start failed: {resp}")
+        runtime.daemon.servo_begin_chunk(command_pose_real, force_live_mode=False)
+        servo_active = True
 
-        live_pose = runtime.get_live_tcp_pose()
-        live_pose[5] = runtime.wrap_angle(float(live_pose[5] + delta_rad))
-        _execute_pose_target(live_pose)
+    def _stop_servo() -> None:
+        nonlocal servo_active, command_pose_real
+        if runtime.dry_run:
+            servo_active = False
+            command_pose_real = runtime.get_live_tcp_pose()
+            return
+        if servo_active:
+            try:
+                runtime.daemon.servo_stop()
+            except Exception:
+                pass
+        servo_active = False
+        command_pose_real = runtime.get_live_tcp_pose()
+        live_joint6 = runtime.get_live_joint6()
+        if live_joint6 is not None:
+            runtime.local_exec_joint6_rad = float(live_joint6)
+
+    def _maybe_record_active_tick(now_ts: float) -> None:
+        if recording and now_ts >= next_record_ts:
+            _append_current_snapshot()
+
+    def _axis_from_active(now_ts: float, positive_key: str, negative_key: str) -> float:
+        pos_active = active_until.get(positive_key, 0.0) >= now_ts
+        neg_active = active_until.get(negative_key, 0.0) >= now_ts
+        if pos_active == neg_active:
+            return 0.0
+        return 1.0 if pos_active else -1.0
+
+    def _handle_discrete_key(key: str) -> bool:
+        nonlocal recording, recorded_frames, frame_idx, saved_episode_count, status_line, local_gripper_open, next_record_ts
+        if key == KEY_ENTER:
+            if not recording:
+                recording = True
+                recorded_frames = []
+                frame_idx = 0
+                next_record_ts = 0.0
+                _append_current_snapshot()
+                status_line = f"Recording started: {config.prompt}"
+            else:
+                recording = False
+                if recorded_frames:
+                    episode_dir = save_episode_fn(
+                        recorded_frames,
+                        save_dir,
+                        config.prompt,
+                        save_fps=config.save_fps,
+                        state_mode=config.state_mode,
+                    )
+                    saved_episode_count += 1
+                    status_line = f"Saved {episode_dir.name} for prompt: {config.prompt}"
+                else:
+                    status_line = "Recording stopped: no frames captured"
+                recorded_frames = []
+                frame_idx = 0
+            return True
+
+        if key == KEY_SPACE:
+            target_state = 0 if local_gripper_open else 1
+            ok = True if runtime.dry_run else runtime.command_gripper_state(target_state)
+            if ok:
+                local_gripper_open = bool(target_state == 1)
+                if config.state_mode != STATE_MODE_J6:
+                    live_joint6 = runtime.get_live_joint6()
+                    if live_joint6 is not None:
+                        runtime.local_exec_joint6_rad = float(live_joint6)
+                if recording:
+                    _append_current_snapshot()
+                status_line = f"Gripper {'open' if local_gripper_open else 'closed'}"
+            else:
+                status_line = "Gripper command failed"
+            return True
+
+        return False
 
     term = RawTerminal.open()
     try:
         while True:
-            print(
-                render_keyboard_ui(
-                    prompt=config.prompt,
-                    recording=recording,
-                    gripper_open=local_gripper_open,
-                    state_mode=config.state_mode,
-                    move_step_mm=move_step_m * 1000.0,
-                    rotate_step_deg=rotate_step_deg,
-                    status_line=status_line,
-                ),
-                end="",
-                flush=True,
+            now_ts = time.monotonic()
+            if now_ts >= next_ui_refresh_ts:
+                print(
+                    render_keyboard_ui(
+                        prompt=config.prompt,
+                        recording=recording,
+                        gripper_open=local_gripper_open,
+                        state_mode=config.state_mode,
+                        move_step_mm=move_step_m * 1000.0,
+                        rotate_step_deg=rotate_step_deg,
+                        status_line=status_line,
+                    ),
+                    end="",
+                    flush=True,
+                )
+                next_ui_refresh_ts = now_ts + float(UI_REFRESH_DT_S)
+
+            for key in drain_keys(term.fd):
+                if key in {KEY_QUIT, KEY_CTRL_C}:
+                    status_line = "Exiting keyboard teleop."
+                    return saved_episode_count
+                if _handle_discrete_key(key):
+                    continue
+                if key in {
+                    KEY_UP,
+                    KEY_DOWN,
+                    KEY_LEFT,
+                    KEY_RIGHT,
+                    KEY_CTRL_UP,
+                    KEY_CTRL_DOWN,
+                    KEY_CTRL_LEFT,
+                    KEY_CTRL_RIGHT,
+                }:
+                    active_until[key] = now_ts + float(KEY_ACTIVE_LATCH_S)
+
+            move_axis = np.array(
+                [
+                    _axis_from_active(now_ts, KEY_UP, KEY_DOWN),
+                    _axis_from_active(now_ts, KEY_LEFT, KEY_RIGHT),
+                    _axis_from_active(now_ts, KEY_CTRL_UP, KEY_CTRL_DOWN),
+                ],
+                dtype=np.float64,
             )
-
-            key = read_key(term.fd)
-            if key in {KEY_QUIT, KEY_CTRL_C}:
-                status_line = "Exiting keyboard teleop."
-                break
-
-            if key == KEY_ENTER:
-                if not recording:
-                    recording = True
-                    recorded_frames = []
-                    frame_idx = 0
-                    _append_current_snapshot()
-                    status_line = f"Recording started: {config.prompt}"
-                else:
-                    recording = False
-                    if recorded_frames:
-                        save_episode_fn(
-                            recorded_frames,
-                            save_dir,
-                            config.prompt,
-                            save_fps=config.save_fps,
-                            state_mode=config.state_mode,
-                        )
-                        saved_episode_count += 1
-                        status_line = f"Saved episode {saved_episode_count - 1} for prompt: {config.prompt}"
-                    else:
-                        status_line = "Recording stopped: no frames captured"
-                    recorded_frames = []
-                    frame_idx = 0
-                continue
-
-            if key == KEY_SPACE:
-                target_state = 0 if local_gripper_open else 1
-                ok = True if runtime.dry_run else runtime.command_gripper_state(target_state)
-                if ok:
-                    local_gripper_open = bool(target_state == 1)
-                    if recording:
-                        _append_current_snapshot()
-                    status_line = f"Gripper {'open' if local_gripper_open else 'closed'}"
-                else:
-                    status_line = "Gripper command failed"
-                continue
-
-            move_delta = np.zeros((3,), dtype=np.float64)
-            rotate_delta_deg = 0.0
-            if key == KEY_UP:
-                move_delta[0] = move_step_m
-            elif key == KEY_DOWN:
-                move_delta[0] = -move_step_m
-            elif key == KEY_LEFT:
-                move_delta[1] = move_step_m
-            elif key == KEY_RIGHT:
-                move_delta[1] = -move_step_m
-            elif key == KEY_CTRL_UP:
-                move_delta[2] = move_step_m
-            elif key == KEY_CTRL_DOWN:
-                move_delta[2] = -move_step_m
-            elif key == KEY_CTRL_LEFT:
-                rotate_delta_deg = +rotate_step_deg
-            elif key == KEY_CTRL_RIGHT:
-                rotate_delta_deg = -rotate_step_deg
-            else:
-                continue
+            rotate_axis = _axis_from_active(now_ts, KEY_CTRL_LEFT, KEY_CTRL_RIGHT)
+            linear_norm = float(np.linalg.norm(move_axis))
+            has_linear = linear_norm > 1e-9
+            has_rotate = abs(rotate_axis) > 1e-9
 
             try:
-                if abs(rotate_delta_deg) > 1e-9:
-                    _execute_rotate(rotate_delta_deg)
+                if has_linear or has_rotate:
+                    if not runtime.dry_run:
+                        _ensure_servo_active()
+                    if has_linear:
+                        move_axis = move_axis / linear_norm
+                        command_pose_real[:3] = command_pose_real[:3] + move_axis * float(move_step_m)
+                    command_pose_real[2] = max(float(runtime.min_tcp_z), float(command_pose_real[2]))
+                    if has_rotate:
+                        rotate_delta_rad = float(np.deg2rad(rotate_step_deg * rotate_axis))
+                        if config.state_mode == STATE_MODE_J6:
+                            runtime.local_exec_joint6_rad = runtime.wrap_angle(runtime.local_exec_joint6_rad + rotate_delta_rad)
+                        else:
+                            command_pose_real[5] = runtime.wrap_angle(float(command_pose_real[5] + rotate_delta_rad))
+                            live_joint6 = runtime.get_live_joint6()
+                            if live_joint6 is not None:
+                                runtime.local_exec_joint6_rad = float(live_joint6)
+
+                    if not runtime.dry_run:
+                        if config.state_mode == STATE_MODE_J6:
+                            resp = runtime.daemon.servo_pose_j6(command_pose_real, runtime.local_exec_joint6_rad)
+                        else:
+                            resp = runtime.daemon.servo_pose(command_pose_real)
+                        pose_ret = int(resp.get("servo_pose_ret", -1))
+                        if pose_ret != 0:
+                            raise RuntimeError(resp)
+                        if config.state_mode != STATE_MODE_J6:
+                            live_joint6 = runtime.get_live_joint6()
+                            if live_joint6 is not None:
+                                runtime.local_exec_joint6_rad = float(live_joint6)
+
+                    _maybe_record_active_tick(now_ts)
                     status_line = (
-                        f"Rotate {'CCW' if rotate_delta_deg > 0 else 'CW'} "
-                        f"{abs(rotate_delta_deg):.1f} deg"
+                        f"Move dx={move_axis[0]*move_step_m*1000.0:+.1f}mm "
+                        f"dy={move_axis[1]*move_step_m*1000.0:+.1f}mm "
+                        f"dz={move_axis[2]*move_step_m*1000.0:+.1f}mm "
+                        f"rot={rotate_axis*rotate_step_deg:+.2f}deg"
                     )
                 else:
-                    live_pose = runtime.get_live_tcp_pose()
-                    live_pose[:3] = live_pose[:3] + move_delta
-                    live_pose[2] = max(float(runtime.min_tcp_z), float(live_pose[2]))
-                    _execute_pose_target(live_pose)
-                    status_line = (
-                        f"Move dx={move_delta[0]*1000.0:+.1f}mm "
-                        f"dy={move_delta[1]*1000.0:+.1f}mm "
-                        f"dz={move_delta[2]*1000.0:+.1f}mm"
-                    )
+                    time.sleep(float(CONTROL_DT_S))
             except Exception as exc:
                 status_line = f"Command failed: {exc}"
+                _stop_servo()
     finally:
+        _stop_servo()
         term.close()
 
     return saved_episode_count

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import select
 import sys
 import termios
 import tty
@@ -103,6 +104,24 @@ def read_key(fd: int) -> str:
     return ""
 
 
+def read_key_nonblocking(fd: int, timeout_s: float = 0.0) -> str | None:
+    ready, _, _ = select.select([fd], [], [], max(0.0, float(timeout_s)))
+    if not ready:
+        return None
+    return read_key(fd)
+
+
+def drain_keys(fd: int) -> list[str]:
+    keys: list[str] = []
+    while True:
+        key = read_key_nonblocking(fd, 0.0)
+        if key is None:
+            break
+        if key:
+            keys.append(key)
+    return keys
+
+
 def render_keyboard_ui(
     *,
     prompt: str,
@@ -164,4 +183,3 @@ class RawTerminal:
         sys.stdout.write(SHOW_CURSOR)
         sys.stdout.write(CLEAR_SCREEN)
         sys.stdout.flush()
-

@@ -5,8 +5,14 @@ import re
 import select
 import sys
 import termios
+import threading
 import tty
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+try:
+    from pynput import keyboard as pynput_keyboard
+except (ImportError, Exception):
+    pynput_keyboard = None
 
 
 _ESC = "\033["
@@ -120,6 +126,87 @@ def drain_keys(fd: int) -> list[str]:
         if key:
             keys.append(key)
     return keys
+
+
+@dataclass
+class ContinuousKeyState:
+    _listener: object | None = None
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _up: bool = False
+    _down: bool = False
+    _left: bool = False
+    _right: bool = False
+    _ctrl: bool = False
+
+    @property
+    def available(self) -> bool:
+        return pynput_keyboard is not None
+
+    def start(self) -> bool:
+        if pynput_keyboard is None:
+            return False
+        self.stop()
+        self._listener = pynput_keyboard.Listener(
+            on_press=self._on_press,
+            on_release=self._on_release,
+        )
+        self._listener.start()
+        return True
+
+    def stop(self) -> None:
+        listener = self._listener
+        self._listener = None
+        if listener is not None:
+            try:
+                listener.stop()
+            except Exception:
+                pass
+        with self._lock:
+            self._up = False
+            self._down = False
+            self._left = False
+            self._right = False
+            self._ctrl = False
+
+    def axes(self) -> tuple[float, float, float, float]:
+        with self._lock:
+            up = self._up
+            down = self._down
+            left = self._left
+            right = self._right
+            ctrl = self._ctrl
+
+        vertical = (1.0 if up else 0.0) - (1.0 if down else 0.0)
+        horizontal = (1.0 if left else 0.0) - (1.0 if right else 0.0)
+        if ctrl:
+            return 0.0, 0.0, vertical, horizontal
+        return vertical, horizontal, 0.0, 0.0
+
+    def _on_press(self, key) -> None:
+        with self._lock:
+            if key in {pynput_keyboard.Key.ctrl, pynput_keyboard.Key.ctrl_l, pynput_keyboard.Key.ctrl_r}:
+                self._ctrl = True
+            elif key == pynput_keyboard.Key.up:
+                self._up = True
+            elif key == pynput_keyboard.Key.down:
+                self._down = True
+            elif key == pynput_keyboard.Key.left:
+                self._left = True
+            elif key == pynput_keyboard.Key.right:
+                self._right = True
+
+    def _on_release(self, key) -> None:
+        with self._lock:
+            if key in {pynput_keyboard.Key.ctrl, pynput_keyboard.Key.ctrl_l, pynput_keyboard.Key.ctrl_r}:
+                self._ctrl = False
+            elif key == pynput_keyboard.Key.up:
+                self._up = False
+            elif key == pynput_keyboard.Key.down:
+                self._down = False
+            elif key == pynput_keyboard.Key.left:
+                self._left = False
+            elif key == pynput_keyboard.Key.right:
+                self._right = False
 
 
 def render_keyboard_ui(

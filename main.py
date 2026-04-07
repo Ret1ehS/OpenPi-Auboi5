@@ -246,15 +246,15 @@ class TrajectoryExecutor:
         def _plan_from_item(item):
             nonlocal servo_active
             tcp_deltas, submitted_observed_pose, joint6_deltas, semantic_joint6 = item
+            _ = submitted_observed_pose
             snapshot = get_robot_snapshot()
-            # Serial mode integrates from the same observed pose that was fed
-            # into the policy. This keeps chunk boundaries consistent with the
-            # observation used for inference instead of re-sampling a newer
-            # live pose after inference latency.
-            if submitted_observed_pose is not None:
-                start_sim = np.asarray(submitted_observed_pose, dtype=np.float64).reshape(6).copy()
-            else:
-                start_sim = real_pose_to_sim(snapshot.tcp_pose)
+            # Match the stable ad961043 path: after the previous chunk has
+            # fully finished and settled, each new chunk integrates from the
+            # current live robot pose, not from the earlier observation pose
+            # captured before inference. Using the stale observed pose here
+            # re-injects inference-latency drift as a corrective "snap back"
+            # at chunk boundaries.
+            start_sim = real_pose_to_sim(snapshot.tcp_pose)
 
             if snapshot.collision or not snapshot.within_safety_limits:
                 result = TrackChunkResult(

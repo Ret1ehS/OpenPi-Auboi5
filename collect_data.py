@@ -83,8 +83,6 @@ DEFAULT_J6_HOME_RAD = 0.11434
 DEFAULT_J6_EXEC_TOL_RAD = float(np.deg2rad(1.0))
 ROTATE_ABS_DEG_MIN = 12.0
 ROTATE_ABS_DEG_MAX = 22.5
-KEYBOARD_MOVE_STEP_M = 0.005
-KEYBOARD_ROTATE_STEP_DEG = 5.0
 
 
 def _maybe_reexec_into_repo_venv() -> None:
@@ -107,22 +105,9 @@ from support.get_obs import (
     STATE_MODE_YAW,
     preprocess_image_for_openpi as preprocess_image,
 )
-from support.keyboard_control import (
-    KEY_CTRL_C,
-    KEY_CTRL_DOWN,
-    KEY_CTRL_LEFT,
-    KEY_CTRL_RIGHT,
-    KEY_CTRL_UP,
-    KEY_DOWN,
-    KEY_ENTER,
-    KEY_LEFT,
-    KEY_QUIT,
-    KEY_RIGHT,
-    KEY_SPACE,
-    KEY_UP,
-    RawTerminal,
-    read_key as read_keyboard_key,
-    render_keyboard_ui,
+from task.keyboard_teleop import (
+    KeyboardTeleopConfig,
+    run_session as kt_run_session,
 )
 from task.pick_and_place import (
     OBJECT_ORDER,
@@ -1189,6 +1174,12 @@ class CollectTaskRuntime:
         live_base = np.asarray(snap_local.tcp_pose, dtype=np.float64).reshape(6).copy()
         return build_pose_at_xy(live_base, x, y, z)
 
+    def get_live_tcp_pose(self) -> np.ndarray:
+        from support.tcp_control import get_robot_snapshot
+
+        snap_local = get_robot_snapshot()
+        return np.asarray(snap_local.tcp_pose, dtype=np.float64).reshape(6).copy()
+
     def return_home(self, label: str) -> np.ndarray:
         if not self.dry_run:
             execute_movel_and_wait(
@@ -1203,6 +1194,16 @@ class CollectTaskRuntime:
         self.local_exec_joint6_rad = float(self.default_joint6_rad)
         self.origin_xy = self.home_real[:2].copy()
         return self.home_real.copy()
+
+    def move_pose(self, target_real: np.ndarray, label: str) -> None:
+        if self.dry_run:
+            return
+        execute_movel_and_wait(
+            self.daemon,
+            np.asarray(target_real, dtype=np.float64).reshape(6).copy(),
+            label,
+            speed_mps=self.linear_speed,
+        )
 
     def z_for_pick_level(self, level: int) -> float:
         return float(self.min_tcp_z + self.cube_height_m * max(0, int(level)))
@@ -1251,6 +1252,21 @@ class CollectTaskRuntime:
             )
         execute_joint6_rotation(float(target_joint6))
         return []
+
+    def capture_manual_snapshot(
+        self,
+        *,
+        gripper: float,
+        frame_idx: int,
+        semantic_joint6: float | None = None,
+    ) -> RecordedFrame:
+        joint6 = self.local_exec_joint6_rad if semantic_joint6 is None else semantic_joint6
+        return capture_manual_snapshot(
+            self.cameras,
+            gripper=gripper,
+            frame_idx=frame_idx,
+            semantic_joint6=float(joint6),
+        )
 
     def make_dummy_frame(self, *, sim_pose: np.ndarray, gripper: float, joint6: float, frame_idx: int) -> RecordedFrame:
         return RecordedFrame(
@@ -1394,7 +1410,6 @@ def main() -> int:
     cameras: CameraPair | None = None
     daemon = None
     runtime: CollectTaskRuntime | None = None
-    keyboard_episode_count = 0
     pick_session = PickAndPlaceSession(scene_state={})
     open_close_session = OpenCloseSession()
     cleanup_state = {"done": False}
@@ -1534,188 +1549,6 @@ def main() -> int:
             open_close_session = OpenCloseSession()
             print("\n  Open/close state cleared. Reference will be re-captured from current TCP.")
 
-    def run_keyboard_teleop_session(prompt_text: str) -> None:
-        nonlocal keyboard_episode_count
-
-        if not args.dry_run:
-            runtime.return_home("keyboard teleop init home")
-            ensure_gripper_ok(
-                command_gripper_state(1, timeout_s=args.gripper_timeout),
-                "open gripper before keyboard teleop",
-            )
-        local_gripper_open = True
-        recording = False
-        recorded_frames: list[RecordedFrame] = []
-        frame_idx = 0
-        move_step_m = float(KEYBOARD_MOVE_STEP_M)
-        rotate_step_deg = float(KEYBOARD_ROTATE_STEP_DEG)
-        status_line = "Ready. Enter starts recording. Idle periods are not recorded."
-
-        def _append_current_snapshot() -> None:
-            nonlocal frame_idx
-            if not recording:
-                return
-            recorded_frames.append(
-                capture_manual_snapshot(
-                    cameras,
-                    gripper=1.0 if local_gripper_open else 0.0,
-                    frame_idx=frame_idx,
-                    semantic_joint6=runtime.local_exec_joint6_rad,
-                )
-            )
-            frame_idx += 1
-
-        def _execute_pose_target(target_pose: np.ndarray) -> None:
-            nonlocal frame_idx
-            if recording:
-                seg = execute_and_record(
-                    daemon,
-                    cameras,
-                    target_pose,
-                        gripper=1.0 if local_gripper_open else 0.0,
-                        start_frame_idx=frame_idx,
-                        speed_mps=LINEAR_SPEED,
-                        semantic_joint6=runtime.local_exec_joint6_rad,
-                        record=True,
-                    )
-                recorded_frames.extend(seg)
-                frame_idx += len(seg)
-            else:
-                execute_movel_and_wait(
-                    daemon,
-                    target_pose,
-                    "keyboard move",
-                    speed_mps=LINEAR_SPEED,
-                )
-
-        def _execute_rotate(delta_deg: float) -> None:
-            nonlocal frame_idx
-            delta_rad = float(np.deg2rad(delta_deg))
-            if collect_state_mode == STATE_MODE_J6:
-                target_joint6 = _wrap_angle(runtime.local_exec_joint6_rad + delta_rad)
-                if recording:
-                    seg = execute_joint6_rotation_and_record(
-                        cameras,
-                        target_joint6=target_joint6,
-                        start_joint6=runtime.local_exec_joint6_rad,
-                        gripper=1.0 if local_gripper_open else 0.0,
-                        start_frame_idx=frame_idx,
-                    )
-                    recorded_frames.extend(seg)
-                    frame_idx += len(seg)
-                else:
-                    execute_joint6_rotation(target_joint6)
-                runtime.local_exec_joint6_rad = target_joint6
-                return
-
-            live_pose = np.asarray(get_robot_snapshot().tcp_pose, dtype=np.float64).reshape(6).copy()
-            live_pose[5] = _wrap_angle(float(live_pose[5] + delta_rad))
-            _execute_pose_target(live_pose)
-
-        term = RawTerminal.open()
-        try:
-            while True:
-                sys.stdout.write(
-                    render_keyboard_ui(
-                        prompt=prompt_text,
-                        recording=recording,
-                        gripper_open=local_gripper_open,
-                        state_mode=collect_state_mode,
-                        move_step_mm=move_step_m * 1000.0,
-                        rotate_step_deg=rotate_step_deg,
-                        status_line=status_line,
-                    )
-                )
-                sys.stdout.flush()
-
-                key = read_keyboard_key(term.fd)
-                if key in {KEY_QUIT, KEY_CTRL_C}:
-                    status_line = "Exiting keyboard teleop."
-                    break
-
-                if key == KEY_ENTER:
-                    if not recording:
-                        recording = True
-                        recorded_frames = []
-                        frame_idx = 0
-                        _append_current_snapshot()
-                        status_line = f"Recording started: {prompt_text}"
-                    else:
-                        recording = False
-                        if recorded_frames:
-                            save_episode(
-                                recorded_frames,
-                                save_dir,
-                                prompt_text,
-                                save_fps=save_fps,
-                                state_mode=collect_state_mode,
-                            )
-                            keyboard_episode_count += 1
-                            status_line = f"Saved episode {keyboard_episode_count - 1} for prompt: {prompt_text}"
-                        else:
-                            status_line = "Recording stopped: no frames captured"
-                        recorded_frames = []
-                        frame_idx = 0
-                    continue
-
-                if key == KEY_SPACE:
-                    target_state = 0 if local_gripper_open else 1
-                    if args.dry_run:
-                        ok = True
-                    else:
-                        ok = command_gripper_state(target_state, timeout_s=args.gripper_timeout)
-                    if ok:
-                        local_gripper_open = bool(target_state == 1)
-                        if recording:
-                            _append_current_snapshot()
-                        status_line = f"Gripper {'open' if local_gripper_open else 'closed'}"
-                    else:
-                        status_line = "Gripper command failed"
-                    continue
-
-                move_delta = np.zeros((3,), dtype=np.float64)
-                rotate_delta_deg = 0.0
-                if key == KEY_UP:
-                    move_delta[0] = move_step_m
-                elif key == KEY_DOWN:
-                    move_delta[0] = -move_step_m
-                elif key == KEY_LEFT:
-                    move_delta[1] = move_step_m
-                elif key == KEY_RIGHT:
-                    move_delta[1] = -move_step_m
-                elif key == KEY_CTRL_UP:
-                    move_delta[2] = move_step_m
-                elif key == KEY_CTRL_DOWN:
-                    move_delta[2] = -move_step_m
-                elif key == KEY_CTRL_LEFT:
-                    rotate_delta_deg = +rotate_step_deg
-                elif key == KEY_CTRL_RIGHT:
-                    rotate_delta_deg = -rotate_step_deg
-                else:
-                    continue
-
-                try:
-                    if abs(rotate_delta_deg) > 1e-9:
-                        _execute_rotate(rotate_delta_deg)
-                        status_line = (
-                            f"Rotate {'CCW' if rotate_delta_deg > 0 else 'CW'} "
-                            f"{abs(rotate_delta_deg):.1f} deg"
-                        )
-                    else:
-                        live_pose = np.asarray(get_robot_snapshot().tcp_pose, dtype=np.float64).reshape(6).copy()
-                        live_pose[:3] = live_pose[:3] + move_delta
-                        live_pose[2] = max(float(MIN_TCP_Z), float(live_pose[2]))
-                        _execute_pose_target(live_pose)
-                        status_line = (
-                            f"Move dx={move_delta[0]*1000.0:+.1f}mm "
-                            f"dy={move_delta[1]*1000.0:+.1f}mm "
-                            f"dz={move_delta[2]*1000.0:+.1f}mm"
-                        )
-                except Exception as exc:
-                    status_line = f"Command failed: {exc}"
-        finally:
-            term.close()
-
     if selected_task == "keyboard_teleop":
         prompt_text = args.prompt.strip()
         if not prompt_text:
@@ -1725,7 +1558,16 @@ def main() -> int:
             cleanup_collection()
             return 0
         print(f"\nKeyboard prompt: {prompt_text}")
-        run_keyboard_teleop_session(prompt_text)
+        kt_run_session(
+            runtime,
+            config=KeyboardTeleopConfig(
+                prompt=prompt_text,
+                save_fps=save_fps,
+                state_mode=collect_state_mode,
+            ),
+            save_dir=save_dir,
+            save_episode_fn=save_episode,
+        )
         cleanup_collection()
         print("Done.")
         return 0

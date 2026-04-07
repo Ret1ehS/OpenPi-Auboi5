@@ -117,7 +117,7 @@ class CollectTUIConfig:
     mode: str              # "manual" | "auto"
     auto_episodes: int
     resume_mode: str       # "continue" | "reset"
-    task: str              # "pick_and_place" | "open_and_close"
+    task: str              # "pick_and_place" | "open_and_close" | "keyboard_teleop"
     save_fps: int          # 30 | 50
     state_mode: str        # "yaw" | "j6"
     quit: bool = False
@@ -477,7 +477,7 @@ def _snapshot_collect_config(rows: list[MenuRow]) -> CollectTUIConfig:
     task = _get_toggle(rows, "Task")
     mode = _get_toggle(rows, "Mode")
     auto_episodes = _get_int(rows, "Auto Episodes", 10)
-    if task == "open_and_close":
+    if _is_manual_locked_task(rows):
         mode = "manual"
         auto_episodes = 1
     return CollectTUIConfig(
@@ -493,17 +493,17 @@ def _snapshot_collect_config(rows: list[MenuRow]) -> CollectTUIConfig:
 def _collect_disabled_labels(rows: list[MenuRow]) -> set[str]:
     disabled: set[str] = set()
     task = _get_toggle(rows, "Task")
-    if _get_toggle(rows, "Mode") != "auto" or task == "open_and_close":
+    if _get_toggle(rows, "Mode") != "auto" or task in {"open_and_close", "keyboard_teleop"}:
         disabled.add("Auto Episodes")
     return disabled
 
 
-def _is_open_and_close_task(rows: list[MenuRow]) -> bool:
-    return _get_toggle(rows, "Task") == "open_and_close"
+def _is_manual_locked_task(rows: list[MenuRow]) -> bool:
+    return _get_toggle(rows, "Task") in {"open_and_close", "keyboard_teleop"}
 
 
 def _enforce_collect_task_constraints(rows: list[MenuRow]) -> None:
-    if not _is_open_and_close_task(rows):
+    if not _is_manual_locked_task(rows):
         return
     for row in rows:
         if isinstance(row, ToggleItem) and row.label == "Mode":
@@ -526,7 +526,7 @@ def _collect_selectable_rows(rows: list[MenuRow]) -> list[MenuRow]:
 
 def _collect_nonselectable_labels(rows: list[MenuRow]) -> set[str]:
     labels = _collect_disabled_labels(rows)
-    if _is_open_and_close_task(rows):
+    if _is_manual_locked_task(rows):
         labels.add("Mode")
     return labels
 
@@ -547,8 +547,8 @@ def run_collect_tui_config(
         ToggleItem("State Mode", ["j6", "yaw"], selected=_choice_index(["j6", "yaw"], default_state_mode, 0)),
         ToggleItem(
             "Task",
-            ["pick_and_place", "open_and_close"],
-            selected=_choice_index(["pick_and_place", "open_and_close"], default_task, 0),
+            ["pick_and_place", "open_and_close", "keyboard_teleop"],
+            selected=_choice_index(["pick_and_place", "open_and_close", "keyboard_teleop"], default_task, 0),
         ),
         TextItem("Auto Episodes", str(max(1, int(default_auto_episodes)))),
         SeparatorItem(),

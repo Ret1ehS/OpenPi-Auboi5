@@ -189,7 +189,7 @@ def _render(
                 if is_focused:
                     value = f"{BOLD}{BG_BLUE}{FG_WHITE}< {current} >{RESET}"
                 else:
-                    value = f"{FG_BLACK}< {current} >{RESET}"
+                    value = f"{FG_WHITE}< {current} >{RESET}"
                 line = f"{prefix}{label}{value}"
             else:
                 parts = []

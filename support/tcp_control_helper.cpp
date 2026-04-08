@@ -1045,7 +1045,7 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
     auto algo = robot->getRobotAlgorithm();
     std::ofstream diag_log;
     if (!opt.log_file.empty()) {
-        diag_log.open(opt.log_file, std::ios::app);
+        diag_log.open(opt.log_file, std::ios::out | std::ios::trunc);
     }
     auto log_diag = [&](const std::string &line) {
         if (!diag_log.is_open()) {

@@ -1118,6 +1118,32 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
             print_snapshot(robot, config);
             std::cout << "END" << std::endl;
 
+        } else if (line == "servo_sync_seed") {
+            if (!servo_active) {
+                std::cout << "servo_sync_seed_ret=-1" << std::endl;
+                std::cout << "error=servo_not_active" << std::endl;
+                std::cout << "END" << std::endl;
+                continue;
+            }
+            state = robot->getRobotState();
+            seed_q = state->getJointPositions();
+            hold_q = seed_q;
+            auto fk_result = algo->forwardKinematics(seed_q);
+            hold_pose = std::get<0>(fk_result);
+            const int fk_ret = std::get<1>(fk_result);
+            if (fk_ret != 0 || hold_pose.size() != 6) {
+                std::cout << "servo_sync_seed_ret=-1" << std::endl;
+                std::cout << "error=fk_fail" << std::endl;
+                std::cout << "fk_ret=" << fk_ret << std::endl;
+                std::cout << "END" << std::endl;
+                continue;
+            }
+            hold_joint_mode = true;
+            std::cout << "servo_sync_seed_ret=0" << std::endl;
+            print_vec("joint_q_rad", seed_q);
+            print_vec("hold_pose", hold_pose);
+            std::cout << "END" << std::endl;
+
         } else if (line.rfind("servo_start", 0) == 0) {
             // servo_start [track_time_s]
             // Enter servo mode, keep it open until servo_stop

@@ -690,6 +690,9 @@ class _DaemonHelper:
         with self._lock:
             if pose6 is not None:
                 self._last_servo_pose_real = np.asarray(pose6, dtype=np.float64).reshape(POSE_DIM).copy()
+            sync_resp = self._send_cmd("servo_sync_seed")
+            if int(sync_resp.get("servo_sync_seed_ret", -1)) != 0:
+                raise RuntimeError(f"servo_sync_seed failed: {sync_resp}")
             force_z_n, scale, warning_active = _get_force_guard_state()
             self._servo_force_guard_fz_n = force_z_n
             self._servo_force_guard_scale = scale
@@ -697,6 +700,7 @@ class _DaemonHelper:
             self._servo_force_guard_force_live = bool(force_live_mode)
             self._servo_force_guard_live_mode = bool(force_live_mode or warning_active)
             return {
+                **sync_resp,
                 "force_guard_fz_n": force_z_n,
                 "force_guard_scale": scale,
                 "force_guard_warning_active": warning_active,

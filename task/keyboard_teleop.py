@@ -80,7 +80,6 @@ def run_session(
     key_state = ContinuousKeyState()
     linear_axis_cmd = np.zeros(3, dtype=np.float64)
     rotate_axis_cmd = 0.0
-    preview_horizon_s = float(CONTROL_DT_S * float(MAX_LEAD_TICKS))
     rotate_speed_radps = float(np.deg2rad(DEFAULT_ROTATE_SPEED_DEGPS))
 
     def _append_current_snapshot() -> None:
@@ -102,10 +101,7 @@ def run_session(
         if runtime.dry_run or servo_active:
             return
         command_pose_real = runtime.get_live_tcp_pose()
-        resp = runtime.daemon.servo_start(CONTROL_DT_S)
-        if int(resp.get("servo_start_ret", -1)) != 0:
-            raise RuntimeError(f"servo_start failed: {resp}")
-        runtime.daemon.servo_begin_chunk(command_pose_real, force_live_mode=False)
+        runtime.begin_stream_servo(command_pose_real)
         servo_active = True
 
     def _stop_servo() -> None:
@@ -118,7 +114,7 @@ def run_session(
             return
         if servo_active:
             try:
-                runtime.daemon.servo_stop()
+                runtime.stop_stream_servo()
             except Exception:
                 pass
         servo_active = False
@@ -272,10 +268,10 @@ def run_session(
                     command_pose_real = _limit_pose_lead(command_pose_real, live_pose)
 
                     if not runtime.dry_run:
-                        if config.state_mode == STATE_MODE_J6:
-                            resp = runtime.daemon.servo_pose_j6(command_pose_real, runtime.local_exec_joint6_rad)
+                        if config.state_mode == STATE_MODE_J6 and has_rotate and not has_linear:
+                            resp = runtime.send_stream_joint6(runtime.local_exec_joint6_rad)
                         else:
-                            resp = runtime.daemon.servo_pose(command_pose_real)
+                            resp = runtime.send_stream_pose(command_pose_real)
                         pose_ret = int(resp.get("servo_pose_ret", -1))
                         if pose_ret != 0:
                             raise RuntimeError(resp)
@@ -283,14 +279,26 @@ def run_session(
                             live_joint6 = runtime.get_live_joint6()
                             if live_joint6 is not None:
                                 runtime.local_exec_joint6_rad = float(live_joint6)
+                        elif has_linear:
+                            live_joint6 = runtime.get_live_joint6()
+                            if live_joint6 is not None:
+                                runtime.local_exec_joint6_rad = float(live_joint6)
 
                     _maybe_record_active_tick(now_ts)
-                    status_line = (
-                        f"Move vx={linear_axis_cmd[0]*float(runtime.linear_speed)*1000.0:+.1f}mm/s "
-                        f"vy={linear_axis_cmd[1]*float(runtime.linear_speed)*1000.0:+.1f}mm/s "
-                        f"vz={linear_axis_cmd[2]*float(runtime.linear_speed)*1000.0:+.1f}mm/s "
-                        f"rot={rotate_axis_cmd*DEFAULT_ROTATE_SPEED_DEGPS:+.2f}deg/s"
-                    )
+                    if has_linear and has_rotate and config.state_mode == STATE_MODE_J6:
+                        status_line = (
+                            f"Move vx={linear_axis_cmd[0]*float(runtime.linear_speed)*1000.0:+.1f}mm/s "
+                            f"vy={linear_axis_cmd[1]*float(runtime.linear_speed)*1000.0:+.1f}mm/s "
+                            f"vz={linear_axis_cmd[2]*float(runtime.linear_speed)*1000.0:+.1f}mm/s "
+                            f"(j6 rotate deferred)"
+                        )
+                    else:
+                        status_line = (
+                            f"Move vx={linear_axis_cmd[0]*float(runtime.linear_speed)*1000.0:+.1f}mm/s "
+                            f"vy={linear_axis_cmd[1]*float(runtime.linear_speed)*1000.0:+.1f}mm/s "
+                            f"vz={linear_axis_cmd[2]*float(runtime.linear_speed)*1000.0:+.1f}mm/s "
+                            f"rot={rotate_axis_cmd*DEFAULT_ROTATE_SPEED_DEGPS:+.2f}deg/s"
+                        )
                 else:
                     if servo_active:
                         if hold_pose_real is None:
@@ -304,9 +312,9 @@ def run_session(
                                 hold_joint6_rad = None
                         if config.state_mode == STATE_MODE_J6:
                             joint6_cmd = runtime.local_exec_joint6_rad if hold_joint6_rad is None else float(hold_joint6_rad)
-                            resp = runtime.daemon.servo_pose_j6(hold_pose_real, joint6_cmd)
+                            resp = runtime.send_stream_joint6(joint6_cmd, hold_pose_real=hold_pose_real)
                         else:
-                            resp = runtime.daemon.servo_pose(hold_pose_real)
+                            resp = runtime.send_stream_pose(hold_pose_real)
                             live_joint6 = runtime.get_live_joint6()
                             if live_joint6 is not None:
                                 runtime.local_exec_joint6_rad = float(live_joint6)

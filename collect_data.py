@@ -1208,6 +1208,34 @@ class CollectTaskRuntime:
             return None
         return float(joint_q[5])
 
+    def begin_stream_servo(self, start_pose_real: np.ndarray) -> None:
+        if self.dry_run:
+            return
+        resp = self.daemon.servo_start(SERVO_CONTROL_DT)
+        if int(resp.get("servo_start_ret", -1)) != 0:
+            raise RuntimeError(f"servo_start failed: {resp}")
+        self.daemon.servo_begin_chunk(np.asarray(start_pose_real, dtype=np.float64).reshape(6).copy(), force_live_mode=False)
+
+    def stop_stream_servo(self) -> None:
+        if self.dry_run:
+            return
+        self.daemon.servo_stop()
+
+    def send_stream_pose(self, target_real: np.ndarray) -> dict[str, object]:
+        pose_cmd = np.asarray(target_real, dtype=np.float64).reshape(6).copy()
+        if self.dry_run:
+            return {"servo_pose_ret": 0, "dry_run": True}
+        return self.daemon.servo_pose(pose_cmd)
+
+    def send_stream_joint6(self, target_joint6: float, *, hold_pose_real: np.ndarray | None = None) -> dict[str, object]:
+        if hold_pose_real is None:
+            pose_cmd = self.get_live_tcp_pose()
+        else:
+            pose_cmd = np.asarray(hold_pose_real, dtype=np.float64).reshape(6).copy()
+        if self.dry_run:
+            return {"servo_pose_ret": 0, "dry_run": True}
+        return self.daemon.servo_pose_j6(pose_cmd, float(target_joint6))
+
     def return_home(self, label: str) -> np.ndarray:
         if not self.dry_run:
             execute_movel_and_wait(

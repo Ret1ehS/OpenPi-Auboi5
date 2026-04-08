@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+import threading
 from typing import Any, Callable
 
 import numpy as np
@@ -24,14 +26,18 @@ CONTROL_DT_S = 0.01
 RAW_RECORD_DT_S = 1.0 / 30.0
 UI_REFRESH_DT_S = 0.05
 TARGET_HORIZON_SCALE = 1.0
-MAX_LEAD_TICKS = 36.0
 DEFAULT_ROTATE_SPEED_DEGPS = 45.0
 DEFAULT_MOVE_STEP_M = 0.005
 DEFAULT_ROTATE_STEP_DEG = DEFAULT_ROTATE_SPEED_DEGPS * CONTROL_DT_S * TARGET_HORIZON_SCALE
 LINEAR_FILTER_TAU_S = 0.02
 ROTATE_FILTER_TAU_S = 0.02
-LEAD_REFERENCE_TAU_S = 0.05
 AXIS_EPS = 1e-3
+INPUT_POLL_DT_S = 0.002
+LIVE_POSE_SAMPLE_DT_S = 0.02
+POSE_CORRECTION_TAU_S = 0.12
+POSE_CORRECTION_DEADBAND_M = 0.0015
+POSE_CORRECTION_DEADBAND_RAD = float(np.deg2rad(0.25))
+LOOKAHEAD_TIME_S = 0.04
 POSE_SEND_DEADBAND_M = 0.00035
 POSE_SEND_DEADBAND_RAD = float(np.deg2rad(0.06))
 
@@ -47,6 +53,45 @@ class KeyboardTeleopConfig:
     workspace_y_max: float
     move_step_m: float = DEFAULT_MOVE_STEP_M
     rotate_step_deg: float = DEFAULT_ROTATE_STEP_DEG
+
+
+class _TerminalInputPump:
+    def __init__(self, fd: int, key_state: ContinuousKeyState) -> None:
+        self._fd = int(fd)
+        self._key_state = key_state
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._discrete_keys: deque[str] = deque()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="keyboard-input-pump", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        self._thread = None
+        if thread is not None:
+            thread.join(timeout=1.0)
+
+    def pop_discrete(self) -> list[str]:
+        with self._lock:
+            keys = list(self._discrete_keys)
+            self._discrete_keys.clear()
+            return keys
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            now_ts = time.monotonic()
+            keys = drain_keys(self._fd)
+            discrete = self._key_state.feed_terminal_keys(keys, now_ts)
+            if discrete:
+                with self._lock:
+                    self._discrete_keys.extend(discrete)
+            time.sleep(float(INPUT_POLL_DT_S))
 
 
 def run_session(
@@ -70,18 +115,18 @@ def run_session(
     saved_episode_count = 0
     move_step_m = float(runtime.linear_speed) * float(CONTROL_DT_S) * float(TARGET_HORIZON_SCALE)
     rotate_step_deg = float(DEFAULT_ROTATE_SPEED_DEGPS) * float(CONTROL_DT_S) * float(TARGET_HORIZON_SCALE)
-    max_linear_lead_m = max(move_step_m * float(MAX_LEAD_TICKS), float(runtime.linear_speed) * float(CONTROL_DT_S) * float(MAX_LEAD_TICKS))
-    max_yaw_lead_rad = float(np.deg2rad(rotate_step_deg * float(MAX_LEAD_TICKS)))
     status_line = "Ready. Enter starts recording. Idle periods are not recorded."
     next_ui_refresh_ts = 0.0
     next_record_ts = 0.0
     next_control_ts = time.monotonic()
     servo_active = False
     command_pose_real = runtime.get_live_tcp_pose()
-    lead_reference_pose_real = command_pose_real.copy()
+    planned_pose_real = command_pose_real.copy()
+    live_correction_pose_real = command_pose_real.copy()
     last_sent_pose_real: np.ndarray | None = None
     hold_pose_real: np.ndarray | None = None
     hold_joint6_rad: float | None = None
+    last_live_sample_ts = 0.0
     key_state = ContinuousKeyState()
     linear_axis_cmd = np.zeros(3, dtype=np.float64)
     rotate_axis_cmd = 0.0
@@ -102,24 +147,32 @@ def run_session(
         next_record_ts = time.monotonic() + float(RAW_RECORD_DT_S)
 
     def _ensure_servo_active() -> None:
-        nonlocal servo_active, command_pose_real, lead_reference_pose_real, last_sent_pose_real
+        nonlocal servo_active, command_pose_real, planned_pose_real, live_correction_pose_real
+        nonlocal last_sent_pose_real, hold_pose_real, hold_joint6_rad, last_live_sample_ts
         if runtime.dry_run or servo_active:
             return
         command_pose_real = runtime.get_live_tcp_pose()
-        lead_reference_pose_real = command_pose_real.copy()
+        planned_pose_real = command_pose_real.copy()
+        live_correction_pose_real = command_pose_real.copy()
         last_sent_pose_real = None
+        hold_pose_real = None
+        hold_joint6_rad = None
+        last_live_sample_ts = 0.0
         runtime.begin_stream_servo(command_pose_real)
         servo_active = True
 
     def _stop_servo() -> None:
-        nonlocal servo_active, command_pose_real, lead_reference_pose_real, last_sent_pose_real, hold_pose_real, hold_joint6_rad
+        nonlocal servo_active, command_pose_real, planned_pose_real, live_correction_pose_real
+        nonlocal last_sent_pose_real, hold_pose_real, hold_joint6_rad, last_live_sample_ts
         if runtime.dry_run:
             servo_active = False
             command_pose_real = runtime.get_live_tcp_pose()
-            lead_reference_pose_real = command_pose_real.copy()
+            planned_pose_real = command_pose_real.copy()
+            live_correction_pose_real = command_pose_real.copy()
             last_sent_pose_real = None
             hold_pose_real = None
             hold_joint6_rad = None
+            last_live_sample_ts = 0.0
             return
         if servo_active:
             try:
@@ -128,10 +181,12 @@ def run_session(
                 pass
         servo_active = False
         command_pose_real = runtime.get_live_tcp_pose()
-        lead_reference_pose_real = command_pose_real.copy()
+        planned_pose_real = command_pose_real.copy()
+        live_correction_pose_real = command_pose_real.copy()
         last_sent_pose_real = None
         hold_pose_real = None
         hold_joint6_rad = None
+        last_live_sample_ts = 0.0
         live_joint6 = runtime.get_live_joint6()
         if live_joint6 is not None:
             runtime.local_exec_joint6_rad = float(live_joint6)
@@ -148,17 +203,39 @@ def run_session(
         pose[5] = runtime.wrap_angle(float(pose[5]))
         return pose
 
-    def _limit_pose_lead(command_pose: np.ndarray, live_pose: np.ndarray) -> np.ndarray:
-        limited = np.asarray(command_pose, dtype=np.float64).reshape(6).copy()
-        live = np.asarray(live_pose, dtype=np.float64).reshape(6).copy()
-        delta_xyz = limited[:3] - live[:3]
-        dist = float(np.linalg.norm(delta_xyz))
-        if dist > float(max_linear_lead_m) and dist > 1e-9:
-            limited[:3] = live[:3] + delta_xyz / dist * float(max_linear_lead_m)
-        yaw_err = runtime.wrap_angle(float(limited[5] - live[5]))
-        if abs(yaw_err) > float(max_yaw_lead_rad):
-            limited[5] = runtime.wrap_angle(float(live[5] + np.sign(yaw_err) * max_yaw_lead_rad))
-        return _clip_command_pose(limited)
+    def _sample_live_pose(now_ts: float) -> np.ndarray | None:
+        nonlocal last_live_sample_ts, live_correction_pose_real
+        if runtime.dry_run:
+            return live_correction_pose_real.copy()
+        if last_live_sample_ts > 0.0 and (now_ts - last_live_sample_ts) < float(LIVE_POSE_SAMPLE_DT_S):
+            return None
+        live_pose = runtime.get_live_tcp_pose()
+        last_live_sample_ts = now_ts
+        live_correction_pose_real = np.asarray(live_pose, dtype=np.float64).reshape(6).copy()
+        return live_correction_pose_real.copy()
+
+    def _apply_live_pose_correction(now_ts: float) -> None:
+        nonlocal planned_pose_real
+        live_pose = _sample_live_pose(now_ts)
+        if live_pose is None:
+            return
+        correction_alpha = float(1.0 - np.exp(-CONTROL_DT_S / POSE_CORRECTION_TAU_S))
+        pos_err = live_pose[:3] - planned_pose_real[:3]
+        if float(np.linalg.norm(pos_err)) >= float(POSE_CORRECTION_DEADBAND_M):
+            planned_pose_real[:3] = planned_pose_real[:3] + pos_err * correction_alpha
+        yaw_err = runtime.wrap_angle(float(live_pose[5] - planned_pose_real[5]))
+        if abs(yaw_err) >= float(POSE_CORRECTION_DEADBAND_RAD):
+            planned_pose_real[5] = runtime.wrap_angle(float(planned_pose_real[5] + yaw_err * correction_alpha))
+        planned_pose_real = _clip_command_pose(planned_pose_real)
+
+    def _build_lookahead_pose(
+        linear_velocity_xyz: np.ndarray,
+        yaw_velocity_radps: float,
+    ) -> np.ndarray:
+        pose = np.asarray(planned_pose_real, dtype=np.float64).reshape(6).copy()
+        pose[:3] = pose[:3] + np.asarray(linear_velocity_xyz, dtype=np.float64).reshape(3) * float(LOOKAHEAD_TIME_S)
+        pose[5] = runtime.wrap_angle(float(pose[5] + float(yaw_velocity_radps) * float(LOOKAHEAD_TIME_S)))
+        return _clip_command_pose(pose)
 
     def _apply_pose_deadband(candidate_pose: np.ndarray) -> np.ndarray:
         nonlocal last_sent_pose_real
@@ -222,9 +299,11 @@ def run_session(
         return False
 
     term = RawTerminal.open()
+    input_pump = _TerminalInputPump(term.fd, key_state)
     try:
         if not key_state.start(fd=term.fd):
             raise RuntimeError("continuous keyboard teleop backend unavailable")
+        input_pump.start()
         while True:
             now_ts = time.monotonic()
             sleep_s = float(next_control_ts - now_ts)
@@ -249,7 +328,7 @@ def run_session(
                 )
                 next_ui_refresh_ts = now_ts + float(UI_REFRESH_DT_S)
 
-            discrete_keys = key_state.feed_terminal_keys(drain_keys(term.fd), now_ts)
+            discrete_keys = input_pump.pop_discrete()
             for key in discrete_keys:
                 if key in {KEY_QUIT, KEY_CTRL_C}:
                     status_line = "Exiting keyboard teleop."
@@ -269,41 +348,44 @@ def run_session(
 
             try:
                 if has_linear or has_rotate:
-                    live_pose = runtime.get_live_tcp_pose()
                     if not servo_active:
-                        command_pose_real = live_pose.copy()
+                        command_pose_real = runtime.get_live_tcp_pose()
+                        planned_pose_real = command_pose_real.copy()
+                        live_correction_pose_real = command_pose_real.copy()
                     if not runtime.dry_run:
                         _ensure_servo_active()
                     hold_pose_real = None
                     hold_joint6_rad = None
+                    _apply_live_pose_correction(now_ts)
+                    linear_velocity_xyz = np.zeros(3, dtype=np.float64)
+                    yaw_velocity_radps = 0.0
                     if has_linear:
                         move_dir = linear_axis_cmd / linear_norm
-                        command_pose_real[:3] = (
-                            command_pose_real[:3]
-                            + move_dir * float(runtime.linear_speed) * float(CONTROL_DT_S) * float(linear_norm)
+                        linear_velocity_xyz = (
+                            move_dir * float(runtime.linear_speed) * float(linear_norm)
                         )
-                        lead_alpha = float(1.0 - np.exp(-CONTROL_DT_S / LEAD_REFERENCE_TAU_S))
-                        lead_reference_pose_real[:3] = (
-                            lead_reference_pose_real[:3]
-                            + (live_pose[:3] - lead_reference_pose_real[:3]) * lead_alpha
+                        planned_pose_real[:3] = (
+                            planned_pose_real[:3]
+                            + linear_velocity_xyz * float(CONTROL_DT_S)
                         )
-                    else:
-                        lead_reference_pose_real[:3] = live_pose[:3]
                     if has_rotate:
                         rotate_delta_rad = float(rotate_speed_radps * rotate_axis_cmd * CONTROL_DT_S)
                         if config.state_mode == STATE_MODE_J6:
                             runtime.local_exec_joint6_rad = runtime.wrap_angle(runtime.local_exec_joint6_rad + rotate_delta_rad)
                         else:
-                            command_pose_real[5] = runtime.wrap_angle(float(command_pose_real[5] + rotate_delta_rad))
-                    lead_reference_pose_real[3:] = live_pose[3:]
+                            yaw_velocity_radps = float(rotate_speed_radps * rotate_axis_cmd)
+                            planned_pose_real[5] = runtime.wrap_angle(float(planned_pose_real[5] + rotate_delta_rad))
 
-                    command_pose_real = _clip_command_pose(command_pose_real)
-                    command_pose_real = _limit_pose_lead(command_pose_real, lead_reference_pose_real)
+                    planned_pose_real = _clip_command_pose(planned_pose_real)
+                    command_pose_real = _build_lookahead_pose(linear_velocity_xyz, yaw_velocity_radps)
                     command_pose_real = _apply_pose_deadband(command_pose_real)
 
                     if not runtime.dry_run:
                         if config.state_mode == STATE_MODE_J6 and has_rotate and not has_linear:
-                            resp = runtime.send_stream_joint6(runtime.local_exec_joint6_rad)
+                            resp = runtime.send_stream_joint6(
+                                runtime.local_exec_joint6_rad,
+                                hold_pose_real=command_pose_real,
+                            )
                         else:
                             resp = runtime.send_stream_pose(command_pose_real)
                         pose_ret = int(resp.get("servo_pose_ret", -1))
@@ -336,12 +418,10 @@ def run_session(
                 else:
                     if servo_active:
                         if hold_pose_real is None:
-                            hold_pose_real = runtime.get_live_tcp_pose().copy()
+                            _apply_live_pose_correction(now_ts)
+                            hold_pose_real = planned_pose_real.copy()
                             last_sent_pose_real = hold_pose_real.copy()
                             if config.state_mode == STATE_MODE_J6:
-                                live_joint6 = runtime.get_live_joint6()
-                                if live_joint6 is not None:
-                                    runtime.local_exec_joint6_rad = float(live_joint6)
                                 hold_joint6_rad = float(runtime.local_exec_joint6_rad)
                             else:
                                 hold_joint6_rad = None
@@ -365,6 +445,7 @@ def run_session(
             next_control_ts = float(next_control_ts + float(CONTROL_DT_S))
     finally:
         _stop_servo()
+        input_pump.stop()
         key_state.stop()
         term.close()
 

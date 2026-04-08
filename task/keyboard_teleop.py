@@ -23,12 +23,14 @@ from support.keyboard_control import (
 CONTROL_DT_S = 0.01
 RAW_RECORD_DT_S = 1.0 / 30.0
 UI_REFRESH_DT_S = 0.05
-IDLE_SERVO_STOP_S = 0.20
 TARGET_HORIZON_SCALE = 1.0
 MAX_LEAD_TICKS = 4.0
 DEFAULT_ROTATE_SPEED_DEGPS = 10.0
 DEFAULT_MOVE_STEP_M = 0.005
 DEFAULT_ROTATE_STEP_DEG = DEFAULT_ROTATE_SPEED_DEGPS * CONTROL_DT_S * TARGET_HORIZON_SCALE
+LINEAR_FILTER_TAU_S = 0.06
+ROTATE_FILTER_TAU_S = 0.06
+AXIS_EPS = 1e-3
 
 
 @dataclass(frozen=True)
@@ -73,8 +75,11 @@ def run_session(
     next_control_ts = time.monotonic()
     servo_active = False
     command_pose_real = runtime.get_live_tcp_pose()
-    last_motion_ts = time.monotonic()
     key_state = ContinuousKeyState()
+    linear_axis_cmd = np.zeros(3, dtype=np.float64)
+    rotate_axis_cmd = 0.0
+    preview_horizon_s = float(CONTROL_DT_S * float(MAX_LEAD_TICKS))
+    rotate_speed_radps = float(np.deg2rad(DEFAULT_ROTATE_SPEED_DEGPS))
 
     def _append_current_snapshot() -> None:
         nonlocal frame_idx, next_record_ts
@@ -225,27 +230,36 @@ def run_session(
                 if _handle_discrete_key(key):
                     continue
             move_x, move_y, move_z, rotate_axis = key_state.axes(now_ts)
-            move_axis = np.array([move_x, move_y, move_z], dtype=np.float64)
-            linear_norm = float(np.linalg.norm(move_axis))
-            has_linear = linear_norm > 1e-9
-            has_rotate = abs(rotate_axis) > 1e-9
+            desired_linear_axis = np.array([move_x, move_y, move_z], dtype=np.float64)
+            desired_rotate_axis = float(rotate_axis)
+            linear_alpha = float(1.0 - np.exp(-CONTROL_DT_S / LINEAR_FILTER_TAU_S))
+            rotate_alpha = float(1.0 - np.exp(-CONTROL_DT_S / ROTATE_FILTER_TAU_S))
+            linear_axis_cmd = linear_axis_cmd + (desired_linear_axis - linear_axis_cmd) * linear_alpha
+            rotate_axis_cmd = float(rotate_axis_cmd + (desired_rotate_axis - rotate_axis_cmd) * rotate_alpha)
+            linear_norm = float(np.linalg.norm(linear_axis_cmd))
+            has_linear = linear_norm > AXIS_EPS
+            has_rotate = abs(rotate_axis_cmd) > AXIS_EPS
 
             try:
                 if has_linear or has_rotate:
                     live_pose = runtime.get_live_tcp_pose()
                     if not runtime.dry_run:
                         _ensure_servo_active()
-                    if not servo_active:
-                        command_pose_real = live_pose.copy()
+                    command_pose_real = live_pose.copy()
                     if has_linear:
-                        move_axis = move_axis / linear_norm
-                        command_pose_real[:3] = command_pose_real[:3] + move_axis * float(move_step_m)
+                        move_dir = linear_axis_cmd / linear_norm
+                        command_pose_real[:3] = (
+                            command_pose_real[:3]
+                            + move_dir * float(runtime.linear_speed) * float(preview_horizon_s) * float(linear_norm)
+                        )
                     if has_rotate:
-                        rotate_delta_rad = float(np.deg2rad(rotate_step_deg * rotate_axis))
+                        rotate_delta_rad = float(rotate_speed_radps * rotate_axis_cmd * CONTROL_DT_S)
                         if config.state_mode == STATE_MODE_J6:
                             runtime.local_exec_joint6_rad = runtime.wrap_angle(runtime.local_exec_joint6_rad + rotate_delta_rad)
                         else:
-                            command_pose_real[5] = runtime.wrap_angle(float(command_pose_real[5] + rotate_delta_rad))
+                            command_pose_real[5] = runtime.wrap_angle(
+                                float(command_pose_real[5] + rotate_speed_radps * rotate_axis_cmd * preview_horizon_s)
+                            )
 
                     command_pose_real = _clip_command_pose(command_pose_real)
                     command_pose_real = _limit_pose_lead(command_pose_real, live_pose)
@@ -263,18 +277,33 @@ def run_session(
                             if live_joint6 is not None:
                                 runtime.local_exec_joint6_rad = float(live_joint6)
 
-                    last_motion_ts = now_ts
                     _maybe_record_active_tick(now_ts)
                     status_line = (
-                        f"Move dx={move_axis[0]*move_step_m*1000.0:+.1f}mm "
-                        f"dy={move_axis[1]*move_step_m*1000.0:+.1f}mm "
-                        f"dz={move_axis[2]*move_step_m*1000.0:+.1f}mm "
-                        f"rot={rotate_axis*rotate_step_deg:+.2f}deg"
+                        f"Move vx={linear_axis_cmd[0]*float(runtime.linear_speed)*1000.0:+.1f}mm/s "
+                        f"vy={linear_axis_cmd[1]*float(runtime.linear_speed)*1000.0:+.1f}mm/s "
+                        f"vz={linear_axis_cmd[2]*float(runtime.linear_speed)*1000.0:+.1f}mm/s "
+                        f"rot={rotate_axis_cmd*DEFAULT_ROTATE_SPEED_DEGPS:+.2f}deg/s"
                     )
                 else:
-                    if servo_active and (now_ts - last_motion_ts) >= float(IDLE_SERVO_STOP_S):
-                        _stop_servo()
-                        status_line = "Idle hold"
+                    if servo_active:
+                        live_pose = runtime.get_live_tcp_pose()
+                        command_pose_real = live_pose.copy()
+                        if config.state_mode == STATE_MODE_J6:
+                            live_joint6 = runtime.get_live_joint6()
+                            if live_joint6 is not None:
+                                runtime.local_exec_joint6_rad = float(live_joint6)
+                            resp = runtime.daemon.servo_pose_j6(command_pose_real, runtime.local_exec_joint6_rad)
+                        else:
+                            resp = runtime.daemon.servo_pose(command_pose_real)
+                            live_joint6 = runtime.get_live_joint6()
+                            if live_joint6 is not None:
+                                runtime.local_exec_joint6_rad = float(live_joint6)
+                        pose_ret = int(resp.get("servo_pose_ret", -1))
+                        if pose_ret != 0:
+                            raise RuntimeError(resp)
+                        status_line = "Holding current pose"
+                    else:
+                        status_line = "Idle. Waiting for input."
             except Exception as exc:
                 status_line = f"Command failed: {exc}"
                 _stop_servo()

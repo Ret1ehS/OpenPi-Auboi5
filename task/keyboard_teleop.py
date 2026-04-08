@@ -30,7 +30,10 @@ DEFAULT_MOVE_STEP_M = 0.005
 DEFAULT_ROTATE_STEP_DEG = DEFAULT_ROTATE_SPEED_DEGPS * CONTROL_DT_S * TARGET_HORIZON_SCALE
 LINEAR_FILTER_TAU_S = 0.02
 ROTATE_FILTER_TAU_S = 0.02
+LEAD_REFERENCE_TAU_S = 0.05
 AXIS_EPS = 1e-3
+POSE_SEND_DEADBAND_M = 0.0002
+POSE_SEND_DEADBAND_RAD = float(np.deg2rad(0.03))
 
 
 @dataclass(frozen=True)
@@ -75,6 +78,8 @@ def run_session(
     next_control_ts = time.monotonic()
     servo_active = False
     command_pose_real = runtime.get_live_tcp_pose()
+    lead_reference_pose_real = command_pose_real.copy()
+    last_sent_pose_real: np.ndarray | None = None
     hold_pose_real: np.ndarray | None = None
     hold_joint6_rad: float | None = None
     key_state = ContinuousKeyState()
@@ -97,18 +102,22 @@ def run_session(
         next_record_ts = time.monotonic() + float(RAW_RECORD_DT_S)
 
     def _ensure_servo_active() -> None:
-        nonlocal servo_active, command_pose_real
+        nonlocal servo_active, command_pose_real, lead_reference_pose_real, last_sent_pose_real
         if runtime.dry_run or servo_active:
             return
         command_pose_real = runtime.get_live_tcp_pose()
+        lead_reference_pose_real = command_pose_real.copy()
+        last_sent_pose_real = None
         runtime.begin_stream_servo(command_pose_real)
         servo_active = True
 
     def _stop_servo() -> None:
-        nonlocal servo_active, command_pose_real, hold_pose_real, hold_joint6_rad
+        nonlocal servo_active, command_pose_real, lead_reference_pose_real, last_sent_pose_real, hold_pose_real, hold_joint6_rad
         if runtime.dry_run:
             servo_active = False
             command_pose_real = runtime.get_live_tcp_pose()
+            lead_reference_pose_real = command_pose_real.copy()
+            last_sent_pose_real = None
             hold_pose_real = None
             hold_joint6_rad = None
             return
@@ -119,6 +128,8 @@ def run_session(
                 pass
         servo_active = False
         command_pose_real = runtime.get_live_tcp_pose()
+        lead_reference_pose_real = command_pose_real.copy()
+        last_sent_pose_real = None
         hold_pose_real = None
         hold_joint6_rad = None
         live_joint6 = runtime.get_live_joint6()
@@ -148,6 +159,20 @@ def run_session(
         if abs(yaw_err) > float(max_yaw_lead_rad):
             limited[5] = runtime.wrap_angle(float(live[5] + np.sign(yaw_err) * max_yaw_lead_rad))
         return _clip_command_pose(limited)
+
+    def _apply_pose_deadband(candidate_pose: np.ndarray) -> np.ndarray:
+        nonlocal last_sent_pose_real
+        pose = np.asarray(candidate_pose, dtype=np.float64).reshape(6).copy()
+        if last_sent_pose_real is None:
+            last_sent_pose_real = pose.copy()
+            return pose
+        prev = np.asarray(last_sent_pose_real, dtype=np.float64).reshape(6)
+        pos_delta = float(np.linalg.norm(pose[:3] - prev[:3]))
+        ang_delta = np.arctan2(np.sin(pose[3:] - prev[3:]), np.cos(pose[3:] - prev[3:]))
+        if pos_delta < float(POSE_SEND_DEADBAND_M) and float(np.linalg.norm(ang_delta)) < float(POSE_SEND_DEADBAND_RAD):
+            return prev.copy()
+        last_sent_pose_real = pose.copy()
+        return pose
 
     def _handle_discrete_key(key: str) -> bool:
         nonlocal recording, recorded_frames, frame_idx, saved_episode_count, status_line, local_gripper_open, next_record_ts
@@ -257,15 +282,24 @@ def run_session(
                             command_pose_real[:3]
                             + move_dir * float(runtime.linear_speed) * float(CONTROL_DT_S) * float(linear_norm)
                         )
+                        lead_alpha = float(1.0 - np.exp(-CONTROL_DT_S / LEAD_REFERENCE_TAU_S))
+                        lead_reference_pose_real[:3] = (
+                            lead_reference_pose_real[:3]
+                            + (live_pose[:3] - lead_reference_pose_real[:3]) * lead_alpha
+                        )
+                    else:
+                        lead_reference_pose_real[:3] = live_pose[:3]
                     if has_rotate:
                         rotate_delta_rad = float(rotate_speed_radps * rotate_axis_cmd * CONTROL_DT_S)
                         if config.state_mode == STATE_MODE_J6:
                             runtime.local_exec_joint6_rad = runtime.wrap_angle(runtime.local_exec_joint6_rad + rotate_delta_rad)
                         else:
                             command_pose_real[5] = runtime.wrap_angle(float(command_pose_real[5] + rotate_delta_rad))
+                    lead_reference_pose_real[3:] = live_pose[3:]
 
                     command_pose_real = _clip_command_pose(command_pose_real)
-                    command_pose_real = _limit_pose_lead(command_pose_real, live_pose)
+                    command_pose_real = _limit_pose_lead(command_pose_real, lead_reference_pose_real)
+                    command_pose_real = _apply_pose_deadband(command_pose_real)
 
                     if not runtime.dry_run:
                         if config.state_mode == STATE_MODE_J6 and has_rotate and not has_linear:
@@ -303,6 +337,7 @@ def run_session(
                     if servo_active:
                         if hold_pose_real is None:
                             hold_pose_real = runtime.get_live_tcp_pose().copy()
+                            last_sent_pose_real = hold_pose_real.copy()
                             if config.state_mode == STATE_MODE_J6:
                                 live_joint6 = runtime.get_live_joint6()
                                 if live_joint6 is not None:

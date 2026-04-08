@@ -997,106 +997,170 @@ bool solve_pose_full_ik_soft_j6_target(RobotAlgorithmPtr algo,
         return false;
     }
 
-    std::vector<std::vector<double>> candidate_seeds;
-    candidate_seeds.push_back(seed_q);
-
-    const std::array<double, 7> q6_offsets = {
-        0.0,
-        kPi / 2.0,
-        -kPi / 2.0,
-        kPi,
-        -kPi,
-        3.0 * kPi / 2.0,
-        -3.0 * kPi / 2.0,
-    };
-    for (double offset : q6_offsets) {
-        std::vector<double> candidate = seed_q;
-        candidate[5] = target_joint6 + offset;
-        bool duplicate = false;
-        for (const auto &existing : candidate_seeds) {
-            if (existing.size() == 6 &&
-                std::abs(wrap_angle(existing[5] - candidate[5])) < 1e-9) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (!duplicate) {
-            candidate_seeds.push_back(candidate);
-        }
-    }
-
-    bool found = false;
-    double best_score = std::numeric_limits<double>::infinity();
-    int first_ik_ret = -1;
-    std::string last_error = "ik_fail";
-    std::vector<double> best_target_q;
-    std::vector<double> best_fk_pose;
-
-    for (const auto &candidate_seed : candidate_seeds) {
-        auto ik_result = algo->inverseKinematics(candidate_seed, target_pose);
-        auto candidate_q = std::get<0>(ik_result);
-        const int candidate_ik_ret = std::get<1>(ik_result);
-        if (candidate_ik_ret != 0 || candidate_q.size() != 6) {
-            if (first_ik_ret == -1) {
-                first_ik_ret = candidate_ik_ret;
-            }
-            continue;
-        }
-
-        auto fk_result = algo->forwardKinematics(candidate_q);
-        auto candidate_fk = std::get<0>(fk_result);
-        const int fk_ret = std::get<1>(fk_result);
-        if (fk_ret != 0 || candidate_fk.size() != 6) {
-            last_error = "target_fk_fail";
-            if (first_ik_ret == -1) {
-                first_ik_ret = fk_ret;
-            }
-            continue;
-        }
-
-        const double q6_err = std::abs(wrap_angle(candidate_q[5] - target_joint6));
-        double joint_delta_norm_sq = 0.0;
-        for (size_t idx = 0; idx < 6; ++idx) {
-            const double dq = wrap_angle(candidate_q[idx] - seed_q[idx]);
-            joint_delta_norm_sq += dq * dq;
-        }
-        const double joint_delta_norm = std::sqrt(joint_delta_norm_sq);
-
-        double pose_pos_err_sq = 0.0;
-        for (int idx = 0; idx < 3; ++idx) {
-            const double d = candidate_fk[idx] - target_pose[idx];
-            pose_pos_err_sq += d * d;
-        }
-        const double pose_pos_err = std::sqrt(pose_pos_err_sq);
-        double pose_ang_err_sq = 0.0;
-        for (int idx = 3; idx < 6; ++idx) {
-            const double d = wrap_angle(candidate_fk[idx] - target_pose[idx]);
-            pose_ang_err_sq += d * d;
-        }
-        const double pose_ang_err = std::sqrt(pose_ang_err_sq);
-
-        const double score =
-            500.0 * pose_pos_err +
-            50.0 * pose_ang_err +
-            1.0 * q6_err +
-            0.02 * joint_delta_norm;
-
-        if (score < best_score) {
-            best_score = score;
-            best_target_q = candidate_q;
-            best_fk_pose = candidate_fk;
-            found = true;
-        }
-    }
-
-    if (!found) {
-        ik_ret = first_ik_ret;
-        error = last_error;
+    auto fk_result = algo->forwardKinematics(seed_q);
+    const auto current_pose = std::get<0>(fk_result);
+    const int fk_ret = std::get<1>(fk_result);
+    if (fk_ret != 0 || current_pose.size() != 6) {
+        ik_ret = fk_ret;
+        error = "fk_fail";
         return false;
     }
 
-    target_q = best_target_q;
-    fk_pose = best_fk_pose;
+    auto jac_result = algo->calcJacobian(seed_q, true);
+    const auto jac_flat = std::get<0>(jac_result);
+    ik_ret = std::get<1>(jac_result);
+    if (ik_ret != 0 || jac_flat.size() != 36) {
+        error = "jacobian_fail";
+        return false;
+    }
+
+    std::array<std::array<double, 6>, 6> jacobian{};
+    for (int r = 0; r < 6; ++r) {
+        for (int c = 0; c < 6; ++c) {
+            jacobian[r][c] = jac_flat[r * 6 + c];
+        }
+    }
+
+    std::array<double, 5> hard_rhs{};
+    hard_rhs[0] = target_pose[0] - current_pose[0];
+    hard_rhs[1] = target_pose[1] - current_pose[1];
+    hard_rhs[2] = target_pose[2] - current_pose[2];
+    hard_rhs[3] = wrap_angle(target_pose[3] - current_pose[3]);
+    hard_rhs[4] = wrap_angle(target_pose[4] - current_pose[4]);
+    const double yaw_rhs = wrap_angle(target_pose[5] - current_pose[5]);
+    const double q6_rhs = wrap_angle(target_joint6 - seed_q[5]);
+
+    std::vector<std::vector<double>> normal(6, std::vector<double>(6, 0.0));
+    std::vector<double> rhs_normal(6, 0.0);
+    constexpr double lambda = 1e-4;
+    for (int r = 0; r < 5; ++r) {
+        for (int i = 0; i < 6; ++i) {
+            rhs_normal[i] += jacobian[r][i] * hard_rhs[r];
+            for (int j = 0; j < 6; ++j) {
+                normal[i][j] += jacobian[r][i] * jacobian[r][j];
+            }
+        }
+    }
+    for (int i = 0; i < 6; ++i) {
+        normal[i][i] += lambda * lambda;
+    }
+
+    std::vector<double> dq_hard;
+    if (!solve_linear_system(normal, rhs_normal, dq_hard) || dq_hard.size() != 6) {
+        error = "hard_linear_solve_fail";
+        return false;
+    }
+
+    std::vector<double> null_dir;
+    bool null_found = false;
+    for (int free_idx = 0; free_idx < 6; ++free_idx) {
+        std::vector<int> cols;
+        cols.reserve(5);
+        for (int c = 0; c < 6; ++c) {
+            if (c != free_idx) {
+                cols.push_back(c);
+            }
+        }
+        std::vector<std::vector<double>> a5(5, std::vector<double>(5, 0.0));
+        std::vector<double> b5(5, 0.0);
+        for (int r = 0; r < 5; ++r) {
+            for (int k = 0; k < 5; ++k) {
+                a5[r][k] = jacobian[r][cols[k]];
+            }
+            b5[r] = -jacobian[r][free_idx];
+        }
+        std::vector<double> x5;
+        if (!solve_linear_system(a5, b5, x5) || x5.size() != 5) {
+            continue;
+        }
+        std::vector<double> candidate(6, 0.0);
+        candidate[free_idx] = 1.0;
+        for (int k = 0; k < 5; ++k) {
+            candidate[cols[k]] = x5[k];
+        }
+        double norm_sq = 0.0;
+        for (double v : candidate) {
+            norm_sq += v * v;
+        }
+        if (norm_sq <= 1e-12) {
+            continue;
+        }
+        const double inv_norm = 1.0 / std::sqrt(norm_sq);
+        for (double &v : candidate) {
+            v *= inv_norm;
+        }
+        null_dir = candidate;
+        null_found = true;
+        break;
+    }
+
+    if (!null_found || null_dir.size() != 6) {
+        error = "nullspace_fail";
+        return false;
+    }
+
+    const double yaw_after_hard =
+        jacobian[5][0] * dq_hard[0] +
+        jacobian[5][1] * dq_hard[1] +
+        jacobian[5][2] * dq_hard[2] +
+        jacobian[5][3] * dq_hard[3] +
+        jacobian[5][4] * dq_hard[4] +
+        jacobian[5][5] * dq_hard[5];
+    const double yaw_residual = yaw_rhs - yaw_after_hard;
+    const double q6_residual = q6_rhs - dq_hard[5];
+
+    const double yaw_null =
+        jacobian[5][0] * null_dir[0] +
+        jacobian[5][1] * null_dir[1] +
+        jacobian[5][2] * null_dir[2] +
+        jacobian[5][3] * null_dir[3] +
+        jacobian[5][4] * null_dir[4] +
+        jacobian[5][5] * null_dir[5];
+    const double q6_null = null_dir[5];
+
+    constexpr double yaw_weight = 1.0;
+    constexpr double q6_weight = 1.0;
+    constexpr double alpha_reg = 1e-4;
+    const double alpha_num =
+        yaw_weight * yaw_residual * yaw_null +
+        q6_weight * q6_residual * q6_null;
+    const double alpha_den =
+        yaw_weight * yaw_null * yaw_null +
+        q6_weight * q6_null * q6_null +
+        alpha_reg;
+    const double alpha = alpha_num / alpha_den;
+
+    std::vector<double> dq = dq_hard;
+    for (int i = 0; i < 6; ++i) {
+        dq[i] += alpha * null_dir[i];
+    }
+
+    constexpr double max_joint_step = 0.08;
+    double max_abs_delta = 0.0;
+    for (double value : dq) {
+        max_abs_delta = std::max(max_abs_delta, std::abs(value));
+    }
+    if (max_abs_delta > max_joint_step) {
+        const double scale = max_joint_step / max_abs_delta;
+        for (double &value : dq) {
+            value *= scale;
+        }
+    }
+
+    target_q = seed_q;
+    for (int idx = 0; idx < 6; ++idx) {
+        target_q[idx] += dq[idx];
+    }
+
+    auto target_fk = algo->forwardKinematics(target_q);
+    fk_pose = std::get<0>(target_fk);
+    const int target_fk_ret = std::get<1>(target_fk);
+    if (target_fk_ret != 0 || fk_pose.size() != 6) {
+        ik_ret = target_fk_ret;
+        error = "target_fk_fail";
+        return false;
+    }
+
     ik_ret = 0;
     return true;
 }

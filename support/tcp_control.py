@@ -45,7 +45,6 @@ DEFAULT_SDK_ROOT = "/home/orin/openpi/aubo_sdk/aubo_sdk-0.24.1-rc.3-Linux_aarch6
 DEFAULT_HELPER_BIN = "/home/orin/openpi/scripts/.build/tcp_control_helper"
 DEFAULT_HELPER_LOG_DIR = Path(__file__).resolve().parent.parent / "log"
 DEFAULT_HELPER_LOG_FILE = DEFAULT_HELPER_LOG_DIR / "tcp_control_helper.log"
-DEFAULT_SNAPSHOT_HELPER_LOG_FILE = DEFAULT_HELPER_LOG_DIR / "tcp_control_snapshot.log"
 
 DEFAULT_ROBOT_IP = "192.168.1.100"
 DEFAULT_PORT = 30004
@@ -978,7 +977,7 @@ def _get_snapshot_daemon() -> _DaemonHelper:
     if _snapshot_daemon is None:
         with _daemon_lock:
             if _snapshot_daemon is None:
-                _snapshot_daemon = _DaemonHelper(log_file=DEFAULT_SNAPSHOT_HELPER_LOG_FILE)
+                _snapshot_daemon = _DaemonHelper(log_file="")
     return _snapshot_daemon
 
 

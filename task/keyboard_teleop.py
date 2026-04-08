@@ -33,10 +33,6 @@ LINEAR_FILTER_TAU_S = 0.02
 ROTATE_FILTER_TAU_S = 0.02
 AXIS_EPS = 1e-3
 INPUT_POLL_DT_S = 0.002
-LIVE_POSE_SAMPLE_DT_S = 0.02
-POSE_CORRECTION_TAU_S = 0.12
-POSE_CORRECTION_DEADBAND_M = 0.0015
-POSE_CORRECTION_DEADBAND_RAD = float(np.deg2rad(0.25))
 LOOKAHEAD_TIME_S = 0.04
 POSE_SEND_DEADBAND_M = 0.00035
 POSE_SEND_DEADBAND_RAD = float(np.deg2rad(0.06))
@@ -122,11 +118,9 @@ def run_session(
     servo_active = False
     command_pose_real = runtime.get_live_tcp_pose()
     planned_pose_real = command_pose_real.copy()
-    live_correction_pose_real = command_pose_real.copy()
     last_sent_pose_real: np.ndarray | None = None
     hold_pose_real: np.ndarray | None = None
     hold_joint6_rad: float | None = None
-    last_live_sample_ts = 0.0
     key_state = ContinuousKeyState()
     linear_axis_cmd = np.zeros(3, dtype=np.float64)
     rotate_axis_cmd = 0.0
@@ -147,32 +141,28 @@ def run_session(
         next_record_ts = time.monotonic() + float(RAW_RECORD_DT_S)
 
     def _ensure_servo_active() -> None:
-        nonlocal servo_active, command_pose_real, planned_pose_real, live_correction_pose_real
-        nonlocal last_sent_pose_real, hold_pose_real, hold_joint6_rad, last_live_sample_ts
+        nonlocal servo_active, command_pose_real, planned_pose_real
+        nonlocal last_sent_pose_real, hold_pose_real, hold_joint6_rad
         if runtime.dry_run or servo_active:
             return
         command_pose_real = runtime.get_live_tcp_pose()
         planned_pose_real = command_pose_real.copy()
-        live_correction_pose_real = command_pose_real.copy()
         last_sent_pose_real = None
         hold_pose_real = None
         hold_joint6_rad = None
-        last_live_sample_ts = 0.0
         runtime.begin_stream_servo(command_pose_real)
         servo_active = True
 
     def _stop_servo() -> None:
-        nonlocal servo_active, command_pose_real, planned_pose_real, live_correction_pose_real
-        nonlocal last_sent_pose_real, hold_pose_real, hold_joint6_rad, last_live_sample_ts
+        nonlocal servo_active, command_pose_real, planned_pose_real
+        nonlocal last_sent_pose_real, hold_pose_real, hold_joint6_rad
         if runtime.dry_run:
             servo_active = False
             command_pose_real = runtime.get_live_tcp_pose()
             planned_pose_real = command_pose_real.copy()
-            live_correction_pose_real = command_pose_real.copy()
             last_sent_pose_real = None
             hold_pose_real = None
             hold_joint6_rad = None
-            last_live_sample_ts = 0.0
             return
         if servo_active:
             try:
@@ -182,11 +172,9 @@ def run_session(
         servo_active = False
         command_pose_real = runtime.get_live_tcp_pose()
         planned_pose_real = command_pose_real.copy()
-        live_correction_pose_real = command_pose_real.copy()
         last_sent_pose_real = None
         hold_pose_real = None
         hold_joint6_rad = None
-        last_live_sample_ts = 0.0
         live_joint6 = runtime.get_live_joint6()
         if live_joint6 is not None:
             runtime.local_exec_joint6_rad = float(live_joint6)
@@ -202,31 +190,6 @@ def run_session(
         pose[2] = max(float(runtime.min_tcp_z), float(pose[2]))
         pose[5] = runtime.wrap_angle(float(pose[5]))
         return pose
-
-    def _sample_live_pose(now_ts: float) -> np.ndarray | None:
-        nonlocal last_live_sample_ts, live_correction_pose_real
-        if runtime.dry_run:
-            return live_correction_pose_real.copy()
-        if last_live_sample_ts > 0.0 and (now_ts - last_live_sample_ts) < float(LIVE_POSE_SAMPLE_DT_S):
-            return None
-        live_pose = runtime.get_live_tcp_pose()
-        last_live_sample_ts = now_ts
-        live_correction_pose_real = np.asarray(live_pose, dtype=np.float64).reshape(6).copy()
-        return live_correction_pose_real.copy()
-
-    def _apply_live_pose_correction(now_ts: float) -> None:
-        nonlocal planned_pose_real
-        live_pose = _sample_live_pose(now_ts)
-        if live_pose is None:
-            return
-        correction_alpha = float(1.0 - np.exp(-CONTROL_DT_S / POSE_CORRECTION_TAU_S))
-        pos_err = live_pose[:3] - planned_pose_real[:3]
-        if float(np.linalg.norm(pos_err)) >= float(POSE_CORRECTION_DEADBAND_M):
-            planned_pose_real[:3] = planned_pose_real[:3] + pos_err * correction_alpha
-        yaw_err = runtime.wrap_angle(float(live_pose[5] - planned_pose_real[5]))
-        if abs(yaw_err) >= float(POSE_CORRECTION_DEADBAND_RAD):
-            planned_pose_real[5] = runtime.wrap_angle(float(planned_pose_real[5] + yaw_err * correction_alpha))
-        planned_pose_real = _clip_command_pose(planned_pose_real)
 
     def _build_lookahead_pose(
         linear_velocity_xyz: np.ndarray,
@@ -351,12 +314,10 @@ def run_session(
                     if not servo_active:
                         command_pose_real = runtime.get_live_tcp_pose()
                         planned_pose_real = command_pose_real.copy()
-                        live_correction_pose_real = command_pose_real.copy()
                     if not runtime.dry_run:
                         _ensure_servo_active()
                     hold_pose_real = None
                     hold_joint6_rad = None
-                    _apply_live_pose_correction(now_ts)
                     linear_velocity_xyz = np.zeros(3, dtype=np.float64)
                     yaw_velocity_radps = 0.0
                     if has_linear:
@@ -418,7 +379,6 @@ def run_session(
                 else:
                     if servo_active:
                         if hold_pose_real is None:
-                            _apply_live_pose_correction(now_ts)
                             hold_pose_real = planned_pose_real.copy()
                             last_sent_pose_real = hold_pose_real.copy()
                             if config.state_mode == STATE_MODE_J6:

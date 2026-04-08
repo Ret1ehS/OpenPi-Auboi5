@@ -32,7 +32,6 @@ DEFAULT_ROTATE_STEP_DEG = DEFAULT_ROTATE_SPEED_DEGPS * CONTROL_DT_S * TARGET_HOR
 AXIS_EPS = 1e-3
 INPUT_POLL_DT_S = 0.002
 LOOKAHEAD_TIME_S = 0.04
-INITIAL_REPEAT_LATCH_S = 0.30
 POSE_SEND_DEADBAND_M = 0.00035
 POSE_SEND_DEADBAND_RAD = float(np.deg2rad(0.06))
 
@@ -127,7 +126,7 @@ def run_session(
     raw_motion_active_prev = False
     latched_linear_axis = np.zeros(3, dtype=np.float64)
     latched_rotate_axis = 0.0
-    repeat_latch_deadline = 0.0
+    repeat_latch_waiting_repeat = False
 
     def _append_current_snapshot() -> None:
         nonlocal frame_idx, next_record_ts
@@ -312,19 +311,19 @@ def run_session(
                 if raw_motion_active and not raw_motion_active_prev:
                     latched_linear_axis = raw_linear_axis.copy()
                     latched_rotate_axis = float(raw_rotate_axis)
-                    repeat_latch_deadline = now_ts + float(INITIAL_REPEAT_LATCH_S)
+                    repeat_latch_waiting_repeat = True
                 elif raw_motion_active:
                     latched_linear_axis = raw_linear_axis.copy()
                     latched_rotate_axis = float(raw_rotate_axis)
-                    repeat_latch_deadline = 0.0
-                elif repeat_latch_deadline > now_ts:
+                    repeat_latch_waiting_repeat = False
+                elif repeat_latch_waiting_repeat:
                     raw_linear_axis = latched_linear_axis.copy()
                     raw_rotate_axis = float(latched_rotate_axis)
                     raw_motion_active = True
                 else:
                     latched_linear_axis = np.zeros(3, dtype=np.float64)
                     latched_rotate_axis = 0.0
-                    repeat_latch_deadline = 0.0
+                    repeat_latch_waiting_repeat = False
             raw_motion_active_prev = bool(raw_motion_active)
 
             linear_axis_cmd = raw_linear_axis

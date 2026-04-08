@@ -173,6 +173,16 @@ def _wrap_angle(angle: float) -> float:
     return float(np.arctan2(np.sin(angle), np.cos(angle)))
 
 
+def _require_joint6_readback(joint_q: np.ndarray, *, context: str) -> float:
+    joint_q_arr = np.asarray(joint_q, dtype=np.float64).reshape(-1)
+    if joint_q_arr.size < 6:
+        raise RuntimeError(
+            f"{context}: robot snapshot missing joint6 readback "
+            f"(joint_q size={joint_q_arr.size})"
+        )
+    return float(joint_q_arr[5])
+
+
 def _normalize_state_mode(state_mode: str) -> str:
     mode = str(state_mode).strip().lower()
     if mode not in (STATE_MODE_YAW, STATE_MODE_J6):
@@ -641,7 +651,7 @@ def _execute_servo_segment(
     start_snap = get_robot_snapshot()
     start_real = np.asarray(start_snap.tcp_pose, dtype=np.float64).reshape(6).copy()
     start_joint_q = np.asarray(start_snap.joint_q, dtype=np.float64).reshape(-1)
-    start_joint6 = float(start_joint_q[5]) if start_joint_q.size >= 6 else float(target_joint6 or DEFAULT_J6_HOME_RAD)
+    start_joint6 = _require_joint6_readback(start_joint_q, context=f"{label} start snapshot")
     pose_targets, joint_targets = _build_servo_pose_targets(
         start_real,
         target_real,
@@ -668,7 +678,10 @@ def _execute_servo_segment(
             return
         actual_real = np.asarray(snap.tcp_pose, dtype=np.float64).reshape(6).copy()
         joint_q = np.asarray(snap.joint_q, dtype=np.float64).reshape(-1)
-        actual_joint6 = float(joint_q[5]) if joint_q.size >= 6 else float(current_semantic_joint6)
+        actual_joint6 = _require_joint6_readback(
+            joint_q,
+            context=f"{label} record snapshot frame_idx={frame_idx}",
+        )
         frames.append(
             _capture_recorded_frame(
                 cameras,
@@ -717,7 +730,10 @@ def _execute_servo_segment(
             snap = get_robot_snapshot()
             actual_real = np.asarray(snap.tcp_pose, dtype=np.float64).reshape(6).copy()
             joint_q = np.asarray(snap.joint_q, dtype=np.float64).reshape(-1)
-            actual_joint6 = float(joint_q[5]) if joint_q.size >= 6 else float(current_semantic_joint6)
+            actual_joint6 = _require_joint6_readback(
+                joint_q,
+                context=f"{label} final hold snapshot",
+            )
             joint6_ok = (
                 target_joint6 is None
                 or abs(_wrap_angle(actual_joint6 - float(target_joint6))) <= DEFAULT_J6_EXEC_TOL_RAD
@@ -915,7 +931,10 @@ def capture_manual_snapshot(
     snap = get_robot_snapshot()
     actual_real = np.asarray(snap.tcp_pose, dtype=np.float64).reshape(6).copy()
     joint_q = np.asarray(snap.joint_q, dtype=np.float64).reshape(-1)
-    readback_joint6 = float(joint_q[5]) if joint_q.size >= 6 else float(semantic_joint6)
+    readback_joint6 = _require_joint6_readback(
+        joint_q,
+        context=f"manual snapshot frame_idx={frame_idx}",
+    )
     return _capture_recorded_frame(
         cameras,
         actual_real,

@@ -70,6 +70,7 @@ def run_session(
     status_line = "Ready. Enter starts recording. Idle periods are not recorded."
     next_ui_refresh_ts = 0.0
     next_record_ts = 0.0
+    next_control_ts = time.monotonic()
     servo_active = False
     command_pose_real = runtime.get_live_tcp_pose()
     last_motion_ts = time.monotonic()
@@ -194,6 +195,12 @@ def run_session(
             raise RuntimeError("continuous keyboard teleop backend unavailable")
         while True:
             now_ts = time.monotonic()
+            sleep_s = float(next_control_ts - now_ts)
+            if sleep_s > 0.0:
+                time.sleep(sleep_s)
+                now_ts = time.monotonic()
+            else:
+                next_control_ts = now_ts
             if now_ts >= next_ui_refresh_ts:
                 print(
                     render_keyboard_ui(
@@ -268,10 +275,10 @@ def run_session(
                     if servo_active and (now_ts - last_motion_ts) >= float(IDLE_SERVO_STOP_S):
                         _stop_servo()
                         status_line = "Idle hold"
-                    time.sleep(float(CONTROL_DT_S))
             except Exception as exc:
                 status_line = f"Command failed: {exc}"
                 _stop_servo()
+            next_control_ts = float(next_control_ts + float(CONTROL_DT_S))
     finally:
         _stop_servo()
         key_state.stop()

@@ -1182,39 +1182,43 @@ def execute_step_sequence(
     frames: list[Any] = []
     frame_idx = 0
     held_object: str | None = initial_held_object
-    for step in steps:
-        if step.kind == "pick":
-            if held_object is not None:
-                raise RuntimeError(f"cannot pick {step.object_name} while holding {held_object}")
-            step_frames, frame_idx = execute_pick_step(
-                runtime,
-                step,
-                record=record,
-                frame_idx=frame_idx,
-                lookup_scene_state=lookup_state,
-            )
-            frames.extend(step_frames)
-            scene_detach_top(execution_state, step.object_name)
-            held_object = step.object_name
-            runtime.runtime_held_object = held_object
-        elif step.kind == "place":
-            if held_object != step.object_name:
-                raise RuntimeError(
-                    f"cannot place {step.object_name}: currently holding {held_object!r}"
+    runtime.begin_task_servo()
+    try:
+        for step in steps:
+            if step.kind == "pick":
+                if held_object is not None:
+                    raise RuntimeError(f"cannot pick {step.object_name} while holding {held_object}")
+                step_frames, frame_idx = execute_pick_step(
+                    runtime,
+                    step,
+                    record=record,
+                    frame_idx=frame_idx,
+                    lookup_scene_state=lookup_state,
                 )
-            step_frames, frame_idx = execute_place_step(
-                runtime,
-                step,
-                record=record,
-                frame_idx=frame_idx,
-                lookup_scene_state=lookup_state,
-                result_scene_state=execution_state,
-            )
-            frames.extend(step_frames)
-            held_object = None
-            runtime.runtime_held_object = None
-        else:
-            raise RuntimeError(f"unknown step kind: {step.kind}")
+                frames.extend(step_frames)
+                scene_detach_top(execution_state, step.object_name)
+                held_object = step.object_name
+                runtime.runtime_held_object = held_object
+            elif step.kind == "place":
+                if held_object != step.object_name:
+                    raise RuntimeError(
+                        f"cannot place {step.object_name}: currently holding {held_object!r}"
+                    )
+                step_frames, frame_idx = execute_place_step(
+                    runtime,
+                    step,
+                    record=record,
+                    frame_idx=frame_idx,
+                    lookup_scene_state=lookup_state,
+                    result_scene_state=execution_state,
+                )
+                frames.extend(step_frames)
+                held_object = None
+                runtime.runtime_held_object = None
+            else:
+                raise RuntimeError(f"unknown step kind: {step.kind}")
+    finally:
+        runtime.end_task_servo()
     return frames, held_object
 
 

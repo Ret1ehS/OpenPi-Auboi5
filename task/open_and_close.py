@@ -491,15 +491,19 @@ def execute_move_step_sequence(
 ):
     frames: list[Any] = []
     frame_idx = 0
-    for step in steps:
-        step_frames, frame_idx = execute_move_step(
-            runtime,
-            step,
-            record=record,
-            frame_idx=frame_idx,
-            base_pose6=base_pose6,
-        )
-        frames.extend(step_frames)
+    runtime.begin_task_servo()
+    try:
+        for step in steps:
+            step_frames, frame_idx = execute_move_step(
+                runtime,
+                step,
+                record=record,
+                frame_idx=frame_idx,
+                base_pose6=base_pose6,
+            )
+            frames.extend(step_frames)
+    finally:
+        runtime.end_task_servo()
     return frames
 
 

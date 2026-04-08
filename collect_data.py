@@ -644,6 +644,7 @@ def _execute_servo_segment(
     target_joint6: float | None = None,
     semantic_joint6: float | None = None,
     force_live_mode: bool = True,
+    reuse_servo: bool = False,
 ) -> list["RecordedFrame"]:
     from support.tcp_control import get_robot_snapshot
 
@@ -702,10 +703,11 @@ def _execute_servo_segment(
         return daemon.servo_pose_j6(pose_cmd, joint6_cmd)
 
     try:
-        start_resp = daemon.servo_start(SERVO_CONTROL_DT)
-        servo_started = True
-        if int(start_resp.get("servo_start_ret", -1)) != 0:
-            raise RuntimeError(f"{label} servo_start failed: {start_resp}")
+        if not reuse_servo:
+            start_resp = daemon.servo_start(SERVO_CONTROL_DT)
+            servo_started = True
+            if int(start_resp.get("servo_start_ret", -1)) != 0:
+                raise RuntimeError(f"{label} servo_start failed: {start_resp}")
 
         begin_resp = daemon.servo_begin_chunk(start_real, force_live_mode=force_live_mode)
         if require_force_guard and begin_resp.get("force_guard_fz_n") is None:
@@ -791,6 +793,7 @@ def execute_movel_and_wait(
     target_joint6: float | None = None,
     timeout_s: float = DEFAULT_ASYNC_MOVE_TIMEOUT_S,
     force_live_mode: bool = True,
+    reuse_servo: bool = False,
 ) -> dict[str, object]:
     _execute_servo_segment(
         daemon,
@@ -801,6 +804,7 @@ def execute_movel_and_wait(
         target_joint6=target_joint6,
         timeout_s=timeout_s,
         force_live_mode=force_live_mode,
+        reuse_servo=reuse_servo,
     )
     return {"servo_execute": "ok"}
 
@@ -849,6 +853,7 @@ def execute_and_record(
     semantic_joint6: float | None = None,
     force_live_mode: bool = True,
     record: bool = True,
+    reuse_servo: bool = False,
 ) -> list[RecordedFrame]:
     """Execute one servo segment at 100Hz and record executed state at 30Hz."""
     return _execute_servo_segment(
@@ -864,10 +869,12 @@ def execute_and_record(
         target_joint6=target_joint6,
         semantic_joint6=semantic_joint6,
         force_live_mode=force_live_mode,
+        reuse_servo=reuse_servo,
     )
 
 
 def execute_joint6_rotation_and_record(
+    daemon,
     cameras: CameraPair,
     target_joint6: float,
     start_joint6: float,
@@ -877,13 +884,14 @@ def execute_joint6_rotation_and_record(
     speed_deg: float = DEFAULT_J6_MOVE_SPEED_DEG,
     acc_deg: float = DEFAULT_J6_MOVE_ACC_DEG,
     timeout_s: float = DEFAULT_ASYNC_MOVE_TIMEOUT_S,
+    reuse_servo: bool = False,
 ) -> list[RecordedFrame]:
     """Rotate joint6 in servo mode and record real observations at 30Hz."""
-    from support.tcp_control import _get_motion_daemon, get_robot_snapshot
+    from support.tcp_control import get_robot_snapshot
 
     start_pose = np.asarray(get_robot_snapshot().tcp_pose, dtype=np.float64).reshape(6).copy()
     return _execute_servo_segment(
-        _get_motion_daemon(),
+        daemon,
         start_pose,
         label=f"joint6 servo rotation @ frame {start_frame_idx}",
         speed_mps=LINEAR_SPEED,
@@ -895,27 +903,31 @@ def execute_joint6_rotation_and_record(
         target_joint6=float(target_joint6),
         semantic_joint6=float(start_joint6),
         force_live_mode=False,
+        reuse_servo=reuse_servo,
     )
 
 
 def execute_joint6_rotation(
+    daemon,
     target_joint6: float,
     *,
     speed_deg: float = DEFAULT_J6_MOVE_SPEED_DEG,
     acc_deg: float = DEFAULT_J6_MOVE_ACC_DEG,
+    reuse_servo: bool = False,
 ) -> None:
     """Rotate joint6 in servo mode without recording."""
-    from support.tcp_control import _get_motion_daemon, get_robot_snapshot
+    from support.tcp_control import get_robot_snapshot
 
     current_pose = np.asarray(get_robot_snapshot().tcp_pose, dtype=np.float64).reshape(6).copy()
     _execute_servo_segment(
-        _get_motion_daemon(),
+        daemon,
         current_pose,
         label=f"joint6 servo rotation to {float(target_joint6):.6f}rad",
         speed_mps=LINEAR_SPEED,
         record=False,
         target_joint6=float(target_joint6),
         force_live_mode=False,
+        reuse_servo=reuse_servo,
     )
 
 
@@ -1169,6 +1181,7 @@ class CollectTaskRuntime:
     default_j6_exec_tol_rad: float = DEFAULT_J6_EXEC_TOL_RAD
     cleanup_scene_state: dict[str, dict[str, object]] | None = None
     runtime_held_object: str | None = None
+    held_servo_depth: int = 0
 
     def wrap_angle(self, angle: float) -> float:
         return _wrap_angle(angle)
@@ -1220,6 +1233,26 @@ class CollectTaskRuntime:
         if self.dry_run:
             return
         self.daemon.servo_stop()
+
+    @property
+    def hold_servo_active(self) -> bool:
+        return bool(self.held_servo_depth > 0)
+
+    def begin_task_servo(self) -> None:
+        if self.dry_run:
+            return
+        if self.held_servo_depth == 0:
+            self.begin_stream_servo(self.get_live_tcp_pose())
+        self.held_servo_depth += 1
+
+    def end_task_servo(self) -> None:
+        if self.dry_run:
+            return
+        if self.held_servo_depth <= 0:
+            return
+        self.held_servo_depth -= 1
+        if self.held_servo_depth == 0:
+            self.stop_stream_servo()
 
     def send_stream_pose(self, target_real: np.ndarray) -> dict[str, object]:
         pose_cmd = np.asarray(target_real, dtype=np.float64).reshape(6).copy()
@@ -1288,6 +1321,7 @@ class CollectTaskRuntime:
             speed_mps=self.linear_speed,
             semantic_joint6=self.local_exec_joint6_rad if semantic_joint6 is None else semantic_joint6,
             record=record,
+            reuse_servo=self.hold_servo_active,
         )
 
     def record_joint6_rotation(
@@ -1300,13 +1334,19 @@ class CollectTaskRuntime:
     ) -> list[RecordedFrame]:
         if record:
             return execute_joint6_rotation_and_record(
+                self.daemon,
                 self.cameras,
                 target_joint6=float(target_joint6),
                 start_joint6=float(self.local_exec_joint6_rad),
                 gripper=gripper,
                 start_frame_idx=start_frame_idx,
+                reuse_servo=self.hold_servo_active,
             )
-        execute_joint6_rotation(float(target_joint6))
+        execute_joint6_rotation(
+            self.daemon,
+            float(target_joint6),
+            reuse_servo=self.hold_servo_active,
+        )
         return []
 
     def capture_manual_snapshot(

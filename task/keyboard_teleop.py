@@ -26,11 +26,9 @@ CONTROL_DT_S = 0.01
 RAW_RECORD_DT_S = 1.0 / 30.0
 UI_REFRESH_DT_S = 0.05
 TARGET_HORIZON_SCALE = 1.0
-DEFAULT_ROTATE_SPEED_DEGPS = 45.0
+DEFAULT_ROTATE_SPEED_DEGPS = 31.5
 DEFAULT_MOVE_STEP_M = 0.005
 DEFAULT_ROTATE_STEP_DEG = DEFAULT_ROTATE_SPEED_DEGPS * CONTROL_DT_S * TARGET_HORIZON_SCALE
-LINEAR_FILTER_TAU_S = 0.02
-ROTATE_FILTER_TAU_S = 0.02
 AXIS_EPS = 1e-3
 INPUT_POLL_DT_S = 0.002
 LOOKAHEAD_TIME_S = 0.04
@@ -299,12 +297,8 @@ def run_session(
                 if _handle_discrete_key(key):
                     continue
             move_x, move_y, move_z, rotate_axis = key_state.axes(now_ts)
-            desired_linear_axis = np.array([move_x, move_y, move_z], dtype=np.float64)
-            desired_rotate_axis = float(rotate_axis)
-            linear_alpha = float(1.0 - np.exp(-CONTROL_DT_S / LINEAR_FILTER_TAU_S))
-            rotate_alpha = float(1.0 - np.exp(-CONTROL_DT_S / ROTATE_FILTER_TAU_S))
-            linear_axis_cmd = linear_axis_cmd + (desired_linear_axis - linear_axis_cmd) * linear_alpha
-            rotate_axis_cmd = float(rotate_axis_cmd + (desired_rotate_axis - rotate_axis_cmd) * rotate_alpha)
+            linear_axis_cmd = np.array([move_x, move_y, move_z], dtype=np.float64)
+            rotate_axis_cmd = float(rotate_axis)
             linear_norm = float(np.linalg.norm(linear_axis_cmd))
             has_linear = linear_norm > AXIS_EPS
             has_rotate = abs(rotate_axis_cmd) > AXIS_EPS

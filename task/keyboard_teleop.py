@@ -13,17 +13,9 @@ from support.get_obs import STATE_MODE_J6
 from support.keyboard_control import (
     ContinuousKeyState,
     KEY_CTRL_C,
-    KEY_CTRL_DOWN,
-    KEY_CTRL_LEFT,
-    KEY_CTRL_RIGHT,
-    KEY_CTRL_UP,
     KEY_ENTER,
-    KEY_LEFT,
     KEY_QUIT,
-    KEY_RIGHT,
     KEY_SPACE,
-    KEY_UP,
-    KEY_DOWN,
     RawTerminal,
     drain_keys,
     render_keyboard_ui,
@@ -65,7 +57,6 @@ class _TerminalInputPump:
         self._lock = threading.Lock()
         self._discrete_keys: deque[str] = deque()
         self._thread: threading.Thread | None = None
-        self._motion_event_count = 0
 
     def start(self) -> None:
         if self._thread is not None:
@@ -86,29 +77,13 @@ class _TerminalInputPump:
             self._discrete_keys.clear()
             return keys
 
-    def motion_event_count(self) -> int:
-        with self._lock:
-            return int(self._motion_event_count)
-
     def _run(self) -> None:
-        motion_keys = {
-            KEY_UP,
-            KEY_DOWN,
-            KEY_LEFT,
-            KEY_RIGHT,
-            KEY_CTRL_UP,
-            KEY_CTRL_DOWN,
-            KEY_CTRL_LEFT,
-            KEY_CTRL_RIGHT,
-        }
         while not self._stop.is_set():
             now_ts = time.monotonic()
             keys = drain_keys(self._fd)
             discrete = self._key_state.feed_terminal_keys(keys, now_ts)
-            motion_count = sum(1 for key in keys if key in motion_keys)
-            if discrete or motion_count > 0:
+            if discrete:
                 with self._lock:
-                    self._motion_event_count += int(motion_count)
                     self._discrete_keys.extend(discrete)
             time.sleep(float(INPUT_POLL_DT_S))
 
@@ -152,7 +127,6 @@ def run_session(
     latched_linear_axis = np.zeros(3, dtype=np.float64)
     latched_rotate_axis = 0.0
     repeat_latch_waiting_repeat = False
-    repeat_latch_event_count = 0
 
     def _append_current_snapshot() -> None:
         nonlocal frame_idx, next_record_ts
@@ -334,18 +308,14 @@ def run_session(
                 or abs(raw_rotate_axis) > AXIS_EPS
             )
             if key_state.backend == "terminal_repeat":
-                motion_event_count = input_pump.motion_event_count()
                 if raw_motion_active and not raw_motion_active_prev:
                     latched_linear_axis = raw_linear_axis.copy()
                     latched_rotate_axis = float(raw_rotate_axis)
                     repeat_latch_waiting_repeat = True
-                    repeat_latch_event_count = int(motion_event_count)
                 elif raw_motion_active:
                     latched_linear_axis = raw_linear_axis.copy()
                     latched_rotate_axis = float(raw_rotate_axis)
-                    if int(motion_event_count) > int(repeat_latch_event_count):
-                        repeat_latch_waiting_repeat = False
-                        repeat_latch_event_count = int(motion_event_count)
+                    repeat_latch_waiting_repeat = False
                 elif repeat_latch_waiting_repeat:
                     raw_linear_axis = latched_linear_axis.copy()
                     raw_rotate_axis = float(latched_rotate_axis)
@@ -354,7 +324,6 @@ def run_session(
                     latched_linear_axis = np.zeros(3, dtype=np.float64)
                     latched_rotate_axis = 0.0
                     repeat_latch_waiting_repeat = False
-                    repeat_latch_event_count = int(motion_event_count)
             raw_motion_active_prev = bool(raw_motion_active)
 
             linear_axis_cmd = raw_linear_axis

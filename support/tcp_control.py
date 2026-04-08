@@ -435,6 +435,16 @@ def _prepare_force_guard(
     ref = np.asarray(reference_pose, dtype=np.float64).reshape(POSE_DIM)
     downward_dist = float(ref[2] - pose[2])
     if downward_dist <= 0.0:
+        # Preserve the current force-guard state during target hold / upward motion.
+        # The collection loop treats a missing force reading during a downward
+        # segment hold as a guard failure, so we must not discard a valid live or
+        # cached reading just because this particular command no longer decreases z.
+        if (
+            force_z_n is not _FORCE_GUARD_UNSET
+            and scale is not _FORCE_GUARD_UNSET
+            and warning_active is not _FORCE_GUARD_UNSET
+        ):
+            return pose, ref, downward_dist, force_z_n, scale, bool(warning_active)
         warning_val = False if warning_active is _FORCE_GUARD_UNSET else bool(warning_active)
         return pose, ref, downward_dist, None, None, warning_val
     if (

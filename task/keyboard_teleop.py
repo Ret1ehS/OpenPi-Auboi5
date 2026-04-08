@@ -32,6 +32,7 @@ DEFAULT_ROTATE_STEP_DEG = DEFAULT_ROTATE_SPEED_DEGPS * CONTROL_DT_S * TARGET_HOR
 AXIS_EPS = 1e-3
 INPUT_POLL_DT_S = 0.002
 LOOKAHEAD_TIME_S = 0.04
+INITIAL_REPEAT_LATCH_S = 0.30
 POSE_SEND_DEADBAND_M = 0.00035
 POSE_SEND_DEADBAND_RAD = float(np.deg2rad(0.06))
 
@@ -123,6 +124,10 @@ def run_session(
     linear_axis_cmd = np.zeros(3, dtype=np.float64)
     rotate_axis_cmd = 0.0
     rotate_speed_radps = float(np.deg2rad(DEFAULT_ROTATE_SPEED_DEGPS))
+    raw_motion_active_prev = False
+    latched_linear_axis = np.zeros(3, dtype=np.float64)
+    latched_rotate_axis = 0.0
+    repeat_latch_deadline = 0.0
 
     def _append_current_snapshot() -> None:
         nonlocal frame_idx, next_record_ts
@@ -297,8 +302,33 @@ def run_session(
                 if _handle_discrete_key(key):
                     continue
             move_x, move_y, move_z, rotate_axis = key_state.axes(now_ts)
-            linear_axis_cmd = np.array([move_x, move_y, move_z], dtype=np.float64)
-            rotate_axis_cmd = float(rotate_axis)
+            raw_linear_axis = np.array([move_x, move_y, move_z], dtype=np.float64)
+            raw_rotate_axis = float(rotate_axis)
+            raw_motion_active = (
+                float(np.linalg.norm(raw_linear_axis)) > AXIS_EPS
+                or abs(raw_rotate_axis) > AXIS_EPS
+            )
+            if key_state.backend == "terminal_repeat":
+                if raw_motion_active and not raw_motion_active_prev:
+                    latched_linear_axis = raw_linear_axis.copy()
+                    latched_rotate_axis = float(raw_rotate_axis)
+                    repeat_latch_deadline = now_ts + float(INITIAL_REPEAT_LATCH_S)
+                elif raw_motion_active:
+                    latched_linear_axis = raw_linear_axis.copy()
+                    latched_rotate_axis = float(raw_rotate_axis)
+                    repeat_latch_deadline = 0.0
+                elif repeat_latch_deadline > now_ts:
+                    raw_linear_axis = latched_linear_axis.copy()
+                    raw_rotate_axis = float(latched_rotate_axis)
+                    raw_motion_active = True
+                else:
+                    latched_linear_axis = np.zeros(3, dtype=np.float64)
+                    latched_rotate_axis = 0.0
+                    repeat_latch_deadline = 0.0
+            raw_motion_active_prev = bool(raw_motion_active)
+
+            linear_axis_cmd = raw_linear_axis
+            rotate_axis_cmd = float(raw_rotate_axis)
             linear_norm = float(np.linalg.norm(linear_axis_cmd))
             has_linear = linear_norm > AXIS_EPS
             has_rotate = abs(rotate_axis_cmd) > AXIS_EPS
@@ -373,7 +403,13 @@ def run_session(
                 else:
                     if servo_active:
                         if hold_pose_real is None:
-                            hold_pose_real = planned_pose_real.copy()
+                            hold_pose_real = (
+                                last_sent_pose_real.copy()
+                                if last_sent_pose_real is not None
+                                else command_pose_real.copy()
+                            )
+                            planned_pose_real = hold_pose_real.copy()
+                            command_pose_real = hold_pose_real.copy()
                             last_sent_pose_real = hold_pose_real.copy()
                             if config.state_mode == STATE_MODE_J6:
                                 hold_joint6_rad = float(runtime.local_exec_joint6_rad)

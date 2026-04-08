@@ -43,6 +43,8 @@ from support.pose_align import (
 
 DEFAULT_SDK_ROOT = "/home/orin/openpi/aubo_sdk/aubo_sdk-0.24.1-rc.3-Linux_aarch64+318754d"
 DEFAULT_HELPER_BIN = "/home/orin/openpi/scripts/.build/tcp_control_helper"
+DEFAULT_HELPER_LOG_DIR = Path(__file__).resolve().parent.parent / "log"
+DEFAULT_HELPER_LOG_FILE = DEFAULT_HELPER_LOG_DIR / "tcp_control_helper.log"
 
 DEFAULT_ROBOT_IP = "192.168.1.100"
 DEFAULT_PORT = 30004
@@ -596,6 +598,7 @@ class _DaemonHelper:
         user: str = DEFAULT_USER,
         password: str = DEFAULT_PASSWORD,
     ) -> None:
+        self._helper_log_file = Path(DEFAULT_HELPER_LOG_FILE)
         self._cmd = [
             str(Path(helper_bin).resolve()),
             "--robot-ip", robot_ip,
@@ -603,6 +606,7 @@ class _DaemonHelper:
             "--user", user,
             "--password", password,
             "--daemon",
+            "--log-file", str(self._helper_log_file),
         ]
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
@@ -616,6 +620,7 @@ class _DaemonHelper:
     def _ensure_started(self) -> subprocess.Popen:
         if self._proc is not None and self._proc.poll() is None:
             return self._proc
+        self._helper_log_file.parent.mkdir(parents=True, exist_ok=True)
         self._proc = subprocess.Popen(
             self._cmd,
             stdin=subprocess.PIPE,

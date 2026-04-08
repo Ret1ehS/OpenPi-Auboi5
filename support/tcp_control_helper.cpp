@@ -18,6 +18,7 @@
 #include <thread>
 #include <tuple>
 #include <vector>
+#include <iomanip>
 #include <poll.h>
 #include <unistd.h>
 
@@ -103,6 +104,7 @@ struct Options {
     bool has_joint_target = false;
     bool has_track_pose_file = false;
     bool daemon = false;
+    std::string log_file;
     std::vector<double> target_pose;
     std::vector<double> joint_target;
     std::string track_pose_file;
@@ -121,6 +123,27 @@ void print_vec(const char *name, const std::vector<double> &values)
         }
     }
     std::cout << "]" << std::endl;
+}
+
+std::string vec_to_json(const std::vector<double> &values)
+{
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) {
+            oss << ", ";
+        }
+        oss << std::setprecision(12) << values[i];
+    }
+    oss << "]";
+    return oss.str();
+}
+
+long long epoch_ms_now()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
 }
 
 Mat4 eye4()
@@ -283,6 +306,8 @@ bool parse_args(int argc, char **argv, Options &opt)
             opt.execute = true;
         } else if (arg == "--daemon") {
             opt.daemon = true;
+        } else if (arg == "--log-file") {
+            opt.log_file = require_value("--log-file");
         } else if (arg == "--target-pose") {
             opt.has_target_pose = true;
             opt.target_pose.clear();
@@ -308,7 +333,7 @@ bool parse_args(int argc, char **argv, Options &opt)
             std::cout
                 << "Usage: tcp_control_helper [--target-pose x y z rx ry rz | --joint-target q1..q6]\n"
                 << "                          [--track-pose-file path --track-time-s 0.05]\n"
-                << "                          [--execute] [--daemon] [--robot-ip IP] [--port 30004]\n";
+                << "                          [--execute] [--daemon] [--log-file path] [--robot-ip IP] [--port 30004]\n";
             return false;
         } else {
             std::cerr << "unknown argument: " << arg << std::endl;
@@ -1074,6 +1099,17 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
     auto motion = robot->getMotionControl();
     auto manage = robot->getRobotManage();
     auto algo = robot->getRobotAlgorithm();
+    std::ofstream diag_log;
+    if (!opt.log_file.empty()) {
+        diag_log.open(opt.log_file, std::ios::app);
+    }
+    auto log_diag = [&](const std::string &line) {
+        if (!diag_log.is_open()) {
+            return;
+        }
+        diag_log << line << std::endl;
+        diag_log.flush();
+    };
 
     // Print initial snapshot so caller knows we're ready
     print_snapshot(robot, config);
@@ -1120,6 +1156,8 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
 
         } else if (line == "servo_sync_seed") {
             if (!servo_active) {
+                log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                         ",\"event\":\"servo_sync_seed\",\"ok\":false,\"error\":\"servo_not_active\"}");
                 std::cout << "servo_sync_seed_ret=-1" << std::endl;
                 std::cout << "error=servo_not_active" << std::endl;
                 std::cout << "END" << std::endl;
@@ -1132,6 +1170,9 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
             hold_pose = std::get<0>(fk_result);
             const int fk_ret = std::get<1>(fk_result);
             if (fk_ret != 0 || hold_pose.size() != 6) {
+                log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                         ",\"event\":\"servo_sync_seed\",\"ok\":false,\"error\":\"fk_fail\",\"fk_ret\":" +
+                         std::to_string(fk_ret) + ",\"seed_q\":" + vec_to_json(seed_q) + "}");
                 std::cout << "servo_sync_seed_ret=-1" << std::endl;
                 std::cout << "error=fk_fail" << std::endl;
                 std::cout << "fk_ret=" << fk_ret << std::endl;
@@ -1139,6 +1180,9 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
                 continue;
             }
             hold_joint_mode = true;
+            log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                     ",\"event\":\"servo_sync_seed\",\"ok\":true,\"seed_q\":" + vec_to_json(seed_q) +
+                     ",\"hold_pose\":" + vec_to_json(hold_pose) + "}");
             std::cout << "servo_sync_seed_ret=0" << std::endl;
             print_vec("joint_q_rad", seed_q);
             print_vec("hold_pose", hold_pose);
@@ -1289,6 +1333,8 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
         } else if (line.rfind("servo_pose_j6 ", 0) == 0) {
             // servo_pose_j6 x y z rx ry rz j6
             if (!servo_active) {
+                log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                         ",\"event\":\"servo_pose_j6\",\"ok\":false,\"error\":\"servo_not_active\"}");
                 std::cout << "error=servo_not_active" << std::endl;
                 std::cout << "END" << std::endl;
                 continue;
@@ -1297,18 +1343,36 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
             std::vector<double> pose;
             double target_joint6 = 0.0;
             if (!parse_pose6_and_joint6(line.substr(14), pose, target_joint6)) {
+                log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                         ",\"event\":\"servo_pose_j6\",\"ok\":false,\"error\":\"bad_pose_or_joint6\"}");
                 std::cout << "error=bad_pose_or_joint6" << std::endl;
                 std::cout << "END" << std::endl;
                 continue;
             }
 
 
+            std::vector<double> seed_before = seed_q;
+            auto current_fk = algo->forwardKinematics(seed_q);
+            std::vector<double> current_pose = std::get<0>(current_fk);
+            const int current_fk_ret = std::get<1>(current_fk);
+            const double yaw_err_before = (current_pose.size() == 6 && pose.size() == 6)
+                                              ? wrap_angle(pose[5] - current_pose[5])
+                                              : 0.0;
             std::vector<double> target_q;
             std::vector<double> fk_pose;
             std::string solve_error;
             int jac_ret = 0;
             if (!solve_pose_roll_pitch_j6_target(
                     algo, seed_q, pose, target_joint6, target_q, fk_pose, jac_ret, solve_error)) {
+                log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                         ",\"event\":\"servo_pose_j6\",\"ok\":false,\"stage\":\"solve\",\"error\":\"" + solve_error +
+                         "\",\"ik_ret\":" + std::to_string(jac_ret) +
+                         ",\"seed_q\":" + vec_to_json(seed_before) +
+                         ",\"current_fk_ret\":" + std::to_string(current_fk_ret) +
+                         ",\"current_pose\":" + vec_to_json(current_pose) +
+                         ",\"target_pose\":" + vec_to_json(pose) +
+                         ",\"target_joint6\":" + std::to_string(target_joint6) +
+                         ",\"yaw_err_before\":" + std::to_string(yaw_err_before) + "}");
                 std::cout << "servo_pose_ret=-1" << std::endl;
                 std::cout << "error=" << solve_error << std::endl;
                 std::cout << "ik_ret=" << jac_ret << std::endl;
@@ -1324,6 +1388,18 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
             if (servo_ret != 0) {
+                log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                         ",\"event\":\"servo_pose_j6\",\"ok\":false,\"stage\":\"servo\",\"error\":\"servo_fail\"" +
+                         ",\"servo_ret\":" + std::to_string(servo_ret) +
+                         ",\"seed_q\":" + vec_to_json(seed_before) +
+                         ",\"current_fk_ret\":" + std::to_string(current_fk_ret) +
+                         ",\"current_pose\":" + vec_to_json(current_pose) +
+                         ",\"target_pose\":" + vec_to_json(pose) +
+                         ",\"target_joint6\":" + std::to_string(target_joint6) +
+                         ",\"target_q\":" + vec_to_json(target_q) +
+                         ",\"fk_pose\":" + vec_to_json(fk_pose) +
+                         ",\"yaw_err_before\":" + std::to_string(yaw_err_before) +
+                         ",\"yaw_err_after\":" + std::to_string((fk_pose.size() == 6 && pose.size() == 6) ? wrap_angle(pose[5] - fk_pose[5]) : 0.0) + "}");
                 std::cout << "servo_pose_ret=" << servo_ret << std::endl;
                 std::cout << "servo_ret_name=" << servo_ret_name(servo_ret) << std::endl;
                 std::cout << "error=servo_fail" << std::endl;
@@ -1336,6 +1412,17 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
             hold_pose = fk_pose;
             hold_joint_mode = true;
             ++sent;
+            log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                     ",\"event\":\"servo_pose_j6\",\"ok\":true" +
+                     ",\"seed_q\":" + vec_to_json(seed_before) +
+                     ",\"current_fk_ret\":" + std::to_string(current_fk_ret) +
+                     ",\"current_pose\":" + vec_to_json(current_pose) +
+                     ",\"target_pose\":" + vec_to_json(pose) +
+                     ",\"target_joint6\":" + std::to_string(target_joint6) +
+                     ",\"target_q\":" + vec_to_json(target_q) +
+                     ",\"fk_pose\":" + vec_to_json(fk_pose) +
+                     ",\"yaw_err_before\":" + std::to_string(yaw_err_before) +
+                     ",\"yaw_err_after\":" + std::to_string((fk_pose.size() == 6 && pose.size() == 6) ? wrap_angle(pose[5] - fk_pose[5]) : 0.0) + "}");
 
             std::this_thread::sleep_for(std::chrono::duration<double>(servo_track_time_s));
 

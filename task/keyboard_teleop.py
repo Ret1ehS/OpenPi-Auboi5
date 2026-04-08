@@ -75,6 +75,8 @@ def run_session(
     next_control_ts = time.monotonic()
     servo_active = False
     command_pose_real = runtime.get_live_tcp_pose()
+    hold_pose_real: np.ndarray | None = None
+    hold_joint6_rad: float | None = None
     key_state = ContinuousKeyState()
     linear_axis_cmd = np.zeros(3, dtype=np.float64)
     rotate_axis_cmd = 0.0
@@ -107,10 +109,12 @@ def run_session(
         servo_active = True
 
     def _stop_servo() -> None:
-        nonlocal servo_active, command_pose_real
+        nonlocal servo_active, command_pose_real, hold_pose_real, hold_joint6_rad
         if runtime.dry_run:
             servo_active = False
             command_pose_real = runtime.get_live_tcp_pose()
+            hold_pose_real = None
+            hold_joint6_rad = None
             return
         if servo_active:
             try:
@@ -119,6 +123,8 @@ def run_session(
                 pass
         servo_active = False
         command_pose_real = runtime.get_live_tcp_pose()
+        hold_pose_real = None
+        hold_joint6_rad = None
         live_joint6 = runtime.get_live_joint6()
         if live_joint6 is not None:
             runtime.local_exec_joint6_rad = float(live_joint6)
@@ -243,23 +249,24 @@ def run_session(
             try:
                 if has_linear or has_rotate:
                     live_pose = runtime.get_live_tcp_pose()
+                    if not servo_active:
+                        command_pose_real = live_pose.copy()
                     if not runtime.dry_run:
                         _ensure_servo_active()
-                    command_pose_real = live_pose.copy()
+                    hold_pose_real = None
+                    hold_joint6_rad = None
                     if has_linear:
                         move_dir = linear_axis_cmd / linear_norm
                         command_pose_real[:3] = (
                             command_pose_real[:3]
-                            + move_dir * float(runtime.linear_speed) * float(preview_horizon_s) * float(linear_norm)
+                            + move_dir * float(runtime.linear_speed) * float(CONTROL_DT_S) * float(linear_norm)
                         )
                     if has_rotate:
                         rotate_delta_rad = float(rotate_speed_radps * rotate_axis_cmd * CONTROL_DT_S)
                         if config.state_mode == STATE_MODE_J6:
                             runtime.local_exec_joint6_rad = runtime.wrap_angle(runtime.local_exec_joint6_rad + rotate_delta_rad)
                         else:
-                            command_pose_real[5] = runtime.wrap_angle(
-                                float(command_pose_real[5] + rotate_speed_radps * rotate_axis_cmd * preview_horizon_s)
-                            )
+                            command_pose_real[5] = runtime.wrap_angle(float(command_pose_real[5] + rotate_delta_rad))
 
                     command_pose_real = _clip_command_pose(command_pose_real)
                     command_pose_real = _limit_pose_lead(command_pose_real, live_pose)
@@ -286,15 +293,20 @@ def run_session(
                     )
                 else:
                     if servo_active:
-                        live_pose = runtime.get_live_tcp_pose()
-                        command_pose_real = live_pose.copy()
+                        if hold_pose_real is None:
+                            hold_pose_real = runtime.get_live_tcp_pose().copy()
+                            if config.state_mode == STATE_MODE_J6:
+                                live_joint6 = runtime.get_live_joint6()
+                                if live_joint6 is not None:
+                                    runtime.local_exec_joint6_rad = float(live_joint6)
+                                hold_joint6_rad = float(runtime.local_exec_joint6_rad)
+                            else:
+                                hold_joint6_rad = None
                         if config.state_mode == STATE_MODE_J6:
-                            live_joint6 = runtime.get_live_joint6()
-                            if live_joint6 is not None:
-                                runtime.local_exec_joint6_rad = float(live_joint6)
-                            resp = runtime.daemon.servo_pose_j6(command_pose_real, runtime.local_exec_joint6_rad)
+                            joint6_cmd = runtime.local_exec_joint6_rad if hold_joint6_rad is None else float(hold_joint6_rad)
+                            resp = runtime.daemon.servo_pose_j6(hold_pose_real, joint6_cmd)
                         else:
-                            resp = runtime.daemon.servo_pose(command_pose_real)
+                            resp = runtime.daemon.servo_pose(hold_pose_real)
                             live_joint6 = runtime.get_live_joint6()
                             if live_joint6 is not None:
                                 runtime.local_exec_joint6_rad = float(live_joint6)

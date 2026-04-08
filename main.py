@@ -11,7 +11,7 @@ Inference loop:
   get_obs -> infer -> extract TCP(6D) euler deltas + gripper
     -> take the first 10 action intervals
     -> execute the segment to completion
-    -> wait until the executor has settled at the segment end pose
+    -> return immediately after the segment finishes
     -> re-observe from the real robot pose and infer again
 """
 
@@ -38,23 +38,8 @@ NATIVE_INTERP_FACTOR = 5  # 10 intervals -> 50 actions in native mode
 STATE_MODE_YAW = "yaw"
 STATE_MODE_J6 = "j6"
 DEFAULT_J6_HOME_RAD = 0.11434
-EXEC_SETTLE_POS_TOL_M = 0.003
-EXEC_SETTLE_ANG_TOL_RAD = 0.03
-EXEC_SETTLE_J6_TOL_RAD = math.radians(1.0)
-EXEC_SETTLE_TIMEOUT_S = 1.00
-EXEC_SETTLE_CONSECUTIVE_HITS = 3
-
-
 def _wrap_angle(angle: float) -> float:
     return float(math.atan2(math.sin(angle), math.cos(angle)))
-
-
-def _pose_close(actual_pose: np.ndarray, target_pose: np.ndarray, *, pos_tol: float = EXEC_SETTLE_POS_TOL_M, ang_tol: float = EXEC_SETTLE_ANG_TOL_RAD) -> bool:
-    actual = np.asarray(actual_pose, dtype=np.float64).reshape(6)
-    target = np.asarray(target_pose, dtype=np.float64).reshape(6)
-    pos_err = float(np.linalg.norm(actual[:3] - target[:3]))
-    ang_err = np.arctan2(np.sin(actual[3:] - target[3:]), np.cos(actual[3:] - target[3:]))
-    return pos_err <= float(pos_tol) and float(np.linalg.norm(ang_err)) <= float(ang_tol)
 
 
 def _maybe_reexec_into_repo_venv() -> None:
@@ -225,41 +210,12 @@ class TrajectoryExecutor:
             with self._lock:
                 self._expected_joint6 = None if value is None else float(value)
 
-        def _wait_until_segment_settles(target_pose_real, target_joint6: float | None):
-            deadline = time.monotonic() + float(EXEC_SETTLE_TIMEOUT_S)
-            latest_snapshot = get_robot_snapshot()
-            consecutive_hits = 0
-            while True:
-                actual_real = np.asarray(latest_snapshot.tcp_pose, dtype=np.float64).reshape(6).copy()
-                joint_q = np.asarray(latest_snapshot.joint_q, dtype=np.float64).reshape(-1)
-                actual_joint6 = float(joint_q[5]) if joint_q.size >= 6 else target_joint6
-                joint6_ok = (
-                    target_joint6 is None
-                    or actual_joint6 is None
-                    or abs(_wrap_angle(float(actual_joint6) - float(target_joint6))) <= float(EXEC_SETTLE_J6_TOL_RAD)
-                )
-                if _pose_close(actual_real, target_pose_real) and joint6_ok:
-                    consecutive_hits += 1
-                    if consecutive_hits >= int(EXEC_SETTLE_CONSECUTIVE_HITS):
-                        return latest_snapshot, actual_real, actual_joint6, True
-                else:
-                    consecutive_hits = 0
-                if time.monotonic() >= deadline:
-                    return latest_snapshot, actual_real, actual_joint6, False
-                time.sleep(0.01)
-                latest_snapshot = get_robot_snapshot()
-
         def _plan_from_item(item):
             nonlocal servo_active
             tcp_deltas, submitted_observed_pose, joint6_deltas, semantic_joint6 = item
             _ = submitted_observed_pose
             snapshot = get_robot_snapshot()
-            # Match the stable ad961043 path: after the previous chunk has
-            # fully finished and settled, each new chunk integrates from the
-            # current live robot pose, not from the earlier observation pose
-            # captured before inference. Using the stale observed pose here
-            # re-injects inference-latency drift as a corrective "snap back"
-            # at chunk boundaries.
+            # Each new chunk integrates from the current live robot pose.
             start_sim = real_pose_to_sim(snapshot.tcp_pose)
 
             if snapshot.collision or not snapshot.within_safety_limits:
@@ -481,47 +437,11 @@ class TrajectoryExecutor:
                             final_pose_real=step.pose_real,
                         )
                     )
-                    if current_index < len(current_plan.steps):
-                        _set_expected_pose(step.pose_sim)
+                    _set_expected_pose(step.pose_sim)
                     if current_index >= len(current_plan.steps):
                         if self._use_joint6 and current_joint6_final is not None:
                             hold_joint6 = float(current_joint6_final)
-                        settle_snapshot, settled_real, settled_joint6, settled_ok = _wait_until_segment_settles(
-                            hold_pose_real,
-                            hold_joint6 if self._use_joint6 else None,
-                        )
-                        settled_sim = real_pose_to_sim(settled_real)
-                        if self._use_joint6:
-                            if settled_joint6 is not None:
-                                hold_joint6 = float(settled_joint6)
                             _set_expected_joint6(hold_joint6)
-                        _set_last_result(
-                            TrackChunkResult(
-                                ok=bool(settled_ok),
-                                reason=(
-                                    f"streaming executed ({current_index}/{len(current_plan.steps)} steps)"
-                                    if settled_ok
-                                    else f"settle_timeout after streaming ({current_index}/{len(current_plan.steps)} steps)"
-                                ),
-                                snapshot=settle_snapshot,
-                                start_pose=current_plan.start_pose,
-                                final_pose=settled_sim,
-                                sample_count=current_index,
-                                control_dt_s=current_plan.control_dt_s,
-                                tracking_err=0.0,
-                                exec_mode="streaming",
-                                raw={
-                                    **resp,
-                                    "settled": bool(settled_ok),
-                                    "settle_consecutive_hits_required": int(EXEC_SETTLE_CONSECUTIVE_HITS),
-                                    "settle_timeout_s": float(EXEC_SETTLE_TIMEOUT_S),
-                                    **({"semantic_joint6": float(hold_joint6)} if hold_joint6 is not None else {}),
-                                },
-                                start_pose_real=current_plan.start_pose_real,
-                                final_pose_real=settled_real.copy(),
-                            )
-                        )
-                        _set_expected_pose(settled_sim)
                         current_snapshot = None
                         current_plan = None
                         current_joint6_targets = None

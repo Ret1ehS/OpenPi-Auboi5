@@ -983,113 +983,121 @@ bool parse_pose6_and_joint6(const std::string &text,
     return static_cast<bool>(iss >> joint6);
 }
 
-bool solve_pose_roll_pitch_j6_target(RobotAlgorithmPtr algo,
-                                     const std::vector<double> &seed_q,
-                                     const std::vector<double> &target_pose,
-                                     double target_joint6,
-                                     std::vector<double> &target_q,
-                                     std::vector<double> &fk_pose,
-                                     int &jac_ret,
-                                     std::string &error)
+bool solve_pose_full_ik_soft_j6_target(RobotAlgorithmPtr algo,
+                                       const std::vector<double> &seed_q,
+                                       const std::vector<double> &target_pose,
+                                       double target_joint6,
+                                       std::vector<double> &target_q,
+                                       std::vector<double> &fk_pose,
+                                       int &ik_ret,
+                                       std::string &error)
 {
     if (seed_q.size() != 6 || target_pose.size() != 6) {
         error = "invalid_input";
         return false;
     }
 
-    auto fk_result = algo->forwardKinematics(seed_q);
-    const auto current_pose = std::get<0>(fk_result);
-    const int fk_ret = std::get<1>(fk_result);
-    if (fk_ret != 0 || current_pose.size() != 6) {
-        jac_ret = fk_ret;
-        error = "fk_fail";
-        return false;
-    }
+    std::vector<std::vector<double>> candidate_seeds;
+    candidate_seeds.push_back(seed_q);
 
-    auto jac_result = algo->calcJacobian(seed_q, true);
-    const auto jac_flat = std::get<0>(jac_result);
-    jac_ret = std::get<1>(jac_result);
-    if (jac_ret != 0 || jac_flat.size() != 36) {
-        error = "jacobian_fail";
-        return false;
-    }
-
-    std::array<std::array<double, 6>, 6> jacobian{};
-    for (int r = 0; r < 6; ++r) {
-        for (int c = 0; c < 6; ++c) {
-            jacobian[r][c] = jac_flat[r * 6 + c];
-        }
-    }
-
-    std::array<double, 5> rhs{};
-    rhs[0] = target_pose[0] - current_pose[0];
-    rhs[1] = target_pose[1] - current_pose[1];
-    rhs[2] = target_pose[2] - current_pose[2];
-    rhs[3] = wrap_angle(target_pose[3] - current_pose[3]);
-    rhs[4] = wrap_angle(target_pose[4] - current_pose[4]);
-
-    double dq6 = wrap_angle(target_joint6 - seed_q[5]);
-    constexpr double max_joint_step = 0.08;
-    dq6 = std::max(-max_joint_step, std::min(max_joint_step, dq6));
-
-    for (int row = 0; row < 5; ++row) {
-        rhs[row] -= jacobian[row][5] * dq6;
-    }
-
-    std::vector<std::vector<double>> normal(5, std::vector<double>(5, 0.0));
-    std::vector<double> rhs_normal(5, 0.0);
-    constexpr double lambda = 1e-4;
-    for (int r = 0; r < 5; ++r) {
-        for (int c = 0; c < 5; ++c) {
-            double sum = 0.0;
-            for (int k = 0; k < 5; ++k) {
-                sum += jacobian[k][r] * jacobian[k][c];
+    const std::array<double, 7> q6_offsets = {
+        0.0,
+        kPi / 2.0,
+        -kPi / 2.0,
+        kPi,
+        -kPi,
+        3.0 * kPi / 2.0,
+        -3.0 * kPi / 2.0,
+    };
+    for (double offset : q6_offsets) {
+        std::vector<double> candidate = seed_q;
+        candidate[5] = target_joint6 + offset;
+        bool duplicate = false;
+        for (const auto &existing : candidate_seeds) {
+            if (existing.size() == 6 &&
+                std::abs(wrap_angle(existing[5] - candidate[5])) < 1e-9) {
+                duplicate = true;
+                break;
             }
-            if (r == c) {
-                sum += lambda * lambda;
+        }
+        if (!duplicate) {
+            candidate_seeds.push_back(candidate);
+        }
+    }
+
+    bool found = false;
+    double best_score = std::numeric_limits<double>::infinity();
+    int first_ik_ret = -1;
+    std::string last_error = "ik_fail";
+    std::vector<double> best_target_q;
+    std::vector<double> best_fk_pose;
+
+    for (const auto &candidate_seed : candidate_seeds) {
+        auto ik_result = algo->inverseKinematics(candidate_seed, target_pose);
+        auto candidate_q = std::get<0>(ik_result);
+        const int candidate_ik_ret = std::get<1>(ik_result);
+        if (candidate_ik_ret != 0 || candidate_q.size() != 6) {
+            if (first_ik_ret == -1) {
+                first_ik_ret = candidate_ik_ret;
             }
-            normal[r][c] = sum;
+            continue;
         }
-        double sum = 0.0;
-        for (int k = 0; k < 5; ++k) {
-            sum += jacobian[k][r] * rhs[k];
+
+        auto fk_result = algo->forwardKinematics(candidate_q);
+        auto candidate_fk = std::get<0>(fk_result);
+        const int fk_ret = std::get<1>(fk_result);
+        if (fk_ret != 0 || candidate_fk.size() != 6) {
+            last_error = "target_fk_fail";
+            if (first_ik_ret == -1) {
+                first_ik_ret = fk_ret;
+            }
+            continue;
         }
-        rhs_normal[r] = sum;
+
+        const double q6_err = std::abs(wrap_angle(candidate_q[5] - target_joint6));
+        double joint_delta_norm_sq = 0.0;
+        for (size_t idx = 0; idx < 6; ++idx) {
+            const double dq = wrap_angle(candidate_q[idx] - seed_q[idx]);
+            joint_delta_norm_sq += dq * dq;
+        }
+        const double joint_delta_norm = std::sqrt(joint_delta_norm_sq);
+
+        double pose_pos_err_sq = 0.0;
+        for (int idx = 0; idx < 3; ++idx) {
+            const double d = candidate_fk[idx] - target_pose[idx];
+            pose_pos_err_sq += d * d;
+        }
+        const double pose_pos_err = std::sqrt(pose_pos_err_sq);
+        double pose_ang_err_sq = 0.0;
+        for (int idx = 3; idx < 6; ++idx) {
+            const double d = wrap_angle(candidate_fk[idx] - target_pose[idx]);
+            pose_ang_err_sq += d * d;
+        }
+        const double pose_ang_err = std::sqrt(pose_ang_err_sq);
+
+        const double score =
+            500.0 * pose_pos_err +
+            50.0 * pose_ang_err +
+            1.0 * q6_err +
+            0.02 * joint_delta_norm;
+
+        if (score < best_score) {
+            best_score = score;
+            best_target_q = candidate_q;
+            best_fk_pose = candidate_fk;
+            found = true;
+        }
     }
 
-    std::vector<double> dq_head;
-    if (!solve_linear_system(normal, rhs_normal, dq_head) || dq_head.size() != 5) {
-        error = "linear_solve_fail";
+    if (!found) {
+        ik_ret = first_ik_ret;
+        error = last_error;
         return false;
     }
 
-    double max_abs_delta = std::abs(dq6);
-    for (double value : dq_head) {
-        max_abs_delta = std::max(max_abs_delta, std::abs(value));
-    }
-    if (max_abs_delta > max_joint_step) {
-        const double scale = max_joint_step / max_abs_delta;
-        for (double &value : dq_head) {
-            value *= scale;
-        }
-        dq6 *= scale;
-    }
-
-    target_q = seed_q;
-    for (int idx = 0; idx < 5; ++idx) {
-        target_q[idx] += dq_head[idx];
-    }
-    target_q[5] += dq6;
-
-    auto target_fk = algo->forwardKinematics(target_q);
-    fk_pose = std::get<0>(target_fk);
-    const int target_fk_ret = std::get<1>(target_fk);
-    if (target_fk_ret != 0 || fk_pose.size() != 6) {
-        jac_ret = target_fk_ret;
-        error = "target_fk_fail";
-        return false;
-    }
-
+    target_q = best_target_q;
+    fk_pose = best_fk_pose;
+    ik_ret = 0;
     return true;
 }
 
@@ -1362,7 +1370,7 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
             std::vector<double> fk_pose;
             std::string solve_error;
             int jac_ret = 0;
-            if (!solve_pose_roll_pitch_j6_target(
+            if (!solve_pose_full_ik_soft_j6_target(
                     algo, seed_q, pose, target_joint6, target_q, fk_pose, jac_ret, solve_error)) {
                 log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
                          ",\"event\":\"servo_pose_j6\",\"ok\":false,\"stage\":\"solve\",\"error\":\"" + solve_error +

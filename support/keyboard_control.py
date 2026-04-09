@@ -297,6 +297,8 @@ def render_keyboard_ui(
     state_mode: str,
     move_step_mm: float,
     rotate_step_deg: float,
+    input_source: str = "",
+    helper_command: str = "",
     status_line: str = "",
 ) -> str:
     lines: list[str] = []
@@ -309,10 +311,14 @@ def render_keyboard_ui(
     )
     lines.append(f"  Gripper:     {BOLD}{FG_WHITE}{'open' if gripper_open else 'closed'}{RESET}")
     lines.append(f"  State Mode:  {BOLD}{FG_WHITE}{state_mode}{RESET}")
+    if input_source:
+        lines.append(f"  Input:       {BOLD}{FG_WHITE}{input_source}{RESET}")
     lines.append(
         f"  Step:        {BOLD}{FG_WHITE}{move_step_mm:.1f} mm{RESET}  /  "
         f"{BOLD}{FG_WHITE}{rotate_step_deg:.1f} deg{RESET}"
     )
+    if helper_command:
+        lines.append(f"  Helper:      {DIM}{helper_command}{RESET}")
     lines.append("")
     lines.append(f"  {BOLD}Arrow keys{RESET}")
     lines.append("    Up: x+    Down: x-    Left: y+    Right: y-")

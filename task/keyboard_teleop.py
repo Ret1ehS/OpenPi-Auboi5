@@ -28,6 +28,7 @@ from support.keyboard_control import (
     drain_keys,
     render_keyboard_ui,
 )
+from support.keyboard_remote import RemoteKeyboardRelay
 
 
 CONTROL_DT_S = 0.01
@@ -41,7 +42,7 @@ AXIS_EPS = 1e-3
 INPUT_POLL_DT_S = 0.002
 LOOKAHEAD_TIME_S = 0.06
 INITIAL_REPEAT_LATCH_S = 0.55
-TERMINAL_REPEAT_HOLD_S = 0.04
+TERMINAL_REPEAT_HOLD_S = 0.06
 MAX_LINEAR_LEAD_M = 0.010
 MAX_YAW_LEAD_RAD = float(np.deg2rad(4.0))
 POSE_SEND_DEADBAND_M = 0.00035
@@ -158,6 +159,8 @@ def run_session(
     repeat_latch_waiting_repeat = False
     repeat_latch_deadline = 0.0
     repeat_latch_event_count = 0
+    remote_relay = RemoteKeyboardRelay.from_ssh_session()
+    remote_helper_command = ""
 
     def _append_current_snapshot() -> None:
         nonlocal frame_idx, next_record_ts
@@ -313,6 +316,15 @@ def run_session(
     try:
         if not key_state.start(fd=term.fd, repeat_hold_s=TERMINAL_REPEAT_HOLD_S):
             raise RuntimeError("continuous keyboard teleop backend unavailable")
+        if remote_relay is not None:
+            try:
+                remote_relay.start()
+                remote_helper_command = remote_relay.launcher_command
+                if remote_helper_command:
+                    status_line = "Run the local helper command to enable raw keyboard streaming."
+            except Exception as exc:
+                status_line = f"Remote keyboard helper unavailable: {exc}"
+                remote_relay = None
         input_pump.start()
         while True:
             now_ts = time.monotonic()
@@ -322,6 +334,16 @@ def run_session(
                 now_ts = time.monotonic()
             else:
                 next_control_ts = now_ts
+            remote_active = bool(remote_relay is not None and remote_relay.has_active_connection(now_ts))
+            if remote_active:
+                input_source = "remote helper"
+                helper_command = ""
+            elif remote_relay is not None:
+                input_source = "terminal fallback"
+                helper_command = remote_helper_command
+            else:
+                input_source = key_state.backend or "terminal"
+                helper_command = ""
             if now_ts >= next_ui_refresh_ts:
                 print(
                     render_keyboard_ui(
@@ -331,6 +353,8 @@ def run_session(
                         state_mode=config.state_mode,
                         move_step_mm=move_step_m * 1000.0,
                         rotate_step_deg=rotate_step_deg,
+                        input_source=input_source,
+                        helper_command=helper_command,
                         status_line=status_line,
                     ),
                     end="",
@@ -338,14 +362,20 @@ def run_session(
                 )
                 next_ui_refresh_ts = now_ts + float(UI_REFRESH_DT_S)
 
-            discrete_keys = input_pump.pop_discrete()
+            discrete_keys: list[str] = []
+            if remote_relay is not None:
+                discrete_keys.extend(remote_relay.pop_discrete())
+            discrete_keys.extend(input_pump.pop_discrete())
             for key in discrete_keys:
                 if key in {KEY_QUIT, KEY_CTRL_C}:
                     status_line = "Exiting keyboard teleop."
                     return saved_episode_count
                 if _handle_discrete_key(key):
                     continue
-            move_x, move_y, move_z, rotate_axis = key_state.axes(now_ts)
+            if remote_active:
+                move_x, move_y, move_z, rotate_axis = remote_relay.axes(now_ts)
+            else:
+                move_x, move_y, move_z, rotate_axis = key_state.axes(now_ts)
             raw_linear_axis = np.array([move_x, move_y, move_z], dtype=np.float64)
             raw_rotate_axis = float(rotate_axis)
             raw_motion_active = (
@@ -354,7 +384,7 @@ def run_session(
             )
             motion_transition_started = bool(raw_motion_active and not raw_motion_active_prev)
             motion_changed = False
-            if key_state.backend == "terminal_repeat":
+            if (not remote_active) and key_state.backend == "terminal_repeat":
                 motion_event_count = input_pump.motion_event_count()
                 motion_changed = (
                     not raw_motion_active_prev
@@ -382,6 +412,11 @@ def run_session(
                     repeat_latch_waiting_repeat = False
                     repeat_latch_deadline = 0.0
                     repeat_latch_event_count = int(motion_event_count)
+            else:
+                latched_linear_axis = np.zeros(3, dtype=np.float64)
+                latched_rotate_axis = 0.0
+                repeat_latch_waiting_repeat = False
+                repeat_latch_deadline = 0.0
             raw_motion_active_prev = bool(raw_motion_active)
 
             linear_axis_cmd = raw_linear_axis
@@ -497,6 +532,8 @@ def run_session(
     finally:
         _stop_servo()
         input_pump.stop()
+        if remote_relay is not None:
+            remote_relay.stop()
         key_state.stop()
         term.close()
 

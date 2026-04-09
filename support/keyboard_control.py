@@ -41,6 +41,7 @@ KEY_CTRL_RIGHT = "CTRL_RIGHT"
 KEY_ENTER = "ENTER"
 KEY_SPACE = "SPACE"
 KEY_SHIFT = "SHIFT"
+KEY_TAB = "TAB"
 KEY_QUIT = "QUIT"
 KEY_CTRL_C = "CTRL_C"
 
@@ -89,6 +90,8 @@ def read_key(fd: int) -> str:
         return KEY_ENTER
     if ch == " ":
         return KEY_SPACE
+    if ch == "\t":
+        return KEY_TAB
     if ch.lower() == "q":
         return KEY_QUIT
     if ch != "\x1b":
@@ -349,6 +352,7 @@ def render_keyboard_ui(
     lines.append("    Enter: start/stop recording")
     lines.append("    Space: toggle gripper")
     lines.append("    Shift: edit prompt (idle only, helper)")
+    lines.append("    Tab: return home (idle only)")
     lines.append("    q / Ctrl+C: quit")
     lines.append("")
     if status_line:

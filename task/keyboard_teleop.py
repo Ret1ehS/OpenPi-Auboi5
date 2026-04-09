@@ -23,6 +23,7 @@ from support.keyboard_control import (
     KEY_RIGHT,
     KEY_SHIFT,
     KEY_SPACE,
+    KEY_TAB,
     KEY_UP,
     KEY_DOWN,
     RawTerminal,
@@ -49,6 +50,7 @@ REMOTE_AXIS_SLEW_PER_TICK = 0.35
 ENTER_INPUT_SUPPRESS_S = 0.06
 SPACE_INPUT_SUPPRESS_S = 0.15
 PROMPT_SWITCH_INPUT_SUPPRESS_S = 0.06
+HOME_INPUT_SUPPRESS_S = 0.20
 MAX_LINEAR_LEAD_M = 0.010
 MAX_YAW_LEAD_RAD = float(np.deg2rad(4.0))
 POSE_SEND_DEADBAND_M = 0.00035
@@ -390,6 +392,7 @@ def run_session(
     def _handle_discrete_key(key: str) -> bool:
         nonlocal recording, saving, recorded_frames, frame_idx, saved_episode_count
         nonlocal status_line, local_gripper_open, next_record_ts, input_suppress_until_ts
+        nonlocal command_pose_real, planned_pose_real, last_sent_pose_real, hold_pose_real, hold_joint6_rad
         if key == KEY_ENTER:
             _clear_pending_inputs()
             input_suppress_until_ts = time.monotonic() + float(ENTER_INPUT_SUPPRESS_S)
@@ -449,6 +452,26 @@ def run_session(
                 status_line = f"Gripper {'open' if local_gripper_open else 'closed'}"
             else:
                 status_line = "Gripper command failed"
+            return True
+
+        if key == KEY_TAB:
+            if recording:
+                status_line = "Ignore return-home while recording"
+                return True
+            _stop_servo()
+            _clear_pending_inputs()
+            input_suppress_until_ts = time.monotonic() + float(HOME_INPUT_SUPPRESS_S)
+            status_line = "Returning home..."
+            _render_ui(force=True)
+            home_pose = runtime.return_home("keyboard teleop return home")
+            command_pose_real[:] = np.asarray(home_pose, dtype=np.float64).reshape(6)
+            planned_pose_real[:] = command_pose_real
+            last_sent_pose_real = None
+            hold_pose_real = None
+            hold_joint6_rad = None
+            _clear_pending_inputs()
+            input_suppress_until_ts = time.monotonic() + float(HOME_INPUT_SUPPRESS_S)
+            status_line = "Returned home"
             return True
 
         return False

@@ -11,7 +11,7 @@ import threading
 import time
 from collections import deque
 
-from support.keyboard_control import KEY_ENTER, KEY_QUIT, KEY_SHIFT, KEY_SPACE
+from support.keyboard_control import KEY_ENTER, KEY_QUIT, KEY_SHIFT, KEY_SPACE, KEY_TAB
 
 
 REMOTE_HELPER_PATH = Path(__file__).with_name("keyboard_remote_client.ps1")
@@ -331,5 +331,7 @@ class RemoteKeyboardRelay:
                     self._discrete_keys.append(KEY_SPACE)
                 elif key == "SHIFT":
                     self._discrete_keys.append(KEY_SHIFT)
+                elif key == "TAB":
+                    self._discrete_keys.append(KEY_TAB)
                 elif key in {"QUIT", "ESC"}:
                     self._discrete_keys.append(KEY_QUIT)

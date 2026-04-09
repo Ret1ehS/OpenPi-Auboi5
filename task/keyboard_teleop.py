@@ -21,6 +21,7 @@ from support.keyboard_control import (
     KEY_LEFT,
     KEY_QUIT,
     KEY_RIGHT,
+    KEY_SHIFT,
     KEY_SPACE,
     KEY_UP,
     KEY_DOWN,
@@ -45,7 +46,9 @@ INITIAL_REPEAT_LATCH_S = 0.55
 TERMINAL_REPEAT_HOLD_S = 0.06
 REMOTE_RELEASE_HOLD_S = 0.03
 REMOTE_AXIS_SLEW_PER_TICK = 0.35
-DISCRETE_INPUT_SUPPRESS_S = 0.15
+ENTER_INPUT_SUPPRESS_S = 0.06
+SPACE_INPUT_SUPPRESS_S = 0.15
+PROMPT_SWITCH_INPUT_SUPPRESS_S = 0.06
 MAX_LINEAR_LEAD_M = 0.010
 MAX_YAW_LEAD_RAD = float(np.deg2rad(4.0))
 POSE_SEND_DEADBAND_M = 0.00035
@@ -145,6 +148,7 @@ def run_session(
     recorded_frames: list[Any] = []
     frame_idx = 0
     saved_episode_count = 0
+    current_prompt_text = str(config.prompt).strip()
     move_step_m = float(runtime.linear_speed) * float(CONTROL_DT_S) * float(TARGET_HORIZON_SCALE)
     rotate_step_deg = float(DEFAULT_ROTATE_SPEED_DEGPS) * float(CONTROL_DT_S) * float(TARGET_HORIZON_SCALE)
     status_line = "Ready. Enter starts recording. Idle periods are not recorded."
@@ -206,6 +210,12 @@ def run_session(
         frame_idx += 1
         next_record_ts = time.monotonic() + float(RAW_RECORD_DT_S)
 
+    term: RawTerminal | None = None
+    input_pump: _TerminalInputPump | None = None
+
+    def _current_prompt() -> str:
+        return current_prompt_text
+
     def _clear_pending_inputs() -> None:
         nonlocal raw_motion_active_prev
         nonlocal latched_linear_axis, latched_rotate_axis
@@ -213,11 +223,13 @@ def run_session(
         nonlocal remote_filtered_linear_axis, remote_filtered_rotate_axis
         nonlocal remote_release_linear_axis, remote_release_rotate_axis, remote_release_deadline
         key_state.clear()
-        input_pump.clear()
+        if input_pump is not None:
+            input_pump.clear()
         if remote_relay is not None:
             remote_relay.clear()
         try:
-            drain_keys(term.fd)
+            if term is not None:
+                drain_keys(term.fd)
         except Exception:
             pass
         raw_motion_active_prev = False
@@ -231,6 +243,35 @@ def run_session(
         remote_release_linear_axis = np.zeros(3, dtype=np.float64)
         remote_release_rotate_axis = 0.0
         remote_release_deadline = 0.0
+
+    def _edit_prompt() -> bool:
+        nonlocal term, input_pump, status_line, input_suppress_until_ts, current_prompt_text
+        if recording:
+            status_line = "Ignore prompt edit while recording"
+            return True
+        _clear_pending_inputs()
+        new_prompt = ""
+        try:
+            if input_pump is not None:
+                input_pump.stop()
+            key_state.stop()
+            if term is not None:
+                term.close()
+            new_prompt = input("\nNew prompt: ").strip()
+        finally:
+            term = RawTerminal.open()
+            input_pump = _TerminalInputPump(term.fd, key_state)
+            if not key_state.start(fd=term.fd, repeat_hold_s=TERMINAL_REPEAT_HOLD_S):
+                raise RuntimeError("continuous keyboard teleop backend unavailable")
+            input_pump.start()
+            _clear_pending_inputs()
+            input_suppress_until_ts = time.monotonic() + float(PROMPT_SWITCH_INPUT_SUPPRESS_S)
+        if new_prompt:
+            current_prompt_text = new_prompt
+            status_line = f"Prompt updated: {current_prompt_text}"
+        else:
+            status_line = f"Prompt unchanged: {current_prompt_text}"
+        return True
 
     def _ensure_servo_active() -> None:
         nonlocal servo_active, command_pose_real, planned_pose_real
@@ -325,42 +366,45 @@ def run_session(
         nonlocal status_line, local_gripper_open, next_record_ts, input_suppress_until_ts
         if key == KEY_ENTER:
             _clear_pending_inputs()
-            input_suppress_until_ts = time.monotonic() + float(DISCRETE_INPUT_SUPPRESS_S)
+            input_suppress_until_ts = time.monotonic() + float(ENTER_INPUT_SUPPRESS_S)
             if not recording:
                 recording = True
                 recorded_frames = []
                 frame_idx = 0
                 next_record_ts = 0.0
                 _append_current_snapshot()
-                status_line = f"Recording started: {config.prompt}"
+                status_line = f"Recording started: {_current_prompt()}"
             else:
                 recording = False
                 if recorded_frames:
                     episode_dir = save_episode_fn(
                         recorded_frames,
                         save_dir,
-                        config.prompt,
+                        _current_prompt(),
                         save_fps=config.save_fps,
                         state_mode=config.state_mode,
                     )
                     saved_episode_count += 1
-                    status_line = f"Saved {episode_dir.name} for prompt: {config.prompt}"
+                    status_line = f"Saved {episode_dir.name} for prompt: {_current_prompt()}"
                 else:
                     status_line = "Recording stopped: no frames captured"
                 recorded_frames = []
                 frame_idx = 0
             _clear_pending_inputs()
-            input_suppress_until_ts = time.monotonic() + float(DISCRETE_INPUT_SUPPRESS_S)
+            input_suppress_until_ts = time.monotonic() + float(ENTER_INPUT_SUPPRESS_S)
             return True
+
+        if key == KEY_SHIFT:
+            return _edit_prompt()
 
         if key == KEY_SPACE:
             _stop_servo()
             _clear_pending_inputs()
-            input_suppress_until_ts = time.monotonic() + float(DISCRETE_INPUT_SUPPRESS_S)
+            input_suppress_until_ts = time.monotonic() + float(SPACE_INPUT_SUPPRESS_S)
             target_state = 0 if local_gripper_open else 1
             ok = True if runtime.dry_run else runtime.command_gripper_state(target_state)
             _clear_pending_inputs()
-            input_suppress_until_ts = time.monotonic() + float(DISCRETE_INPUT_SUPPRESS_S)
+            input_suppress_until_ts = time.monotonic() + float(SPACE_INPUT_SUPPRESS_S)
             if ok:
                 local_gripper_open = bool(target_state == 1)
                 if config.state_mode != STATE_MODE_J6:
@@ -412,7 +456,7 @@ def run_session(
             if now_ts >= next_ui_refresh_ts:
                 print(
                     render_keyboard_ui(
-                        prompt=config.prompt,
+                        prompt=_current_prompt(),
                         recording=recording,
                         gripper_open=local_gripper_open,
                         state_mode=config.state_mode,

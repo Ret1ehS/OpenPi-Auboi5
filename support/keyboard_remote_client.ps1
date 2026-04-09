@@ -35,6 +35,7 @@ while ($true) {
 
         $prevEnter = $false
         $prevSpace = $false
+        $prevShift = $false
         $prevQ = $false
         $prevEsc = $false
 
@@ -44,6 +45,7 @@ while ($true) {
             $left = Test-KeyDown 0x25
             $right = Test-KeyDown 0x27
             $ctrl = Test-KeyDown 0x11
+            $shift = Test-KeyDown 0x10
 
             Write-JsonLine $writer ("{""type"":""state"",""token"":""" + $Token + """,""up"":" + $up.ToString().ToLower() + ",""down"":" + $down.ToString().ToLower() + ",""left"":" + $left.ToString().ToLower() + ",""right"":" + $right.ToString().ToLower() + ",""ctrl"":" + $ctrl.ToString().ToLower() + "}")
 
@@ -58,6 +60,11 @@ while ($true) {
                 Write-JsonLine $writer ("{""type"":""event"",""token"":""" + $Token + """,""key"":""SPACE""}")
             }
             $prevSpace = $spaceNow
+
+            if ($shift -and -not $prevShift) {
+                Write-JsonLine $writer ("{""type"":""event"",""token"":""" + $Token + """,""key"":""SHIFT""}")
+            }
+            $prevShift = $shift
 
             $qNow = Test-KeyDown 0x51
             if ($qNow -and -not $prevQ) {

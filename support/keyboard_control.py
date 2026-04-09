@@ -40,6 +40,7 @@ KEY_CTRL_LEFT = "CTRL_LEFT"
 KEY_CTRL_RIGHT = "CTRL_RIGHT"
 KEY_ENTER = "ENTER"
 KEY_SPACE = "SPACE"
+KEY_SHIFT = "SHIFT"
 KEY_QUIT = "QUIT"
 KEY_CTRL_C = "CTRL_C"
 
@@ -344,6 +345,7 @@ def render_keyboard_ui(
     lines.append(f"  {BOLD}Session{RESET}")
     lines.append("    Enter: start/stop recording")
     lines.append("    Space: toggle gripper")
+    lines.append("    Shift: edit prompt (idle only, helper)")
     lines.append("    q / Ctrl+C: quit")
     lines.append("")
     if status_line:

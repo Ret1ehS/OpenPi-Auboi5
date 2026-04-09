@@ -145,6 +145,7 @@ def run_session(
 
     local_gripper_open = True
     recording = False
+    saving = False
     recorded_frames: list[Any] = []
     frame_idx = 0
     saved_episode_count = 0
@@ -180,6 +181,8 @@ def run_session(
     remote_release_rotate_axis = 0.0
     remote_release_deadline = 0.0
     last_motion_source_remote = False
+    input_source = "terminal"
+    helper_command = ""
 
     def _slew_value(current: float, target: float, delta_max: float) -> float:
         delta = float(target) - float(current)
@@ -215,6 +218,29 @@ def run_session(
 
     def _current_prompt() -> str:
         return current_prompt_text
+
+    def _render_ui(force: bool = False) -> None:
+        nonlocal next_ui_refresh_ts
+        now_ts = time.monotonic()
+        if not force and now_ts < next_ui_refresh_ts:
+            return
+        print(
+            render_keyboard_ui(
+                prompt=_current_prompt(),
+                recording=recording,
+                saving=saving,
+                gripper_open=local_gripper_open,
+                state_mode=config.state_mode,
+                move_step_mm=move_step_m * 1000.0,
+                rotate_step_deg=rotate_step_deg,
+                input_source=input_source,
+                helper_command=helper_command,
+                status_line=status_line,
+            ),
+            end="",
+            flush=True,
+        )
+        next_ui_refresh_ts = now_ts + float(UI_REFRESH_DT_S)
 
     def _clear_pending_inputs() -> None:
         nonlocal raw_motion_active_prev
@@ -362,7 +388,7 @@ def run_session(
         return pose
 
     def _handle_discrete_key(key: str) -> bool:
-        nonlocal recording, recorded_frames, frame_idx, saved_episode_count
+        nonlocal recording, saving, recorded_frames, frame_idx, saved_episode_count
         nonlocal status_line, local_gripper_open, next_record_ts, input_suppress_until_ts
         if key == KEY_ENTER:
             _clear_pending_inputs()
@@ -376,17 +402,24 @@ def run_session(
                 status_line = f"Recording started: {_current_prompt()}"
             else:
                 recording = False
+                saving = True
+                status_line = f"Saving prompt: {_current_prompt()}"
+                _render_ui(force=True)
                 if recorded_frames:
-                    episode_dir = save_episode_fn(
-                        recorded_frames,
-                        save_dir,
-                        _current_prompt(),
-                        save_fps=config.save_fps,
-                        state_mode=config.state_mode,
-                    )
-                    saved_episode_count += 1
-                    status_line = f"Saved {episode_dir.name} for prompt: {_current_prompt()}"
+                    try:
+                        episode_dir = save_episode_fn(
+                            recorded_frames,
+                            save_dir,
+                            _current_prompt(),
+                            save_fps=config.save_fps,
+                            state_mode=config.state_mode,
+                        )
+                        saved_episode_count += 1
+                        status_line = f"Saved {episode_dir.name} for prompt: {_current_prompt()}"
+                    finally:
+                        saving = False
                 else:
+                    saving = False
                     status_line = "Recording stopped: no frames captured"
                 recorded_frames = []
                 frame_idx = 0
@@ -453,23 +486,7 @@ def run_session(
             else:
                 input_source = key_state.backend or "terminal"
                 helper_command = ""
-            if now_ts >= next_ui_refresh_ts:
-                print(
-                    render_keyboard_ui(
-                        prompt=_current_prompt(),
-                        recording=recording,
-                        gripper_open=local_gripper_open,
-                        state_mode=config.state_mode,
-                        move_step_mm=move_step_m * 1000.0,
-                        rotate_step_deg=rotate_step_deg,
-                        input_source=input_source,
-                        helper_command=helper_command,
-                        status_line=status_line,
-                    ),
-                    end="",
-                    flush=True,
-                )
-                next_ui_refresh_ts = now_ts + float(UI_REFRESH_DT_S)
+            _render_ui()
 
             if now_ts < input_suppress_until_ts:
                 _clear_pending_inputs()

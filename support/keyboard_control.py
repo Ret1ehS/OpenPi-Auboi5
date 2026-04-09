@@ -310,6 +310,7 @@ def render_keyboard_ui(
     *,
     prompt: str,
     recording: bool,
+    saving: bool = False,
     gripper_open: bool,
     state_mode: str,
     move_step_mm: float,
@@ -319,12 +320,14 @@ def render_keyboard_ui(
     status_line: str = "",
 ) -> str:
     lines: list[str] = []
+    record_color = FG_YELLOW if saving else (FG_RED if recording else FG_GREEN)
+    record_text = "SAVING" if saving else ("ON" if recording else "OFF")
     lines.append(f"{BOLD}{FG_CYAN}=== OpenPI Keyboard Collect ==={RESET}")
     lines.append("")
     lines.append(f"  Prompt:      {BOLD}{FG_WHITE}{prompt}{RESET}")
     lines.append(
         f"  Recording:   "
-        f"{BOLD}{(FG_RED if recording else FG_GREEN)}{'ON' if recording else 'OFF'}{RESET}"
+        f"{BOLD}{record_color}{record_text}{RESET}"
     )
     lines.append(f"  Gripper:     {BOLD}{FG_WHITE}{'open' if gripper_open else 'closed'}{RESET}")
     lines.append(f"  State Mode:  {BOLD}{FG_WHITE}{state_mode}{RESET}")

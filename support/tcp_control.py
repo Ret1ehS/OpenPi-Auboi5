@@ -79,6 +79,7 @@ FORCE_ADMITTANCE_STIFFNESS_N_PER_M = 2000.0
 FORCE_ADMITTANCE_MAX_BLOCK_Z_M = 0.010
 FORCE_ADMITTANCE_MIN_DT_S = 0.001
 FORCE_ADMITTANCE_MAX_DT_S = 0.05
+FORCE_ADMITTANCE_FORCE_DEADBAND_N = 1.5
 _FORCE_GUARD_UNSET = object()
 
 JOINT_NAMES = [
@@ -421,6 +422,7 @@ def _force_guard_meta(
     warning_active: bool,
     *,
     blocked_z_m: float | None = None,
+    target_fz_n: float | None = None,
 ) -> dict[str, object]:
     meta = {
         "force_guard_fz_n": force_z_n,
@@ -430,6 +432,8 @@ def _force_guard_meta(
     }
     if blocked_z_m is not None:
         meta["force_guard_blocked_z_m"] = float(blocked_z_m)
+    if target_fz_n is not None:
+        meta["force_guard_target_fz_n"] = float(target_fz_n)
     return meta
 
 
@@ -642,6 +646,7 @@ class _DaemonHelper:
         self._servo_force_guard_block_z_m = 0.0
         self._servo_force_guard_block_v_mps = 0.0
         self._servo_force_guard_last_apply_ts_s: float | None = None
+        self._servo_force_target_fz_n: float | None = None
 
     def _ensure_started(self) -> subprocess.Popen:
         if self._proc is not None and self._proc.poll() is None:
@@ -712,6 +717,7 @@ class _DaemonHelper:
             self._servo_force_guard_block_z_m = 0.0
             self._servo_force_guard_block_v_mps = 0.0
             self._servo_force_guard_last_apply_ts_s = None
+            self._servo_force_target_fz_n = None
             return self._send_cmd(f"servo_start {track_time_s:.12g}")
 
     def servo_begin_chunk(
@@ -733,6 +739,11 @@ class _DaemonHelper:
             self._servo_force_guard_warning_active = warning_active
             self._servo_force_guard_force_live = bool(force_live_mode)
             self._servo_force_guard_live_mode = bool(force_live_mode or warning_active)
+            self._servo_force_target_fz_n = (
+                max(float(force_z_n), float(FORCE_GUARD_SOFT_FZ_N))
+                if force_z_n is not None
+                else float(FORCE_GUARD_SOFT_FZ_N)
+            )
             return {
                 **sync_resp,
                 "force_guard_fz_n": force_z_n,
@@ -766,6 +777,12 @@ class _DaemonHelper:
         scale: float | None | object = _FORCE_GUARD_UNSET,
         warning_active: bool | object = _FORCE_GUARD_UNSET,
     ) -> tuple[np.ndarray, float | None, float | None, bool, bool]:
+        if (
+            force_z_n is _FORCE_GUARD_UNSET
+            or scale is _FORCE_GUARD_UNSET
+            or warning_active is _FORCE_GUARD_UNSET
+        ):
+            force_z_n, scale, warning_active = _get_force_guard_state(timeout_s=timeout_s)
         pose, ref, downward_dist, force_z_n, scale, warning_active = _prepare_force_guard(
             requested_pose,
             reference_pose,
@@ -777,10 +794,16 @@ class _DaemonHelper:
         dt_s = self._servo_force_guard_dt_s()
         block_z_m = float(self._servo_force_guard_block_z_m)
         block_v_mps = float(self._servo_force_guard_block_v_mps)
+        target_fz_n = float(
+            FORCE_GUARD_SOFT_FZ_N if self._servo_force_target_fz_n is None else self._servo_force_target_fz_n
+        )
         force_error_n = (
             0.0
             if force_z_n is None
-            else max(0.0, float(FORCE_ADMITTANCE_TARGET_FZ_N) - float(force_z_n))
+            else max(
+                0.0,
+                float(target_fz_n) - float(force_z_n) - float(FORCE_ADMITTANCE_FORCE_DEADBAND_N),
+            )
         )
 
         # Second-order outer-loop admittance on the blocked downward distance.
@@ -827,20 +850,11 @@ class _DaemonHelper:
         Used by data collection for frame-by-frame execution + capture."""
         requested = np.asarray(pose6, dtype=np.float64).reshape(POSE_DIM)
         reference = self._current_servo_reference_pose()
-        if self._servo_force_guard_force_live or self._servo_force_guard_live_mode:
-            guarded, force_z_n, scale, adjusted, warning_active = self._apply_servo_z_admittance(
-                requested,
-                reference,
-                timeout_s=0.0,
-            )
-        else:
-            guarded, force_z_n, scale, adjusted, warning_active = self._apply_servo_z_admittance(
-                requested,
-                reference,
-                force_z_n=self._servo_force_guard_fz_n,
-                scale=self._servo_force_guard_scale,
-                warning_active=self._servo_force_guard_warning_active,
-            )
+        guarded, force_z_n, scale, adjusted, warning_active = self._apply_servo_z_admittance(
+            requested,
+            reference,
+            timeout_s=0.0,
+        )
         cmd = "servo_pose " + " ".join(f"{v:.12g}" for v in guarded)
         with self._lock:
             resp = self._send_cmd(cmd)
@@ -851,6 +865,7 @@ class _DaemonHelper:
                 adjusted,
                 warning_active,
                 blocked_z_m=self._servo_force_guard_block_z_m,
+                target_fz_n=self._servo_force_target_fz_n,
             )
         )
         self._last_servo_pose_real = guarded
@@ -865,20 +880,11 @@ class _DaemonHelper:
         """Send one absolute task target with explicit j6 target in servo mode."""
         requested = np.asarray(pose6, dtype=np.float64).reshape(POSE_DIM)
         reference = self._current_servo_reference_pose()
-        if self._servo_force_guard_force_live or self._servo_force_guard_live_mode:
-            guarded, force_z_n, scale, adjusted, warning_active = self._apply_servo_z_admittance(
-                requested,
-                reference,
-                timeout_s=0.0,
-            )
-        else:
-            guarded, force_z_n, scale, adjusted, warning_active = self._apply_servo_z_admittance(
-                requested,
-                reference,
-                force_z_n=self._servo_force_guard_fz_n,
-                scale=self._servo_force_guard_scale,
-                warning_active=self._servo_force_guard_warning_active,
-            )
+        guarded, force_z_n, scale, adjusted, warning_active = self._apply_servo_z_admittance(
+            requested,
+            reference,
+            timeout_s=0.0,
+        )
         cmd = "servo_pose_j6 " + " ".join(f"{v:.12g}" for v in guarded) + f" {float(joint6):.12g}"
         with self._lock:
             resp = self._send_cmd(cmd)
@@ -889,6 +895,7 @@ class _DaemonHelper:
                 adjusted,
                 warning_active,
                 blocked_z_m=self._servo_force_guard_block_z_m,
+                target_fz_n=self._servo_force_target_fz_n,
             )
         )
         self._last_servo_pose_real = guarded
@@ -909,20 +916,11 @@ class _DaemonHelper:
         warning_active = self._servo_force_guard_warning_active
         reference = self._current_servo_reference_pose()
         for pose in poses_real:
-            if self._servo_force_guard_force_live or self._servo_force_guard_live_mode:
-                guarded, step_force_z_n, step_scale, step_adjusted, step_warning_active = self._apply_servo_z_admittance(
-                    pose,
-                    reference,
-                    timeout_s=0.0,
-                )
-            else:
-                guarded, step_force_z_n, step_scale, step_adjusted, step_warning_active = self._apply_servo_z_admittance(
-                    pose,
-                    reference,
-                    force_z_n=self._servo_force_guard_fz_n,
-                    scale=self._servo_force_guard_scale,
-                    warning_active=self._servo_force_guard_warning_active,
-                )
+            guarded, step_force_z_n, step_scale, step_adjusted, step_warning_active = self._apply_servo_z_admittance(
+                pose,
+                reference,
+                timeout_s=0.0,
+            )
             guarded_poses.append(guarded)
             if step_force_z_n is not None:
                 force_z_n = step_force_z_n
@@ -958,6 +956,7 @@ class _DaemonHelper:
                 adjusted,
                 warning_active,
                 blocked_z_m=self._servo_force_guard_block_z_m,
+                target_fz_n=self._servo_force_target_fz_n,
             )
         )
         if guarded_poses:
@@ -1070,6 +1069,7 @@ class _DaemonHelper:
             self._servo_force_guard_block_z_m = 0.0
             self._servo_force_guard_block_v_mps = 0.0
             self._servo_force_guard_last_apply_ts_s = None
+            self._servo_force_target_fz_n = None
             return resp
 
     def stop(self) -> None:

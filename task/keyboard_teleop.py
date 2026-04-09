@@ -168,6 +168,7 @@ def run_session(
     remote_release_linear_axis = np.zeros(3, dtype=np.float64)
     remote_release_rotate_axis = 0.0
     remote_release_deadline = 0.0
+    last_motion_source_remote = False
 
     def _slew_value(current: float, target: float, delta_max: float) -> float:
         delta = float(target) - float(current)
@@ -479,6 +480,7 @@ def run_session(
 
             try:
                 if has_linear or has_rotate:
+                    last_motion_source_remote = bool(remote_active)
                     if not servo_active:
                         command_pose_real = runtime.get_live_tcp_pose()
                         planned_pose_real = command_pose_real.copy()
@@ -506,7 +508,9 @@ def run_session(
                             planned_pose_real[5] = runtime.wrap_angle(float(planned_pose_real[5] + rotate_delta_rad))
 
                     planned_pose_real = _clip_command_pose(planned_pose_real)
-                    if motion_transition_started:
+                    if remote_active:
+                        command_pose_real = planned_pose_real.copy()
+                    elif motion_transition_started:
                         command_pose_real = planned_pose_real.copy()
                     else:
                         command_pose_real = _build_lookahead_pose(linear_velocity_xyz, yaw_velocity_radps)
@@ -551,11 +555,14 @@ def run_session(
                 else:
                     if servo_active:
                         if hold_pose_real is None:
-                            hold_pose_real = (
-                                last_sent_pose_real.copy()
-                                if last_sent_pose_real is not None
-                                else command_pose_real.copy()
-                            )
+                            if last_motion_source_remote and not runtime.dry_run:
+                                hold_pose_real = runtime.get_live_tcp_pose()
+                            else:
+                                hold_pose_real = (
+                                    last_sent_pose_real.copy()
+                                    if last_sent_pose_real is not None
+                                    else command_pose_real.copy()
+                                )
                             planned_pose_real = hold_pose_real.copy()
                             command_pose_real = hold_pose_real.copy()
                             last_sent_pose_real = hold_pose_real.copy()
@@ -563,6 +570,7 @@ def run_session(
                                 hold_joint6_rad = float(runtime.local_exec_joint6_rad)
                             else:
                                 hold_joint6_rad = None
+                            last_motion_source_remote = False
                         if config.state_mode == STATE_MODE_J6:
                             joint6_cmd = runtime.local_exec_joint6_rad if hold_joint6_rad is None else float(hold_joint6_rad)
                             resp = runtime.send_stream_joint6(joint6_cmd, hold_pose_real=hold_pose_real)

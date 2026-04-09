@@ -410,7 +410,7 @@ def build_clearing_steps(
                 is_rotate=obj.is_rotate,
                 deg=obj.deg,
                 note=f"clear pick {name}",
-                align_j6=True,
+                align_yaw=True,
             )
         )
         result.detach_top(name)
@@ -425,7 +425,7 @@ def build_clearing_steps(
                 is_rotate=False,
                 deg=0.0,
                 note=f"clear place {name}",
-                align_j6=True,
+                align_yaw=True,
             )
         )
         result.place_on_table(name, (float(clear_xy[0]), float(clear_xy[1])), is_rotate=False, deg=0.0)
@@ -637,7 +637,6 @@ def _obstacle_scene_to_pick_state(scene: ObstacleScene) -> dict[str, dict[str, A
             "xy": [float(ostate.xy[0]), float(ostate.xy[1])],
             "is_rotate": bool(ostate.is_rotate),
             "deg": float(ostate.deg),
-            "standard_j6_rad": None,
             "upper": ostate.upper,
             "lower": ostate.lower,
         }
@@ -751,7 +750,7 @@ def initialize_obstacle_scene(
                 level=0,
                 is_rotate=False,
                 deg=0.0,
-                align_j6=True,
+                align_yaw=True,
                 note=f"obstacle prep pick {obj_name}",
             )
             place_step = TaskStep(
@@ -761,7 +760,7 @@ def initialize_obstacle_scene(
                 level=0,
                 is_rotate=is_rotate,
                 deg=deg,
-                align_j6=True,
+                align_yaw=True,
                 note=f"obstacle prep place {obj_name}",
             )
             temp_state = {
@@ -769,7 +768,6 @@ def initialize_obstacle_scene(
                     "xy": [float(origin_xy[0]), float(origin_xy[1])],
                     "is_rotate": False,
                     "deg": 0.0,
-                    "standard_j6_rad": None,
                     "upper": None,
                     "lower": None,
                 }
@@ -850,7 +848,7 @@ def rearrange_open_close_scene(
             level=0,
             is_rotate=source_is_rotate,
             deg=source_deg,
-            align_j6=True,
+            align_yaw=True,
             note=pick_note,
         )
         place_step = TaskStep(
@@ -860,7 +858,7 @@ def rearrange_open_close_scene(
             level=level,
             is_rotate=target_is_rotate,
             deg=target_deg,
-            align_j6=True,
+            align_yaw=True,
             note=place_note,
         )
         temp_state: dict[str, dict[str, Any]] = {
@@ -868,7 +866,6 @@ def rearrange_open_close_scene(
                 "xy": [float(source_xy[0]), float(source_xy[1])],
                 "is_rotate": bool(source_is_rotate),
                 "deg": float(source_deg),
-                "standard_j6_rad": None,
                 "upper": None,
                 "lower": None,
             }

@@ -36,7 +36,6 @@ GRIPPER_THRESHOLD = 0.6
 MAX_EXEC_ACTION_INTERVALS = 10
 NATIVE_INTERP_FACTOR = 5  # 10 intervals -> 50 actions in native mode
 STATE_MODE_YAW = "yaw"
-STATE_MODE_J6 = "j6"
 DEFAULT_J6_HOME_RAD = 0.11434
 def _wrap_angle(angle: float) -> float:
     return float(math.atan2(math.sin(angle), math.cos(angle)))
@@ -404,10 +403,7 @@ class TrajectoryExecutor:
 
                 step = current_plan.steps[current_index]
                 step_joint6 = None if current_joint6_targets is None else float(current_joint6_targets[current_index])
-                if step_joint6 is None:
-                    resp = daemon.servo_pose(step.pose_real)
-                else:
-                    resp = daemon.servo_pose_j6(step.pose_real, step_joint6)
+                resp = daemon.servo_pose(step.pose_real)
                 pose_ret = int(resp.get("servo_pose_ret", -1))
                 error = str(resp.get("error", ""))
 
@@ -520,7 +516,7 @@ def main() -> int:
 
     import numpy as np
 
-    from support.get_obs import RealRobotOpenPIObservationBuilder, STATE_MODE_J6, STATE_MODE_YAW
+    from support.get_obs import RealRobotOpenPIObservationBuilder, STATE_MODE_YAW
     from support.gripper_control import (
         command_gripper_state,
         get_gripper_status,
@@ -639,18 +635,14 @@ def main() -> int:
     print(f"POLICY_READY={type(policy).__name__}  load_time={policy_load_s:.3f}s")
     print(f"POSE_FRAME={get_alignment_mode()}")
 
-    obs_state_mode = str(cfg.obs_state_mode).strip().lower()
-    if obs_state_mode not in (STATE_MODE_YAW, STATE_MODE_J6):
-        print(
-            f"Invalid TUI State Mode={obs_state_mode!r}, "
-            f"fallback to '{STATE_MODE_YAW}' (valid: '{STATE_MODE_YAW}'/'{STATE_MODE_J6}')"
-        )
-        obs_state_mode = STATE_MODE_YAW
+    obs_state_mode = STATE_MODE_YAW
+    if str(cfg.obs_state_mode).strip().lower() != STATE_MODE_YAW:
+        print(f"State Mode '{cfg.obs_state_mode}' overridden to '{STATE_MODE_YAW}' on yaw-refactor branch.")
     print(f"OBS_STATE_MODE={obs_state_mode}")
-    use_joint6_mode = obs_state_mode == STATE_MODE_J6
-    semantic_joint6_rad: float | None = float(DEFAULT_J6_HOME_RAD) if use_joint6_mode else None
+    use_joint6_mode = False
+    semantic_joint6_rad: float | None = None
     obs_builder = RealRobotOpenPIObservationBuilder(state_mode=obs_state_mode)
-    obs_builder.set_semantic_joint6_scalar(semantic_joint6_rad if use_joint6_mode else None)
+    obs_builder.set_semantic_joint6_scalar(None)
     cameras_ready = False
 
     def ensure_cameras_ready() -> None:
@@ -703,8 +695,6 @@ def main() -> int:
                 print(f"  Execute: {execute}  Lock Yaw: {cfg.lock_yaw}")
                 print(f"  TCP pose: {np.round(snap.tcp_pose, 5).tolist()}")
                 print(f"  Joint q (deg): {np.round(np.degrees(snap.joint_q), 2).tolist()}")
-                if use_joint6_mode and semantic_joint6_rad is not None:
-                    print(f"  Semantic j6 (deg): {round(np.degrees(semantic_joint6_rad), 2)}")
                 print(f"  Collision: {snap.collision}")
                 print(f"  Safety limits OK: {snap.within_safety_limits}")
                 print(f"  Executor idle: {executor.is_idle}")
@@ -715,20 +705,10 @@ def main() -> int:
         if cmd_lower == "align":
             executor.clear_pending()
             executor.wait_until_idle()
-            if use_joint6_mode:
-                semantic_joint6_rad = float(DEFAULT_J6_HOME_RAD)
-                obs_builder.set_semantic_joint6_scalar(semantic_joint6_rad)
-                executor.reset_state(semantic_joint6=semantic_joint6_rad)
-            else:
-                executor.reset_state()
+            executor.reset_state()
             print("Moving to initial joint positions...")
             result = move_to_joint_positions(initial_qpos_rad, execute=execute)
-            if use_joint6_mode:
-                semantic_joint6_rad = float(DEFAULT_J6_HOME_RAD)
-                obs_builder.set_semantic_joint6_scalar(semantic_joint6_rad)
-                executor.reset_state(semantic_joint6=semantic_joint6_rad)
-            else:
-                executor.reset_state()
+            executor.reset_state()
             print(f"  Result: ok={result.ok}, reason={result.reason}")
             if execute:
                 if result.ok:
@@ -759,12 +739,7 @@ def main() -> int:
         if cmd_lower == "reset":
             executor.clear_pending()
             executor.wait_until_idle()
-            if use_joint6_mode:
-                semantic_joint6_rad = float(DEFAULT_J6_HOME_RAD)
-                obs_builder.set_semantic_joint6_scalar(semantic_joint6_rad)
-                executor.reset_state(semantic_joint6=semantic_joint6_rad)
-            else:
-                executor.reset_state()
+            executor.reset_state()
             obs_builder.reset_pose_filter()
             policy.reset()
             print("Policy state reset. Executor state cleared.")
@@ -777,12 +752,7 @@ def main() -> int:
         print("  Press Ctrl+C to stop.\n")
 
         policy.reset()
-        if use_joint6_mode:
-            semantic_joint6_rad = float(DEFAULT_J6_HOME_RAD)
-            obs_builder.set_semantic_joint6_scalar(semantic_joint6_rad)
-            executor.reset_state(semantic_joint6=semantic_joint6_rad)
-        else:
-            executor.reset_state()
+        executor.reset_state()
 
         if execute:
             print("Auto-init: aligning joints...")
@@ -802,8 +772,6 @@ def main() -> int:
         ensure_cameras_ready()
         obs_builder.reset_pose_filter()
         obs_builder.set_gripper_open_scalar(1.0)
-        if use_joint6_mode:
-            obs_builder.set_semantic_joint6_scalar(semantic_joint6_rad)
         step = 0
         last_gripper_state: int | None = None
 
@@ -880,21 +848,12 @@ def main() -> int:
                 print(f"  [{step_id:4d}] Gripper cache unchanged after failed command")
 
         def _sync_semantic_joint6_from_executor() -> None:
-            nonlocal semantic_joint6_rad
-            if not use_joint6_mode:
-                return
-            latest_joint6 = executor.expected_joint6
-            if latest_joint6 is not None:
-                semantic_joint6_rad = float(latest_joint6)
-            obs_builder.set_semantic_joint6_scalar(semantic_joint6_rad)
+            return
 
         try:
             while True:
                 loop_start = time.monotonic()
                 step += 1
-                if use_joint6_mode:
-                    obs_builder.set_semantic_joint6_scalar(semantic_joint6_rad)
-
                 aligned_obs = obs_builder.build_observation(prompt)
                 obs = aligned_obs.obs
 
@@ -916,11 +875,7 @@ def main() -> int:
                 tcp_deltas[:, :3] = exec_actions[:, :3]
                 tcp_deltas[:, 3:5] = exec_actions[:, 3:5]
                 joint6_deltas = None
-                if use_joint6_mode:
-                    tcp_deltas[:, 5] = 0.0
-                    joint6_deltas = np.asarray(exec_actions[:, 5], dtype=np.float64).copy()
-                else:
-                    tcp_deltas[:, 5] = exec_actions[:, 5]
+                tcp_deltas[:, 5] = exec_actions[:, 5]
 
                 # Native mode: linearly interpolate 10 intervals -> 50 actions
                 if is_native_speed:
@@ -930,12 +885,6 @@ def main() -> int:
                         axis=0,
                     )
                     tcp_deltas = interp_deltas
-                    if joint6_deltas is not None:
-                        joint6_deltas = np.repeat(
-                            joint6_deltas / float(NATIVE_INTERP_FACTOR),
-                            NATIVE_INTERP_FACTOR,
-                            axis=0,
-                        )
                     # Also expand exec_actions for gripper edge detection
                     exec_actions = np.repeat(exec_actions, NATIVE_INTERP_FACTOR, axis=0)
 
@@ -953,18 +902,15 @@ def main() -> int:
                     scheduled_gripper_idx = int(edge_indices[0])
                     scheduled_gripper_state = int(gripper_targets[scheduled_gripper_idx])
                     tcp_prefix = tcp_deltas[: scheduled_gripper_idx + 1]
-                    if joint6_deltas is not None:
-                        joint6_prefix = joint6_deltas[: scheduled_gripper_idx + 1]
-                    else:
-                        joint6_prefix = None
+                    joint6_prefix = None
                 else:
-                    joint6_prefix = joint6_deltas
+                    joint6_prefix = None
 
                 executor.submit(
                     tcp_prefix,
                     aligned_obs.aligned_tcp_pose_sim,
                     joint6_deltas=joint6_prefix,
-                    semantic_joint6=semantic_joint6_rad,
+                    semantic_joint6=None,
                 )
 
                 gripper_changed = scheduled_gripper_state is not None
@@ -980,10 +926,7 @@ def main() -> int:
                     last_res = executor.last_result
                     if last_res and not last_res.ok:
                         print(f"    Track error before gripper command: {last_res.reason}")
-                        if use_joint6_mode:
-                            executor.reset_state(semantic_joint6=semantic_joint6_rad)
-                        else:
-                            executor.reset_state()
+                        executor.reset_state()
                     else:
                         _apply_gripper_command(step, int(scheduled_gripper_state))
                 else:
@@ -995,10 +938,7 @@ def main() -> int:
                     last_res = executor.last_result
                     if last_res and not last_res.ok:
                         print(f"    Track error: {last_res.reason}")
-                        if use_joint6_mode:
-                            executor.reset_state(semantic_joint6=semantic_joint6_rad)
-                        else:
-                            executor.reset_state()
+                        executor.reset_state()
 
                 loop_time = time.monotonic() - loop_start
                 last_res = executor.last_result
@@ -1015,10 +955,7 @@ def main() -> int:
 
                 if last_res and not last_res.ok:
                     print(f"    Track error: {last_res.reason}")
-                    if use_joint6_mode:
-                        executor.reset_state(semantic_joint6=semantic_joint6_rad)
-                    else:
-                        executor.reset_state()
+                    executor.reset_state()
 
                 if gripper_changed:
                     continue
@@ -1029,10 +966,7 @@ def main() -> int:
             print("\n  Waiting for in-flight trajectory to finish...")
             executor.wait_until_idle()
             _sync_semantic_joint6_from_executor()
-            if use_joint6_mode:
-                executor.reset_state(semantic_joint6=semantic_joint6_rad)
-            else:
-                executor.reset_state()
+            executor.reset_state()
             if _rec_thread is not None:
                 _rec_stop.set()
                 _rec_thread.join(timeout=3)

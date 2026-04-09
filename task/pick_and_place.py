@@ -44,7 +44,6 @@ class ObjectState:
     xy: tuple[float, float]
     is_rotate: bool
     deg: float
-    standard_j6_rad: float | None = None
     upper: str | None = None
     lower: str | None = None
 
@@ -59,7 +58,7 @@ class TaskStep:
     deg: float
     note: str
     support_name: str | None = None
-    align_j6: bool = False
+    align_yaw: bool = False
 
 
 @dataclass
@@ -122,17 +121,14 @@ class SceneState:
                 return None
             is_rotate = bool(raw.get("is_rotate", False))
             deg = float(raw.get("deg", 0.0))
-            standard_j6_rad = _normalize_optional_j6(raw.get("standard_j6_rad"))
             if name == APPLE_NAME:
                 is_rotate = False
                 deg = 0.0
-                standard_j6_rad = None
             objects[name] = ObjectState(
                 name=name,
                 xy=_normalize_xy_tuple(xy),
                 is_rotate=is_rotate,
                 deg=deg,
-                standard_j6_rad=standard_j6_rad if is_rotate else None,
                 upper=_normalize_link(raw.get("upper")),
                 lower=_normalize_link(raw.get("lower")),
             )
@@ -157,19 +153,16 @@ class SceneState:
                 deg = float(np.rad2deg(float(saved_j6 or 0.0) - DEFAULT_J6_HOME_RAD))
                 is_rotate = abs(deg) > 1e-6 and name != APPLE_NAME
             else:
-                saved_j6 = _normalize_optional_j6(raw.get("standard_j6_rad"))
                 deg = float(raw.get("deg", 0.0))
                 is_rotate = bool(raw.get("is_rotate", False))
             if name == APPLE_NAME:
                 deg = 0.0
                 is_rotate = False
-                saved_j6 = None
             objects[name] = ObjectState(
                 name=name,
                 xy=_normalize_xy_tuple(xy),
                 is_rotate=is_rotate,
                 deg=deg,
-                standard_j6_rad=saved_j6 if is_rotate else None,
                 upper=_normalize_link(raw.get("upper")),
                 lower=_normalize_link(raw.get("lower")),
             )
@@ -183,7 +176,6 @@ class SceneState:
                     xy=tuple(obj.xy),
                     is_rotate=bool(obj.is_rotate),
                     deg=float(obj.deg),
-                    standard_j6_rad=None if obj.standard_j6_rad is None else float(obj.standard_j6_rad),
                     upper=obj.upper,
                     lower=obj.lower,
                 )
@@ -197,7 +189,6 @@ class SceneState:
                 "xy": [float(obj.xy[0]), float(obj.xy[1])],
                 "is_rotate": bool(obj.is_rotate),
                 "deg": 0.0 if not obj.is_rotate else float(obj.deg),
-                "standard_j6_rad": None if (name == APPLE_NAME or not obj.is_rotate or obj.standard_j6_rad is None) else float(obj.standard_j6_rad),
                 "upper": obj.upper,
                 "lower": obj.lower,
             }
@@ -257,11 +248,9 @@ class SceneState:
         if name == APPLE_NAME:
             obj.is_rotate = False
             obj.deg = 0.0
-            obj.standard_j6_rad = None
         else:
             obj.is_rotate = bool(is_rotate)
             obj.deg = 0.0 if not is_rotate else float(deg)
-            obj.standard_j6_rad = None
         obj.lower = None
 
     def place_on_target(self, name: str, target_name: str, *, is_rotate: bool, deg: float) -> str:
@@ -275,11 +264,9 @@ class SceneState:
         if name == APPLE_NAME:
             obj.is_rotate = False
             obj.deg = 0.0
-            obj.standard_j6_rad = None
         else:
             obj.is_rotate = bool(is_rotate)
             obj.deg = 0.0 if not is_rotate else float(deg)
-            obj.standard_j6_rad = None
         obj.lower = actual_target
         self.objects[actual_target].upper = name
         return actual_target
@@ -354,7 +341,7 @@ def _build_pick_plan(scene: SceneState, source_name: str, *, config: PlannerConf
             level=0,
             is_rotate=post_is_rotate,
             deg=post_deg,
-            align_j6=_should_align_j6(source_name, is_rotate=post_is_rotate),
+            align_yaw=_should_align_yaw(source_name, is_rotate=post_is_rotate),
             note=f"post-place {source_name}",
         )
     ]
@@ -390,7 +377,7 @@ def _build_place_plan(scene: SceneState, source_name: str, target_name: str, *, 
             level=place_level,
             is_rotate=place_is_rotate,
             deg=place_deg,
-            align_j6=_should_align_j6(source_name, is_rotate=place_is_rotate),
+            align_yaw=_should_align_yaw(source_name, is_rotate=place_is_rotate),
             note=f"place {source_name} on {target_name}",
             support_name=actual_support,
         )
@@ -439,7 +426,7 @@ def _plan_clear_above(
             level=0,
             is_rotate=False,
             deg=0.0,
-            align_j6=bool(upper_name != APPLE_NAME),
+            align_yaw=bool(upper_name != APPLE_NAME),
             note=f"place cleared {upper_name} to table",
         )
     )
@@ -448,7 +435,7 @@ def _plan_clear_above(
 
 def _make_pick_step(scene: SceneState, object_name: str, *, note: str) -> TaskStep:
     obj = scene.get(object_name)
-    should_align_j6 = _should_align_j6(object_name, is_rotate=obj.is_rotate)
+    should_align_yaw = _should_align_yaw(object_name, is_rotate=obj.is_rotate)
     return TaskStep(
         kind="pick",
         object_name=object_name,
@@ -456,7 +443,7 @@ def _make_pick_step(scene: SceneState, object_name: str, *, note: str) -> TaskSt
         level=scene.depth(object_name),
         is_rotate=bool(obj.is_rotate),
         deg=0.0 if not obj.is_rotate else float(obj.deg),
-        align_j6=should_align_j6,
+        align_yaw=should_align_yaw,
         note=note,
     )
 
@@ -470,7 +457,7 @@ def _make_place_step(
     level: int,
     is_rotate: bool,
     deg: float,
-    align_j6: bool,
+    align_yaw: bool,
     note: str,
     support_name: str | None = None,
 ) -> TaskStep:
@@ -482,15 +469,15 @@ def _make_place_step(
         level=int(level),
         is_rotate=bool(is_rotate),
         deg=0.0 if not is_rotate else float(deg),
-        align_j6=bool(align_j6),
+        align_yaw=bool(align_yaw),
         note=note,
         support_name=support_name if target_name is not None else None,
     )
 
 
-def _should_align_j6(object_name: str, *, is_rotate: bool) -> bool:
+def _should_align_yaw(object_name: str, *, is_rotate: bool) -> bool:
     _ = is_rotate
-    # Non-apple objects always align J6 to step.deg; deg=0 means return to the default baseline angle.
+    # Non-apple objects always align tool yaw to step.deg; deg=0 means return to the default baseline angle.
     return bool(object_name != APPLE_NAME)
 
 
@@ -648,30 +635,6 @@ def get_object_deg(scene_state: dict[str, dict[str, Any]], name: str) -> float:
     return float(scene_state[name]["deg"])
 
 
-def get_object_standard_j6_rad(scene_state: dict[str, dict[str, Any]], name: str) -> float | None:
-    raw = scene_state.get(name, {}).get("standard_j6_rad")
-    if raw is None:
-        return None
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return None
-
-
-def set_object_standard_j6_rad(
-    scene_state: dict[str, dict[str, Any]],
-    name: str,
-    joint6_rad: float | None,
-) -> None:
-    state = scene_state.get(name)
-    if not isinstance(state, dict):
-        return
-    if name == APPLE_NAME or not bool(state.get("is_rotate", False)) or joint6_rad is None:
-        state["standard_j6_rad"] = None
-        return
-    state["standard_j6_rad"] = float(joint6_rad)
-
-
 def sample_initial_object_state(
     scene_state: dict[str, dict[str, Any]],
     origin_xy: np.ndarray,
@@ -714,7 +677,6 @@ def sample_initial_object_state(
         "xy": [float(candidate[0]), float(candidate[1])],
         "is_rotate": bool(is_rotate),
         "deg": float(deg),
-        "standard_j6_rad": None,
         "upper": None,
         "lower": None,
     }
@@ -794,7 +756,7 @@ def prepare_session(
                 level=0,
                 is_rotate=False,
                 deg=0.0,
-                align_j6=bool(object_name != APPLE_NAME),
+                align_yaw=bool(object_name != APPLE_NAME),
                 note=f"prep pick {object_name}",
             )
             place_step = TaskStep(
@@ -804,7 +766,7 @@ def prepare_session(
                 level=0,
                 is_rotate=bool(placed_state["is_rotate"]),
                 deg=float(placed_state["deg"]),
-                align_j6=bool(object_name != APPLE_NAME),
+                align_yaw=bool(object_name != APPLE_NAME),
                 note=f"prep place {object_name}",
             )
             _, held_after_prep = execute_step_sequence(
@@ -934,7 +896,6 @@ def scene_place_object(state: dict[str, dict[str, Any]], step: TaskStep) -> None
     if step.object_name == APPLE_NAME:
         obj["is_rotate"] = False
         obj["deg"] = 0.0
-        obj["standard_j6_rad"] = None
     else:
         obj["is_rotate"] = bool(step.is_rotate)
         obj["deg"] = 0.0 if not step.is_rotate else float(step.deg)
@@ -946,34 +907,28 @@ def commit_place_state(state: dict[str, dict[str, Any]], step: TaskStep) -> dict
     return normalized_state
 
 
-def resolve_step_target_joint6_rad(runtime, step: TaskStep, lookup_scene_state: dict[str, dict[str, Any]]) -> float:
-    target_joint6_rad = float(runtime.j6_target_from_deg(step.deg))
+def resolve_step_target_yaw_rad(runtime, step: TaskStep, lookup_scene_state: dict[str, dict[str, Any]]) -> float:
+    target_yaw_rad = float(runtime.yaw_target_from_deg(step.deg))
     if step.object_name == APPLE_NAME or not step.is_rotate:
-        return target_joint6_rad
-
+        return target_yaw_rad
     if step.kind == "pick":
         reference_name = step.object_name
     elif step.support_name is not None:
         reference_name = step.support_name
     else:
         reference_name = None
-
     if reference_name is None:
-        return target_joint6_rad
-
-    saved_joint6_rad = get_object_standard_j6_rad(lookup_scene_state, reference_name)
-    if saved_joint6_rad is None:
-        return target_joint6_rad
-    return float(saved_joint6_rad)
+        return target_yaw_rad
+    return float(runtime.yaw_target_from_deg(get_object_deg(lookup_scene_state, reference_name)))
 
 
-def should_align_joint6_for_step(runtime, step: TaskStep, lookup_scene_state: dict[str, dict[str, Any]]) -> tuple[bool, float]:
-    target_joint6_rad = resolve_step_target_joint6_rad(runtime, step, lookup_scene_state)
-    need_align = bool(step.align_j6) and (
-        abs(runtime.wrap_angle(float(runtime.local_exec_joint6_rad) - float(target_joint6_rad)))
-        > float(runtime.default_j6_exec_tol_rad)
+def should_align_yaw_for_step(runtime, step: TaskStep, lookup_scene_state: dict[str, dict[str, Any]]) -> tuple[bool, float]:
+    target_yaw_rad = resolve_step_target_yaw_rad(runtime, step, lookup_scene_state)
+    current_yaw_rad = float(runtime.get_live_tcp_pose()[5]) if not runtime.dry_run else float(runtime.home_real[5])
+    need_align = bool(step.align_yaw) and (
+        abs(runtime.wrap_angle(float(current_yaw_rad) - float(target_yaw_rad))) > float(runtime.default_j6_exec_tol_rad)
     )
-    return need_align, float(target_joint6_rad)
+    return need_align, float(target_yaw_rad)
 
 
 def execute_pick_step(
@@ -988,12 +943,12 @@ def execute_pick_step(
     target_z = float(runtime.z_for_pick_level(step.level))
     above_z = float(runtime.min_tcp_z + runtime.approach_z_offset_m)
     step_frames: list[Any] = []
-    should_align_joint6, target_joint6_rad = should_align_joint6_for_step(runtime, step, lookup_scene_state)
+    should_align_yaw, target_yaw_rad = should_align_yaw_for_step(runtime, step, lookup_scene_state)
 
     if runtime.dry_run:
-        dummy_count = 12 + (3 if should_align_joint6 else 0)
+        dummy_count = 12 + (3 if should_align_yaw else 0)
         sim_pose = real_pose_to_sim(runtime.home_real)
-        joint6 = target_joint6_rad if should_align_joint6 else runtime.local_exec_joint6_rad
+        joint6 = runtime.local_exec_joint6_rad
         for idx in range(dummy_count):
             step_frames.append(
                 runtime.make_dummy_frame(
@@ -1003,8 +958,6 @@ def execute_pick_step(
                     frame_idx=frame_idx + idx,
                 )
             )
-        if should_align_joint6:
-            runtime.local_exec_joint6_rad = float(target_joint6_rad)
         return step_frames, frame_idx + len(step_frames)
 
     print(
@@ -1022,19 +975,21 @@ def execute_pick_step(
         step_frames.extend(seg)
     frame_idx += len(seg)
 
-    if should_align_joint6:
-        seg = runtime.record_joint6_rotation(
-            target_joint6=float(target_joint6_rad),
+    if should_align_yaw:
+        align_pose = above_pose.copy()
+        align_pose[5] = float(target_yaw_rad)
+        seg = runtime.record_pose_move(
+            align_pose,
             gripper=1.0,
             start_frame_idx=frame_idx,
             record=record,
+            semantic_joint6=runtime.local_exec_joint6_rad,
         )
         if record:
             step_frames.extend(seg)
         frame_idx += len(seg)
-        runtime.local_exec_joint6_rad = float(target_joint6_rad)
 
-    down_pose = runtime.build_pose_from_live_orientation(float(target_xy[0]), float(target_xy[1]), float(target_z))
+    down_pose = runtime.build_pose_from_live_orientation_yaw(float(target_xy[0]), float(target_xy[1]), float(target_z), float(target_yaw_rad))
     seg = runtime.record_pose_move(
         down_pose,
         gripper=1.0,
@@ -1050,7 +1005,7 @@ def execute_pick_step(
         f"close gripper on {step.object_name}",
     )
 
-    lift_pose = runtime.build_pose_from_live_orientation(float(target_xy[0]), float(target_xy[1]), float(above_z))
+    lift_pose = runtime.build_pose_from_live_orientation_yaw(float(target_xy[0]), float(target_xy[1]), float(above_z), float(target_yaw_rad))
     seg = runtime.record_pose_move(
         lift_pose,
         gripper=0.0,
@@ -1076,12 +1031,12 @@ def execute_place_step(
     target_z = float(runtime.z_for_place_level(step.level))
     above_z = float(runtime.min_tcp_z + runtime.approach_z_offset_m)
     step_frames: list[Any] = []
-    should_align_joint6, target_joint6_rad = should_align_joint6_for_step(runtime, step, lookup_scene_state)
+    should_align_yaw, target_yaw_rad = should_align_yaw_for_step(runtime, step, lookup_scene_state)
 
     if runtime.dry_run:
-        dummy_count = 10 + (3 if should_align_joint6 else 0)
+        dummy_count = 10 + (3 if should_align_yaw else 0)
         sim_pose = real_pose_to_sim(runtime.home_real)
-        joint6 = target_joint6_rad if should_align_joint6 else runtime.local_exec_joint6_rad
+        joint6 = runtime.local_exec_joint6_rad
         for idx in range(dummy_count):
             step_frames.append(
                 runtime.make_dummy_frame(
@@ -1091,13 +1046,6 @@ def execute_place_step(
                     frame_idx=frame_idx + idx,
                 )
             )
-        if should_align_joint6:
-            runtime.local_exec_joint6_rad = float(target_joint6_rad)
-        set_object_standard_j6_rad(
-            result_scene_state,
-            step.object_name,
-            runtime.local_exec_joint6_rad if step.is_rotate else None,
-        )
         normalized_state = commit_place_state(result_scene_state, step)
         if normalized_state is not None:
             runtime.cleanup_scene_state = normalized_state
@@ -1118,19 +1066,21 @@ def execute_place_step(
         step_frames.extend(seg)
     frame_idx += len(seg)
 
-    if should_align_joint6:
-        seg = runtime.record_joint6_rotation(
-            target_joint6=float(target_joint6_rad),
+    if should_align_yaw:
+        align_pose = above_pose.copy()
+        align_pose[5] = float(target_yaw_rad)
+        seg = runtime.record_pose_move(
+            align_pose,
             gripper=0.0,
             start_frame_idx=frame_idx,
             record=record,
+            semantic_joint6=runtime.local_exec_joint6_rad,
         )
         if record:
             step_frames.extend(seg)
         frame_idx += len(seg)
-        runtime.local_exec_joint6_rad = float(target_joint6_rad)
 
-    down_pose = runtime.build_pose_from_live_orientation(float(target_xy[0]), float(target_xy[1]), float(target_z))
+    down_pose = runtime.build_pose_from_live_orientation_yaw(float(target_xy[0]), float(target_xy[1]), float(target_z), float(target_yaw_rad))
     seg = runtime.record_pose_move(
         down_pose,
         gripper=0.0,
@@ -1140,12 +1090,6 @@ def execute_place_step(
     if record:
         step_frames.extend(seg)
     frame_idx += len(seg)
-    set_object_standard_j6_rad(
-        result_scene_state,
-        step.object_name,
-        runtime.local_exec_joint6_rad if step.is_rotate else None,
-    )
-
     runtime.ensure_gripper_ok(
         runtime.command_gripper_state(1),
         f"open gripper for {step.object_name}",
@@ -1154,7 +1098,7 @@ def execute_place_step(
     if normalized_state is not None:
         runtime.cleanup_scene_state = normalized_state
 
-    lift_pose = runtime.build_pose_from_live_orientation(float(target_xy[0]), float(target_xy[1]), float(above_z))
+    lift_pose = runtime.build_pose_from_live_orientation_yaw(float(target_xy[0]), float(target_xy[1]), float(above_z), float(target_yaw_rad))
     seg = runtime.record_pose_move(
         lift_pose,
         gripper=1.0,
@@ -1239,7 +1183,6 @@ __all__ = [
     "finalize_episode",
     "get_object_deg",
     "get_object_is_rotate",
-    "get_object_standard_j6_rad",
     "get_object_xy",
     "load_scene_state",
     "PickAndPlaceRecordedEpisode",
@@ -1253,6 +1196,5 @@ __all__ = [
     "scene_detach_top",
     "scene_place_object",
     "scene_top_of",
-    "set_object_standard_j6_rad",
-    "should_align_joint6_for_step",
+    "should_align_yaw_for_step",
 ]

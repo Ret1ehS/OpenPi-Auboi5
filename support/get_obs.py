@@ -45,7 +45,6 @@ WRIST_CAMERA_KEY = "observation/wrist_image"
 STATE_KEY = "observation/state"
 PROMPT_KEY = "prompt"
 STATE_MODE_YAW = "yaw"
-STATE_MODE_J6 = "j6"
 
 SERIAL_ROLE_HINTS = {
     "335": "main",
@@ -191,16 +190,6 @@ def pose6_to_openpi_state(pose6_zyx: np.ndarray, gripper_open: float) -> np.ndar
     aa = _quat_to_axis_angle_wxyz(quat)
     return np.concatenate(
         [pose[:3].astype(np.float32), aa, [float(gripper_open)]],
-        axis=0,
-    ).astype(np.float32)
-
-
-def pose6_to_openpi_state_j6(pose6_zyx: np.ndarray, gripper_open: float, joint6: float) -> np.ndarray:
-    pose = np.asarray(pose6_zyx, dtype=np.float64).reshape(6)
-    quat = _euler_zyx_to_quat_wxyz(pose[3:6])
-    aa = _quat_to_axis_angle_wxyz(quat)
-    return np.concatenate(
-        [pose[:3].astype(np.float32), aa, [float(gripper_open), float(joint6)]],
         axis=0,
     ).astype(np.float32)
 
@@ -364,7 +353,6 @@ class RealRobotOpenPIObservationBuilder:
         self._pool = ThreadPoolExecutor(max_workers=6)
         # Observation path uses the local cache as the authoritative gripper state.
         self._gripper_open_scalar: float = 1.0  # default: open
-        self._semantic_joint6_scalar: float | None = None
         self.set_state_mode(state_mode)
 
     def _apply_camera_profile(self, role: str, dev) -> None:
@@ -375,13 +363,12 @@ class RealRobotOpenPIObservationBuilder:
         self._gripper_open_scalar = float(value)
 
     def set_semantic_joint6_scalar(self, value: float | None) -> None:
-        """Update the local semantic j6 state used by j6-mode observations."""
-        self._semantic_joint6_scalar = None if value is None else float(value)
+        _ = value
 
     def set_state_mode(self, mode: str) -> None:
         mode_norm = str(mode).strip().lower()
-        if mode_norm not in (STATE_MODE_YAW, STATE_MODE_J6):
-            raise ValueError(f"invalid state_mode={mode!r}, expected '{STATE_MODE_YAW}' or '{STATE_MODE_J6}'")
+        if mode_norm != STATE_MODE_YAW:
+            mode_norm = STATE_MODE_YAW
         self._state_mode = mode_norm
 
     def reset_pose_filter(self) -> None:
@@ -548,16 +535,8 @@ class RealRobotOpenPIObservationBuilder:
 
         aligned_tcp_pose_sim = real_pose_to_sim(robot_snapshot.tcp_pose)
         joint_q = np.asarray(robot_snapshot.joint_q, dtype=np.float64).reshape(-1)
-        joint6_readback = float(joint_q[5]) if joint_q.size >= 6 else 0.0
-        joint6_state = (
-            joint6_readback
-            if self._semantic_joint6_scalar is None
-            else float(self._semantic_joint6_scalar)
-        )
-        if self._state_mode == STATE_MODE_J6:
-            state = pose6_to_openpi_state_j6(aligned_tcp_pose_sim, gripper_open, joint6_state)
-        else:
-            state = pose6_to_openpi_state(aligned_tcp_pose_sim, gripper_open)
+        joint6_readback = float(joint_q[5]) if joint_q.size >= 6 else None
+        state = pose6_to_openpi_state(aligned_tcp_pose_sim, gripper_open)
 
         obs = {
             STATE_KEY: state.astype(np.float32),
@@ -571,8 +550,8 @@ class RealRobotOpenPIObservationBuilder:
             robot_snapshot=robot_snapshot,
             aligned_tcp_pose_sim=aligned_tcp_pose_sim,
             gripper_open_scalar=gripper_open,
-            joint6_state_scalar=joint6_state if self._state_mode == STATE_MODE_J6 else None,
-            joint6_readback_scalar=joint6_readback if joint_q.size >= 6 else None,
+            joint6_state_scalar=None,
+            joint6_readback_scalar=joint6_readback,
             main_frame=main_frame,
             wrist_frame=wrist_frame,
             image_pair_system_diff_us=pair_diff_us,
@@ -582,12 +561,10 @@ class RealRobotOpenPIObservationBuilder:
 __all__ = [
     "OPENPI_IMAGE_SIZE",
     "STATE_MODE_YAW",
-    "STATE_MODE_J6",
     "TimedFrame",
     "AlignedObservation",
     "CameraPair",
     "preprocess_image_for_openpi",
     "pose6_to_openpi_state",
-    "pose6_to_openpi_state_j6",
     "RealRobotOpenPIObservationBuilder",
 ]

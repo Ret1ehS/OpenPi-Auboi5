@@ -262,7 +262,7 @@ def run_tui_config(
     rows: list[MenuRow] = [
         ToggleItem("Policy", ["remote", "local"], selected=0),
         ToggleItem("Frame", ["sim", "real"], selected=0),
-        ToggleItem("State Mode", ["yaw", "j6"], selected=0),
+        ToggleItem("State Mode", ["yaw"], selected=0),
         ToggleItem("Record", ["false", "true"], selected=0),
         ToggleItem("Speed Mode", ["limited", "native"], selected=0),
         TextItem("Exec Speed (m/s)", "0.05"),
@@ -538,13 +538,13 @@ def run_collect_tui_config(
     default_resume_mode: str = "continue",
     default_task: str = "pick_and_place",
     default_save_fps: int = 30,
-    default_state_mode: str = "j6",
+    default_state_mode: str = "yaw",
 ) -> CollectTUIConfig:
     rows: list[MenuRow] = [
         ToggleItem("Mode", ["auto", "manual"], selected=_choice_index(["auto", "manual"], default_mode, 0)),
         ToggleItem("Resume", ["continue", "reset"], selected=_choice_index(["continue", "reset"], default_resume_mode, 0)),
         ToggleItem("Save FPS", ["30", "50"], selected=_choice_index(["30", "50"], str(default_save_fps), 0)),
-        ToggleItem("State Mode", ["j6", "yaw"], selected=_choice_index(["j6", "yaw"], default_state_mode, 0)),
+        ToggleItem("State Mode", ["yaw"], selected=0),
         ToggleItem(
             "Task",
             ["pick_and_place", "open_and_close", "keyboard_teleop"],

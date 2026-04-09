@@ -101,7 +101,6 @@ def _maybe_reexec_into_repo_venv() -> None:
 
 from support.get_obs import (
     CameraPair,
-    STATE_MODE_J6,
     STATE_MODE_YAW,
     preprocess_image_for_openpi as preprocess_image,
 )
@@ -184,32 +183,16 @@ def _require_joint6_readback(joint_q: np.ndarray, *, context: str) -> float:
 
 
 def _normalize_state_mode(state_mode: str) -> str:
-    mode = str(state_mode).strip().lower()
-    if mode not in (STATE_MODE_YAW, STATE_MODE_J6):
-        raise ValueError(f"invalid state_mode={state_mode!r}, expected '{STATE_MODE_YAW}' or '{STATE_MODE_J6}'")
-    return mode
+    _ = state_mode
+    return STATE_MODE_YAW
 
 
 def build_state_row(pose6_zyx: np.ndarray, gripper: float, joint6: float, *, state_mode: str) -> np.ndarray:
     """Build one state row for the selected collect-data mode."""
-    mode = _normalize_state_mode(state_mode)
+    _ = _normalize_state_mode(state_mode)
     pose = np.asarray(pose6_zyx, dtype=np.float64).reshape(6)
     quat = _euler_zyx_to_quat_wxyz(pose[3:6])
     aa = _quat_to_axis_angle_wxyz(quat)
-    if mode == STATE_MODE_J6:
-        return np.array(
-            [
-                pose[0],
-                pose[1],
-                pose[2],
-                aa[0],
-                aa[1],
-                aa[2],
-                float(gripper),
-                float(joint6),
-            ],
-            dtype=np.float32,
-        )
     return np.array(
         [
             pose[0],
@@ -250,7 +233,7 @@ def compute_delta_actions(
     state_mode: str,
 ) -> np.ndarray:
     """Compute (N, 7) delta actions for yaw-mode or j6-mode datasets."""
-    mode = _normalize_state_mode(state_mode)
+    _ = _normalize_state_mode(state_mode)
     pose6 = np.asarray(pose6, dtype=np.float32)
     gripper = np.asarray(gripper, dtype=np.float32).reshape(-1)
     joint6 = np.asarray(joint6, dtype=np.float32).reshape(-1)
@@ -271,10 +254,7 @@ def compute_delta_actions(
             euler_next = pose6[idx + 1, 3:6]
             deuler = np.arctan2(np.sin(euler_next - euler_curr), np.cos(euler_next - euler_curr))
             actions[idx, 3:5] = deuler[:2]
-            if mode == STATE_MODE_J6:
-                actions[idx, 5] = _wrap_angle(float(joint6[idx + 1] - joint6[idx]))
-            else:
-                actions[idx, 5] = deuler[2]
+            actions[idx, 5] = deuler[2]
             actions[idx, 6] = gripper[idx + 1]
         else:
             actions[idx, :6] = 0.0
@@ -283,16 +263,12 @@ def compute_delta_actions(
 
 
 def state_schema_for_mode(state_mode: str) -> list[str]:
-    mode = _normalize_state_mode(state_mode)
-    if mode == STATE_MODE_J6:
-        return ["x", "y", "z", "aa_x", "aa_y", "aa_z", "gripper_open", "j6"]
+    _ = _normalize_state_mode(state_mode)
     return ["x", "y", "z", "aa_x", "aa_y", "aa_z", "gripper_open"]
 
 
 def action_schema_for_mode(state_mode: str) -> list[str]:
-    mode = _normalize_state_mode(state_mode)
-    if mode == STATE_MODE_J6:
-        return ["dx", "dy", "dz", "droll", "dpitch", "dj6", "gripper_next"]
+    _ = _normalize_state_mode(state_mode)
     return ["dx", "dy", "dz", "droll", "dpitch", "dyaw", "gripper_next"]
 
 
@@ -698,9 +674,8 @@ def _execute_servo_segment(
         next_record_deadline = now + CONTROL_DT
 
     def _send_servo_command(pose_cmd: np.ndarray, joint6_cmd: float | None) -> dict[str, object]:
-        if joint6_cmd is None:
-            return daemon.servo_pose(pose_cmd)
-        return daemon.servo_pose_j6(pose_cmd, joint6_cmd)
+        _ = joint6_cmd
+        return daemon.servo_pose(pose_cmd)
 
     try:
         if not reuse_servo:
@@ -962,7 +937,7 @@ def prepare_episode_for_save(
     *,
     save_fps: int,
     state_mode: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Convert raw episode frames onto the target save grid."""
     if not frames:
         raise RuntimeError("no frames to resample")
@@ -1004,7 +979,6 @@ def prepare_episode_for_save(
             env_steps,
             main_images,
             wrist_images,
-            raw_joint6_readback.astype(np.float32, copy=True),
         )
 
     save_control_dt = 1.0 / float(save_fps)
@@ -1081,7 +1055,6 @@ def prepare_episode_for_save(
         env_steps,
         main_images,
         wrist_images,
-        joint6_readback_resampled,
     )
 
 
@@ -1111,7 +1084,7 @@ def save_episode(
     episode_dir = save_dir / f"episode_{episode_id:04d}"
     episode_dir.mkdir(parents=True, exist_ok=True)
 
-    states, actions, timestamps, env_steps, main_images, wrist_images, joint6_readback = prepare_episode_for_save(
+    states, actions, timestamps, env_steps, main_images, wrist_images = prepare_episode_for_save(
         frames,
         save_fps=save_fps,
         state_mode=state_mode,
@@ -1123,7 +1096,6 @@ def save_episode(
     np.save(episode_dir / "actions.npy", actions)
     np.save(episode_dir / "timestamps.npy", timestamps)
     np.save(episode_dir / "env_steps.npy", env_steps)
-    np.save(episode_dir / "joint6_readback.npy", joint6_readback)
     np.savez_compressed(
         episode_dir / "images.npz",
         main_images=main_images,
@@ -1144,13 +1116,11 @@ def save_episode(
         "timestamp_mode": "env_step_times_control_dt",
         "timestamps_file": "timestamps.npy",
         "env_steps_file": "env_steps.npy",
-        "joint6_supervision": "semantic",
-        "joint6_readback_file": "joint6_readback.npy",
         "state_dim": len(state_schema),
         "action_dim": 7,
         "state_schema": state_schema,
         "action_schema": action_schema,
-        "state_mode": _normalize_state_mode(state_mode),
+        "state_mode": STATE_MODE_YAW,
         "pose_frame": get_alignment_mode(),
     }
     with open(episode_dir / "metadata.json", "w", encoding="utf-8") as handle:
@@ -1189,6 +1159,11 @@ class CollectTaskRuntime:
     def build_pose_at_xy(self, base_pose: np.ndarray, x: float, y: float, z: float) -> np.ndarray:
         return build_pose_at_xy(base_pose, x, y, z)
 
+    def build_pose_at_xy_yaw(self, base_pose: np.ndarray, x: float, y: float, z: float, yaw: float) -> np.ndarray:
+        pose = build_pose_at_xy(base_pose, x, y, z)
+        pose[5] = self.wrap_angle(float(yaw))
+        return pose
+
     def refresh_home_pose(self) -> np.ndarray:
         from support.pose_align import set_runtime_alignment
         from support.tcp_control import get_robot_snapshot
@@ -1206,6 +1181,11 @@ class CollectTaskRuntime:
         live_base = np.asarray(snap_local.tcp_pose, dtype=np.float64).reshape(6).copy()
         return build_pose_at_xy(live_base, x, y, z)
 
+    def build_pose_from_live_orientation_yaw(self, x: float, y: float, z: float, yaw: float) -> np.ndarray:
+        pose = self.build_pose_from_live_orientation(x, y, z)
+        pose[5] = self.wrap_angle(float(yaw))
+        return pose
+
     def get_live_tcp_pose(self) -> np.ndarray:
         from support.tcp_control import get_robot_snapshot
 
@@ -1220,6 +1200,9 @@ class CollectTaskRuntime:
         if joint_q.size < 6:
             return None
         return float(joint_q[5])
+
+    def yaw_target_from_deg(self, deg: float) -> float:
+        return self.wrap_angle(float(self.home_real[5]) + float(np.deg2rad(float(deg))))
 
     def begin_stream_servo(self, start_pose_real: np.ndarray) -> None:
         if self.dry_run:
@@ -1260,15 +1243,6 @@ class CollectTaskRuntime:
             return {"servo_pose_ret": 0, "dry_run": True}
         return self.daemon.servo_pose(pose_cmd)
 
-    def send_stream_joint6(self, target_joint6: float, *, hold_pose_real: np.ndarray | None = None) -> dict[str, object]:
-        if hold_pose_real is None:
-            pose_cmd = self.get_live_tcp_pose()
-        else:
-            pose_cmd = np.asarray(hold_pose_real, dtype=np.float64).reshape(6).copy()
-        if self.dry_run:
-            return {"servo_pose_ret": 0, "dry_run": True}
-        return self.daemon.servo_pose_j6(pose_cmd, float(target_joint6))
-
     def return_home(self, label: str) -> np.ndarray:
         if not self.dry_run:
             execute_movel_and_wait(
@@ -1276,11 +1250,8 @@ class CollectTaskRuntime:
                 self.home_real,
                 label,
                 speed_mps=self.linear_speed,
-                target_joint6=float(self.default_joint6_rad),
             )
-            self.local_exec_joint6_rad = float(self.default_joint6_rad)
             return self.refresh_home_pose()
-        self.local_exec_joint6_rad = float(self.default_joint6_rad)
         self.origin_xy = self.home_real[:2].copy()
         return self.home_real.copy()
 
@@ -1299,9 +1270,6 @@ class CollectTaskRuntime:
 
     def z_for_place_level(self, level: int) -> float:
         return float(self.z_for_pick_level(level) + self.place_height_offset_m)
-
-    def j6_target_from_deg(self, deg: float) -> float:
-        return float(self.default_joint6_rad + np.deg2rad(float(deg)))
 
     def record_pose_move(
         self,
@@ -1323,31 +1291,6 @@ class CollectTaskRuntime:
             record=record,
             reuse_servo=self.hold_servo_active,
         )
-
-    def record_joint6_rotation(
-        self,
-        *,
-        target_joint6: float,
-        gripper: float,
-        start_frame_idx: int,
-        record: bool,
-    ) -> list[RecordedFrame]:
-        if record:
-            return execute_joint6_rotation_and_record(
-                self.daemon,
-                self.cameras,
-                target_joint6=float(target_joint6),
-                start_joint6=float(self.local_exec_joint6_rad),
-                gripper=gripper,
-                start_frame_idx=start_frame_idx,
-                reuse_servo=self.hold_servo_active,
-            )
-        execute_joint6_rotation(
-            self.daemon,
-            float(target_joint6),
-            reuse_servo=self.hold_servo_active,
-        )
-        return []
 
     def capture_manual_snapshot(
         self,
@@ -1396,7 +1339,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-episodes", type=int, default=0)
     parser.add_argument("--speed", type=float, default=LINEAR_SPEED)
     parser.add_argument("--save-fps", type=int, choices=(RAW_CAPTURE_FPS, UPSAMPLED_SAVE_FPS), default=DEFAULT_SAVE_FPS)
-    parser.add_argument("--state-mode", type=str, choices=(STATE_MODE_YAW, STATE_MODE_J6), default=STATE_MODE_J6)
+    parser.add_argument("--state-mode", type=str, choices=(STATE_MODE_YAW,), default=STATE_MODE_YAW)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--gripper-timeout", type=float, default=10.0)
     parser.add_argument("--pose-frame", type=str, choices=("sim", "real"), default="sim")

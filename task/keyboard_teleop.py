@@ -41,6 +41,7 @@ AXIS_EPS = 1e-3
 INPUT_POLL_DT_S = 0.002
 LOOKAHEAD_TIME_S = 0.06
 INITIAL_REPEAT_LATCH_S = 0.55
+TERMINAL_REPEAT_HOLD_S = 0.04
 MAX_LINEAR_LEAD_M = 0.010
 MAX_YAW_LEAD_RAD = float(np.deg2rad(4.0))
 POSE_SEND_DEADBAND_M = 0.00035
@@ -310,7 +311,7 @@ def run_session(
     term = RawTerminal.open()
     input_pump = _TerminalInputPump(term.fd, key_state)
     try:
-        if not key_state.start(fd=term.fd):
+        if not key_state.start(fd=term.fd, repeat_hold_s=TERMINAL_REPEAT_HOLD_S):
             raise RuntimeError("continuous keyboard teleop backend unavailable")
         input_pump.start()
         while True:
@@ -351,6 +352,8 @@ def run_session(
                 float(np.linalg.norm(raw_linear_axis)) > AXIS_EPS
                 or abs(raw_rotate_axis) > AXIS_EPS
             )
+            motion_transition_started = bool(raw_motion_active and not raw_motion_active_prev)
+            motion_changed = False
             if key_state.backend == "terminal_repeat":
                 motion_event_count = input_pump.motion_event_count()
                 motion_changed = (
@@ -416,7 +419,10 @@ def run_session(
                             planned_pose_real[5] = runtime.wrap_angle(float(planned_pose_real[5] + rotate_delta_rad))
 
                     planned_pose_real = _clip_command_pose(planned_pose_real)
-                    command_pose_real = _build_lookahead_pose(linear_velocity_xyz, yaw_velocity_radps)
+                    if motion_transition_started or motion_changed:
+                        command_pose_real = planned_pose_real.copy()
+                    else:
+                        command_pose_real = _build_lookahead_pose(linear_velocity_xyz, yaw_velocity_radps)
                     command_pose_real = _clamp_command_lead(command_pose_real)
                     command_pose_real = _apply_pose_deadband(command_pose_real)
 

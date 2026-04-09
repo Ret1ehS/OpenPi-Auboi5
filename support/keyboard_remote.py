@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import http.server
+import hashlib
 import json
 import os
 from pathlib import Path
-import secrets
 import socket
 import threading
 import time
@@ -16,6 +16,8 @@ from support.keyboard_control import KEY_ENTER, KEY_QUIT, KEY_SPACE
 
 REMOTE_HELPER_PATH = Path(__file__).with_name("keyboard_remote_client.ps1")
 REMOTE_STALE_TIMEOUT_S = 0.20
+REMOTE_TCP_PORT = int(os.environ.get("OPENPI_REMOTE_KEYBOARD_TCP_PORT", "28731"))
+REMOTE_HTTP_PORT = int(os.environ.get("OPENPI_REMOTE_KEYBOARD_HTTP_PORT", "28732"))
 
 
 class RemoteKeyboardRelay:
@@ -29,7 +31,8 @@ class RemoteKeyboardRelay:
         self._advertised_host = str(advertised_host).strip()
         self._allowed_client_ip = str(allowed_client_ip).strip() if allowed_client_ip else None
         self._stale_timeout_s = float(stale_timeout_s)
-        self._token = secrets.token_hex(12)
+        token_src = f"{self._advertised_host}|{self._allowed_client_ip or '*'}|openpi-keyboard-relay"
+        self._token = hashlib.sha256(token_src.encode("utf-8")).hexdigest()[:24]
 
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -101,7 +104,13 @@ class RemoteKeyboardRelay:
 
         tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        tcp_sock.bind(("0.0.0.0", 0))
+        try:
+            tcp_sock.bind(("0.0.0.0", int(REMOTE_TCP_PORT)))
+        except OSError as exc:
+            tcp_sock.close()
+            raise RuntimeError(
+                f"remote keyboard tcp port {REMOTE_TCP_PORT} busy: {exc}"
+            ) from exc
         tcp_sock.listen(1)
         tcp_sock.settimeout(0.2)
         self._tcp_sock = tcp_sock
@@ -127,7 +136,14 @@ class RemoteKeyboardRelay:
             def log_message(self, format: str, *args) -> None:
                 return
 
-        http_server = http.server.ThreadingHTTPServer(("0.0.0.0", 0), _HelperHandler)
+        try:
+            http_server = http.server.ThreadingHTTPServer(("0.0.0.0", int(REMOTE_HTTP_PORT)), _HelperHandler)
+        except OSError as exc:
+            tcp_sock.close()
+            self._tcp_sock = None
+            raise RuntimeError(
+                f"remote keyboard http port {REMOTE_HTTP_PORT} busy: {exc}"
+            ) from exc
         self._http_server = http_server
         self._http_port = int(http_server.server_address[1])
 

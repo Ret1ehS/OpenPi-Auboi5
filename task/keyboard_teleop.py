@@ -45,7 +45,7 @@ INITIAL_REPEAT_LATCH_S = 0.55
 TERMINAL_REPEAT_HOLD_S = 0.06
 REMOTE_RELEASE_HOLD_S = 0.03
 REMOTE_AXIS_SLEW_PER_TICK = 0.35
-GRIPPER_INPUT_SUPPRESS_S = 0.15
+DISCRETE_INPUT_SUPPRESS_S = 0.15
 MAX_LINEAR_LEAD_M = 0.010
 MAX_YAW_LEAD_RAD = float(np.deg2rad(4.0))
 POSE_SEND_DEADBAND_M = 0.00035
@@ -324,6 +324,8 @@ def run_session(
         nonlocal recording, recorded_frames, frame_idx, saved_episode_count
         nonlocal status_line, local_gripper_open, next_record_ts, input_suppress_until_ts
         if key == KEY_ENTER:
+            _clear_pending_inputs()
+            input_suppress_until_ts = time.monotonic() + float(DISCRETE_INPUT_SUPPRESS_S)
             if not recording:
                 recording = True
                 recorded_frames = []
@@ -347,16 +349,18 @@ def run_session(
                     status_line = "Recording stopped: no frames captured"
                 recorded_frames = []
                 frame_idx = 0
+            _clear_pending_inputs()
+            input_suppress_until_ts = time.monotonic() + float(DISCRETE_INPUT_SUPPRESS_S)
             return True
 
         if key == KEY_SPACE:
             _stop_servo()
             _clear_pending_inputs()
-            input_suppress_until_ts = time.monotonic() + float(GRIPPER_INPUT_SUPPRESS_S)
+            input_suppress_until_ts = time.monotonic() + float(DISCRETE_INPUT_SUPPRESS_S)
             target_state = 0 if local_gripper_open else 1
             ok = True if runtime.dry_run else runtime.command_gripper_state(target_state)
             _clear_pending_inputs()
-            input_suppress_until_ts = time.monotonic() + float(GRIPPER_INPUT_SUPPRESS_S)
+            input_suppress_until_ts = time.monotonic() + float(DISCRETE_INPUT_SUPPRESS_S)
             if ok:
                 local_gripper_open = bool(target_state == 1)
                 if config.state_mode != STATE_MODE_J6:
@@ -437,6 +441,8 @@ def run_session(
                     status_line = "Exiting keyboard teleop."
                     return saved_episode_count
                 if _handle_discrete_key(key):
+                    if time.monotonic() < input_suppress_until_ts:
+                        break
                     continue
             if remote_active:
                 move_x, move_y, move_z, rotate_axis = remote_relay.axes(now_ts)

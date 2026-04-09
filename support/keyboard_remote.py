@@ -212,6 +212,15 @@ class RemoteKeyboardRelay:
             self._discrete_keys.clear()
             return keys
 
+    def clear(self) -> None:
+        with self._lock:
+            self._up = False
+            self._down = False
+            self._left = False
+            self._right = False
+            self._ctrl = False
+            self._discrete_keys.clear()
+
     def axes(self, now_ts: float | None = None) -> tuple[float, float, float, float]:
         ts = time.monotonic() if now_ts is None else float(now_ts)
         with self._lock:

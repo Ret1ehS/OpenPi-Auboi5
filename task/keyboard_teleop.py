@@ -45,6 +45,7 @@ INITIAL_REPEAT_LATCH_S = 0.55
 TERMINAL_REPEAT_HOLD_S = 0.06
 REMOTE_RELEASE_HOLD_S = 0.03
 REMOTE_AXIS_SLEW_PER_TICK = 0.35
+GRIPPER_INPUT_SUPPRESS_S = 0.15
 MAX_LINEAR_LEAD_M = 0.010
 MAX_YAW_LEAD_RAD = float(np.deg2rad(4.0))
 POSE_SEND_DEADBAND_M = 0.00035
@@ -96,6 +97,11 @@ class _TerminalInputPump:
     def motion_event_count(self) -> int:
         with self._lock:
             return int(self._motion_event_count)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._discrete_keys.clear()
+            self._motion_event_count = 0
 
     def _run(self) -> None:
         motion_keys = {
@@ -163,6 +169,7 @@ def run_session(
     repeat_latch_event_count = 0
     remote_relay = RemoteKeyboardRelay.from_ssh_session()
     remote_helper_command = ""
+    input_suppress_until_ts = 0.0
     remote_filtered_linear_axis = np.zeros(3, dtype=np.float64)
     remote_filtered_rotate_axis = 0.0
     remote_release_linear_axis = np.zeros(3, dtype=np.float64)
@@ -198,6 +205,32 @@ def run_session(
         )
         frame_idx += 1
         next_record_ts = time.monotonic() + float(RAW_RECORD_DT_S)
+
+    def _clear_pending_inputs() -> None:
+        nonlocal raw_motion_active_prev
+        nonlocal latched_linear_axis, latched_rotate_axis
+        nonlocal repeat_latch_waiting_repeat, repeat_latch_deadline, repeat_latch_event_count
+        nonlocal remote_filtered_linear_axis, remote_filtered_rotate_axis
+        nonlocal remote_release_linear_axis, remote_release_rotate_axis, remote_release_deadline
+        key_state.clear()
+        input_pump.clear()
+        if remote_relay is not None:
+            remote_relay.clear()
+        try:
+            drain_keys(term.fd)
+        except Exception:
+            pass
+        raw_motion_active_prev = False
+        latched_linear_axis = np.zeros(3, dtype=np.float64)
+        latched_rotate_axis = 0.0
+        repeat_latch_waiting_repeat = False
+        repeat_latch_deadline = 0.0
+        repeat_latch_event_count = 0
+        remote_filtered_linear_axis = np.zeros(3, dtype=np.float64)
+        remote_filtered_rotate_axis = 0.0
+        remote_release_linear_axis = np.zeros(3, dtype=np.float64)
+        remote_release_rotate_axis = 0.0
+        remote_release_deadline = 0.0
 
     def _ensure_servo_active() -> None:
         nonlocal servo_active, command_pose_real, planned_pose_real
@@ -288,7 +321,8 @@ def run_session(
         return pose
 
     def _handle_discrete_key(key: str) -> bool:
-        nonlocal recording, recorded_frames, frame_idx, saved_episode_count, status_line, local_gripper_open, next_record_ts
+        nonlocal recording, recorded_frames, frame_idx, saved_episode_count
+        nonlocal status_line, local_gripper_open, next_record_ts, input_suppress_until_ts
         if key == KEY_ENTER:
             if not recording:
                 recording = True
@@ -317,8 +351,12 @@ def run_session(
 
         if key == KEY_SPACE:
             _stop_servo()
+            _clear_pending_inputs()
+            input_suppress_until_ts = time.monotonic() + float(GRIPPER_INPUT_SUPPRESS_S)
             target_state = 0 if local_gripper_open else 1
             ok = True if runtime.dry_run else runtime.command_gripper_state(target_state)
+            _clear_pending_inputs()
+            input_suppress_until_ts = time.monotonic() + float(GRIPPER_INPUT_SUPPRESS_S)
             if ok:
                 local_gripper_open = bool(target_state == 1)
                 if config.state_mode != STATE_MODE_J6:
@@ -384,6 +422,11 @@ def run_session(
                     flush=True,
                 )
                 next_ui_refresh_ts = now_ts + float(UI_REFRESH_DT_S)
+
+            if now_ts < input_suppress_until_ts:
+                _clear_pending_inputs()
+                next_control_ts = float(next_control_ts + float(CONTROL_DT_S))
+                continue
 
             discrete_keys: list[str] = []
             if remote_relay is not None:

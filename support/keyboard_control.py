@@ -194,6 +194,22 @@ class ContinuousKeyState:
             self._last_ctrl_left_ts = -1.0
             self._last_ctrl_right_ts = -1.0
 
+    def clear(self) -> None:
+        with self._lock:
+            self._up = False
+            self._down = False
+            self._left = False
+            self._right = False
+            self._ctrl = False
+            self._last_up_ts = -1.0
+            self._last_down_ts = -1.0
+            self._last_left_ts = -1.0
+            self._last_right_ts = -1.0
+            self._last_ctrl_up_ts = -1.0
+            self._last_ctrl_down_ts = -1.0
+            self._last_ctrl_left_ts = -1.0
+            self._last_ctrl_right_ts = -1.0
+
     def feed_terminal_keys(self, keys: list[str], now_ts: float) -> list[str]:
         if self._backend != "terminal_repeat":
             return [

@@ -5,6 +5,7 @@ Log/
 data/*
 !data/
 !data/check_data.py
+!data/convert_mujoco_to_lerobot.py
 *.bak_*
 support/kubeconfig.yaml
 task/__pycache__/

@@ -262,7 +262,6 @@ def run_tui_config(
     rows: list[MenuRow] = [
         ToggleItem("Policy", ["remote", "local"], selected=0),
         ToggleItem("Frame", ["sim", "real"], selected=0),
-        ToggleItem("State Mode", ["yaw"], selected=0),
         ToggleItem("Record", ["false", "true"], selected=0),
         ToggleItem("Speed Mode", ["limited", "native"], selected=0),
         TextItem("Exec Speed (m/s)", "0.05"),
@@ -453,12 +452,11 @@ def _infer_disabled_labels(rows: list[MenuRow]) -> set[str]:
 
 def _snapshot_config(rows: list[MenuRow]) -> TUIConfig:
     speed_mode = _get_toggle(rows, "Speed Mode")
-    state_mode = _get_toggle(rows, "State Mode")
     return TUIConfig(
         policy_location=_get_toggle(rows, "Policy"),
         pose_frame=_get_toggle(rows, "Frame"),
-        obs_state_mode=state_mode,
-        lock_yaw=(state_mode == "yaw"),
+        obs_state_mode="yaw",
+        lock_yaw=True,
         dry_run=_get_env_bool("OPENPI_DEBUG_DRY_RUN", False),
         exec_speed_mps=_get_float(rows, "Exec Speed (m/s)", 0.05),
         speed_mode=speed_mode,
@@ -486,7 +484,7 @@ def _snapshot_collect_config(rows: list[MenuRow]) -> CollectTUIConfig:
         resume_mode=_get_toggle(rows, "Resume"),
         task=task,
         save_fps=_get_int(rows, "Save FPS", 30),
-        state_mode=_get_toggle(rows, "State Mode"),
+        state_mode="yaw",
     )
 
 
@@ -544,7 +542,6 @@ def run_collect_tui_config(
         ToggleItem("Mode", ["auto", "manual"], selected=_choice_index(["auto", "manual"], default_mode, 0)),
         ToggleItem("Resume", ["continue", "reset"], selected=_choice_index(["continue", "reset"], default_resume_mode, 0)),
         ToggleItem("Save FPS", ["30", "50"], selected=_choice_index(["30", "50"], str(default_save_fps), 0)),
-        ToggleItem("State Mode", ["yaw"], selected=0),
         ToggleItem(
             "Task",
             ["pick_and_place", "open_and_close", "keyboard_teleop"],

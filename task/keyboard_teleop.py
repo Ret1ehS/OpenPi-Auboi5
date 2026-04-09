@@ -43,6 +43,8 @@ INPUT_POLL_DT_S = 0.002
 LOOKAHEAD_TIME_S = 0.06
 INITIAL_REPEAT_LATCH_S = 0.55
 TERMINAL_REPEAT_HOLD_S = 0.06
+REMOTE_RELEASE_HOLD_S = 0.03
+REMOTE_AXIS_SLEW_PER_TICK = 0.35
 MAX_LINEAR_LEAD_M = 0.010
 MAX_YAW_LEAD_RAD = float(np.deg2rad(4.0))
 POSE_SEND_DEADBAND_M = 0.00035
@@ -161,6 +163,26 @@ def run_session(
     repeat_latch_event_count = 0
     remote_relay = RemoteKeyboardRelay.from_ssh_session()
     remote_helper_command = ""
+    remote_filtered_linear_axis = np.zeros(3, dtype=np.float64)
+    remote_filtered_rotate_axis = 0.0
+    remote_release_linear_axis = np.zeros(3, dtype=np.float64)
+    remote_release_rotate_axis = 0.0
+    remote_release_deadline = 0.0
+
+    def _slew_value(current: float, target: float, delta_max: float) -> float:
+        delta = float(target) - float(current)
+        if delta > float(delta_max):
+            return float(current) + float(delta_max)
+        if delta < -float(delta_max):
+            return float(current) - float(delta_max)
+        return float(target)
+
+    def _slew_vector(current: np.ndarray, target: np.ndarray, delta_max: float) -> np.ndarray:
+        out = np.asarray(current, dtype=np.float64).reshape(-1).copy()
+        tgt = np.asarray(target, dtype=np.float64).reshape(-1)
+        for idx in range(out.size):
+            out[idx] = _slew_value(out[idx], tgt[idx], delta_max)
+        return out
 
     def _append_current_snapshot() -> None:
         nonlocal frame_idx, next_record_ts
@@ -374,10 +396,40 @@ def run_session(
                     continue
             if remote_active:
                 move_x, move_y, move_z, rotate_axis = remote_relay.axes(now_ts)
+                remote_raw_linear_axis = np.array([move_x, move_y, move_z], dtype=np.float64)
+                remote_raw_rotate_axis = float(rotate_axis)
+                remote_raw_motion_active = (
+                    float(np.linalg.norm(remote_raw_linear_axis)) > AXIS_EPS
+                    or abs(remote_raw_rotate_axis) > AXIS_EPS
+                )
+                if remote_raw_motion_active:
+                    remote_release_linear_axis = remote_raw_linear_axis.copy()
+                    remote_release_rotate_axis = float(remote_raw_rotate_axis)
+                    remote_release_deadline = now_ts + float(REMOTE_RELEASE_HOLD_S)
+                elif now_ts < remote_release_deadline:
+                    remote_raw_linear_axis = remote_release_linear_axis.copy()
+                    remote_raw_rotate_axis = float(remote_release_rotate_axis)
+                remote_filtered_linear_axis = _slew_vector(
+                    remote_filtered_linear_axis,
+                    remote_raw_linear_axis,
+                    float(REMOTE_AXIS_SLEW_PER_TICK),
+                )
+                remote_filtered_rotate_axis = _slew_value(
+                    remote_filtered_rotate_axis,
+                    remote_raw_rotate_axis,
+                    float(REMOTE_AXIS_SLEW_PER_TICK),
+                )
+                raw_linear_axis = remote_filtered_linear_axis.copy()
+                raw_rotate_axis = float(remote_filtered_rotate_axis)
             else:
                 move_x, move_y, move_z, rotate_axis = key_state.axes(now_ts)
-            raw_linear_axis = np.array([move_x, move_y, move_z], dtype=np.float64)
-            raw_rotate_axis = float(rotate_axis)
+                raw_linear_axis = np.array([move_x, move_y, move_z], dtype=np.float64)
+                raw_rotate_axis = float(rotate_axis)
+                remote_filtered_linear_axis = np.zeros(3, dtype=np.float64)
+                remote_filtered_rotate_axis = 0.0
+                remote_release_linear_axis = np.zeros(3, dtype=np.float64)
+                remote_release_rotate_axis = 0.0
+                remote_release_deadline = 0.0
             raw_motion_active = (
                 float(np.linalg.norm(raw_linear_axis)) > AXIS_EPS
                 or abs(raw_rotate_axis) > AXIS_EPS

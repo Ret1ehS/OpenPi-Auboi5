@@ -419,7 +419,7 @@ def run_session(
                             planned_pose_real[5] = runtime.wrap_angle(float(planned_pose_real[5] + rotate_delta_rad))
 
                     planned_pose_real = _clip_command_pose(planned_pose_real)
-                    if motion_transition_started or motion_changed:
+                    if motion_transition_started:
                         command_pose_real = planned_pose_real.copy()
                     else:
                         command_pose_real = _build_lookahead_pose(linear_velocity_xyz, yaw_velocity_radps)

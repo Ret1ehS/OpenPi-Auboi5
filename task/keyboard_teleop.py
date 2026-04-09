@@ -41,6 +41,8 @@ AXIS_EPS = 1e-3
 INPUT_POLL_DT_S = 0.002
 LOOKAHEAD_TIME_S = 0.04
 INITIAL_REPEAT_LATCH_S = 0.55
+MAX_LINEAR_LEAD_M = 0.008
+MAX_YAW_LEAD_RAD = float(np.deg2rad(4.0))
 POSE_SEND_DEADBAND_M = 0.00035
 POSE_SEND_DEADBAND_RAD = float(np.deg2rad(0.06))
 
@@ -220,6 +222,20 @@ def run_session(
         pose[2] = max(float(runtime.min_tcp_z), float(pose[2]))
         pose[5] = runtime.wrap_angle(float(pose[5]))
         return pose
+
+    def _clamp_command_lead(command_pose: np.ndarray) -> np.ndarray:
+        pose = np.asarray(command_pose, dtype=np.float64).reshape(6).copy()
+        if runtime.dry_run:
+            return pose
+        live_pose = runtime.get_live_tcp_pose()
+        delta_xyz = pose[:3] - live_pose[:3]
+        lead_dist = float(np.linalg.norm(delta_xyz))
+        if lead_dist > float(MAX_LINEAR_LEAD_M) and lead_dist > 1e-9:
+            pose[:3] = live_pose[:3] + delta_xyz / lead_dist * float(MAX_LINEAR_LEAD_M)
+        yaw_err = runtime.wrap_angle(float(pose[5] - live_pose[5]))
+        if abs(yaw_err) > float(MAX_YAW_LEAD_RAD):
+            pose[5] = runtime.wrap_angle(float(live_pose[5] + np.sign(yaw_err) * float(MAX_YAW_LEAD_RAD)))
+        return _clip_command_pose(pose)
 
     def _build_lookahead_pose(
         linear_velocity_xyz: np.ndarray,
@@ -401,6 +417,7 @@ def run_session(
 
                     planned_pose_real = _clip_command_pose(planned_pose_real)
                     command_pose_real = _build_lookahead_pose(linear_velocity_xyz, yaw_velocity_radps)
+                    command_pose_real = _clamp_command_lead(command_pose_real)
                     command_pose_real = _apply_pose_deadband(command_pose_real)
 
                     if not runtime.dry_run:

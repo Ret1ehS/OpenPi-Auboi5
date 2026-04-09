@@ -22,7 +22,6 @@ import queue
 import sys
 import threading
 import time
-import math
 from pathlib import Path
 
 import numpy as np
@@ -36,9 +35,6 @@ GRIPPER_THRESHOLD = 0.6
 MAX_EXEC_ACTION_INTERVALS = 10
 NATIVE_INTERP_FACTOR = 5  # 10 intervals -> 50 actions in native mode
 STATE_MODE_YAW = "yaw"
-DEFAULT_J6_HOME_RAD = 0.11434
-def _wrap_angle(angle: float) -> float:
-    return float(math.atan2(math.sin(angle), math.cos(angle)))
 
 
 def _maybe_reexec_into_repo_venv() -> None:
@@ -63,19 +59,15 @@ class TrajectoryExecutor:
         *,
         execute: bool,
         max_speed_mps: float = 0.05,
-        use_joint6: bool = False,
-        initial_joint6_rad: float = DEFAULT_J6_HOME_RAD,
     ):
         self._execute = execute
         self._max_speed_mps = max_speed_mps
-        self._use_joint6 = bool(use_joint6)
         self._queue: queue.Queue = queue.Queue(maxsize=2)
         self._sentinel = object()
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._expected_pose = None
-        self._expected_joint6 = float(initial_joint6_rad) if self._use_joint6 else None
         self._last_result = None
         self._reset_servo = False
         self._idle = threading.Event()
@@ -107,16 +99,11 @@ class TrajectoryExecutor:
             return self._last_result
 
     @property
-    def expected_joint6(self):
-        with self._lock:
-            return None if self._expected_joint6 is None else float(self._expected_joint6)
-
-    @property
     def is_idle(self) -> bool:
         return self._idle.is_set()
 
-    def submit(self, tcp_deltas, observed_pose, *, joint6_deltas=None, semantic_joint6: float | None = None) -> None:
-        item = (tcp_deltas, observed_pose, joint6_deltas, semantic_joint6)
+    def submit(self, tcp_deltas, observed_pose) -> None:
+        item = (tcp_deltas, observed_pose)
         # Clear idle before enqueue so a caller that immediately waits for idle
         # cannot observe a stale "idle" state from the previous cycle and
         # return before the executor thread has actually started this item.
@@ -141,11 +128,9 @@ class TrajectoryExecutor:
     def wait_until_idle(self, timeout: float | None = None) -> bool:
         return self._idle.wait(timeout=timeout)
 
-    def reset_state(self, *, semantic_joint6: float | None = None) -> None:
+    def reset_state(self) -> None:
         with self._lock:
             self._expected_pose = None
-            if self._use_joint6 and semantic_joint6 is not None:
-                self._expected_joint6 = float(semantic_joint6)
             self._last_result = None
             self._reset_servo = True
 
@@ -163,9 +148,6 @@ class TrajectoryExecutor:
         current_plan = None
         current_snapshot = None
         current_index = 0
-        current_joint6_targets = None
-        current_joint6_start = None
-        current_joint6_final = None
 
         def _finish_servo() -> None:
             nonlocal servo_active
@@ -201,15 +183,9 @@ class TrajectoryExecutor:
             with self._lock:
                 self._expected_pose = None if pose is None else pose.copy()
 
-        def _set_expected_joint6(value: float | None) -> None:
-            if not self._use_joint6:
-                return
-            with self._lock:
-                self._expected_joint6 = None if value is None else float(value)
-
         def _plan_from_item(item):
             nonlocal servo_active
-            tcp_deltas, submitted_observed_pose, joint6_deltas, semantic_joint6 = item
+            tcp_deltas, submitted_observed_pose = item
             _ = submitted_observed_pose
             snapshot = get_robot_snapshot()
             # Match the earlier stable behavior: each new chunk integrates
@@ -259,45 +235,7 @@ class TrajectoryExecutor:
                 )
                 _set_last_result(result)
                 _set_expected_pose(plan.final_pose)
-                if self._use_joint6:
-                    _set_expected_joint6(self.expected_joint6 if semantic_joint6 is None else semantic_joint6)
                 return None
-
-            start_joint6 = None
-            step_joint6_targets = None
-            final_joint6 = None
-            if self._use_joint6:
-                start_joint6 = float(self.expected_joint6 if semantic_joint6 is None else semantic_joint6)
-                joint6_actions = np.zeros((len(tcp_deltas),), dtype=np.float64)
-                if joint6_deltas is not None:
-                    joint6_actions = np.asarray(joint6_deltas, dtype=np.float64).reshape(-1)
-                    if joint6_actions.shape[0] != len(tcp_deltas):
-                        raise RuntimeError(
-                            f"joint6_deltas length mismatch: expected {len(tcp_deltas)}, got {joint6_actions.shape[0]}"
-                        )
-                step_counts = [0] * len(joint6_actions)
-                for step in plan.steps:
-                    src_idx = int(step.source_action_index)
-                    if 0 <= src_idx < len(step_counts):
-                        step_counts[src_idx] += 1
-                step_joint6_targets = []
-                current_joint6 = float(start_joint6)
-                for action_idx, delta_joint6 in enumerate(joint6_actions):
-                    action_steps = step_counts[action_idx]
-                    action_delta = _wrap_angle(float(delta_joint6))
-                    action_start_joint6 = float(current_joint6)
-                    if action_steps <= 0:
-                        current_joint6 = _wrap_angle(action_start_joint6 + action_delta)
-                        continue
-                    for sub_idx in range(action_steps):
-                        alpha = float(sub_idx + 1) / float(action_steps)
-                        step_joint6_targets.append(_wrap_angle(action_start_joint6 + action_delta * alpha))
-                    current_joint6 = _wrap_angle(action_start_joint6 + action_delta)
-                final_joint6 = float(current_joint6)
-                if len(step_joint6_targets) != len(plan.steps):
-                    raise RuntimeError(
-                        f"joint6 target planning mismatch: expected {len(plan.steps)} step targets, got {len(step_joint6_targets)}"
-                    )
 
             if not self._execute:
                 result = TrackChunkResult(
@@ -316,8 +254,6 @@ class TrajectoryExecutor:
                 )
                 _set_last_result(result)
                 _set_expected_pose(plan.final_pose)
-                if self._use_joint6:
-                    _set_expected_joint6(final_joint6)
                 return None
 
             if not servo_active:
@@ -343,12 +279,7 @@ class TrajectoryExecutor:
                 servo_active = True
 
             daemon.servo_begin_chunk(plan.start_pose_real)
-            return snapshot, plan, step_joint6_targets, start_joint6, final_joint6
-
-        # hold_pose_real: last successfully executed pose. The helper process
-        # keeps servo mode alive and holds this target between commands.
-        hold_pose_real = None
-        hold_joint6 = self.expected_joint6 if self._use_joint6 else None
+            return snapshot, plan
 
         while not self._stop.is_set():
             try:
@@ -359,14 +290,9 @@ class TrajectoryExecutor:
                         self._reset_servo = False
                 if need_reset:
                     _finish_servo()
-                    hold_pose_real = None
-                    hold_joint6 = self.expected_joint6 if self._use_joint6 else None
                     current_plan = None
                     current_snapshot = None
                     current_index = 0
-                    current_joint6_targets = None
-                    current_joint6_start = None
-                    current_joint6_final = None
 
                 if current_plan is None:
                     item = _drain_latest_pending(timeout=0.05)
@@ -383,15 +309,12 @@ class TrajectoryExecutor:
                         if self._queue.empty():
                             self._idle.set()
                         continue
-                    current_snapshot, current_plan, current_joint6_targets, current_joint6_start, current_joint6_final = planned
+                    current_snapshot, current_plan = planned
                     current_index = 0
 
                 if current_plan is None or current_index >= len(current_plan.steps):
                     current_snapshot = None
                     current_plan = None
-                    current_joint6_targets = None
-                    current_joint6_start = None
-                    current_joint6_final = None
                     current_index = 0
                     if self._queue.empty():
                         # Don't stop servo – just hold position
@@ -399,17 +322,12 @@ class TrajectoryExecutor:
                     continue
 
                 step = current_plan.steps[current_index]
-                step_joint6 = None if current_joint6_targets is None else float(current_joint6_targets[current_index])
                 resp = daemon.servo_pose(step.pose_real)
                 pose_ret = int(resp.get("servo_pose_ret", -1))
                 error = str(resp.get("error", ""))
 
                 if pose_ret == 0:
                     current_index += 1
-                    hold_pose_real = step.pose_real.copy()
-                    if step_joint6 is not None:
-                        hold_joint6 = float(step_joint6)
-                        _set_expected_joint6(hold_joint6)
                     _set_last_result(
                         TrackChunkResult(
                             ok=True,
@@ -421,34 +339,21 @@ class TrajectoryExecutor:
                             control_dt_s=current_plan.control_dt_s,
                             tracking_err=0.0,
                             exec_mode="streaming",
-                            raw={**resp, **({"semantic_joint6": float(step_joint6)} if step_joint6 is not None else {})},
+                            raw=resp,
                             start_pose_real=current_plan.start_pose_real,
                             final_pose_real=step.pose_real,
                         )
                     )
                     _set_expected_pose(step.pose_sim)
                     if current_index >= len(current_plan.steps):
-                        if self._use_joint6 and current_joint6_final is not None:
-                            hold_joint6 = float(current_joint6_final)
-                            _set_expected_joint6(hold_joint6)
                         current_snapshot = None
                         current_plan = None
-                        current_joint6_targets = None
-                        current_joint6_start = None
-                        current_joint6_final = None
                         current_index = 0
                         if self._queue.empty():
                             self._idle.set()
                 else:
                     final_pose = step.pose_sim if current_index > 0 else current_plan.start_pose
                     final_pose_real = step.pose_real if current_index > 0 else current_plan.start_pose_real
-                    final_joint6 = None
-                    if self._use_joint6:
-                        if current_index > 0:
-                            final_joint6 = hold_joint6
-                        else:
-                            final_joint6 = current_joint6_start
-                        _set_expected_joint6(final_joint6)
                     _set_last_result(
                         TrackChunkResult(
                             ok=False,
@@ -460,7 +365,7 @@ class TrajectoryExecutor:
                             control_dt_s=current_plan.control_dt_s,
                             tracking_err=0.0,
                             exec_mode="streaming",
-                            raw={**resp, **({"semantic_joint6": float(final_joint6)} if final_joint6 is not None else {})},
+                            raw=resp,
                             start_pose_real=current_plan.start_pose_real,
                             final_pose_real=final_pose_real,
                         )
@@ -468,25 +373,16 @@ class TrajectoryExecutor:
                     _set_expected_pose(final_pose if current_index > 0 else None)
                     current_snapshot = None
                     current_plan = None
-                    current_joint6_targets = None
-                    current_joint6_start = None
-                    current_joint6_final = None
                     current_index = 0
                     if error == "safety":
                         _finish_servo()
-                        hold_pose_real = None
-                        hold_joint6 = self.expected_joint6 if self._use_joint6 else None
 
             except Exception as exc:
                 _set_last_result(None)
                 _set_expected_pose(None)
                 current_snapshot = None
                 current_plan = None
-                current_joint6_targets = None
-                current_joint6_start = None
-                current_joint6_final = None
                 current_index = 0
-                hold_pose_real = None
                 print(f"  [executor] Error: {exc}")
                 _finish_servo()
 
@@ -635,10 +531,7 @@ def main() -> int:
     if str(cfg.obs_state_mode).strip().lower() != STATE_MODE_YAW:
         print(f"State Mode '{cfg.obs_state_mode}' overridden to '{STATE_MODE_YAW}' on yaw-refactor branch.")
     print(f"OBS_STATE_MODE={obs_state_mode}")
-    use_joint6_mode = False
-    semantic_joint6_rad: float | None = None
     obs_builder = RealRobotOpenPIObservationBuilder(state_mode=obs_state_mode)
-    obs_builder.set_semantic_joint6_scalar(None)
     cameras_ready = False
 
     def ensure_cameras_ready() -> None:
@@ -655,8 +548,6 @@ def main() -> int:
     executor = TrajectoryExecutor(
         execute=execute,
         max_speed_mps=effective_speed,
-        use_joint6=use_joint6_mode,
-        initial_joint6_rad=float(DEFAULT_J6_HOME_RAD),
     )
     executor.start()
 
@@ -842,9 +733,6 @@ def main() -> int:
             else:
                 print(f"  [{step_id:4d}] Gripper cache unchanged after failed command")
 
-        def _sync_semantic_joint6_from_executor() -> None:
-            return
-
         try:
             while True:
                 loop_start = time.monotonic()
@@ -869,7 +757,6 @@ def main() -> int:
                 tcp_deltas = np.zeros((len(exec_actions), 6), dtype=np.float64)
                 tcp_deltas[:, :3] = exec_actions[:, :3]
                 tcp_deltas[:, 3:5] = exec_actions[:, 3:5]
-                joint6_deltas = None
                 tcp_deltas[:, 5] = exec_actions[:, 5]
 
                 # Native mode: linearly interpolate 10 intervals -> 50 actions
@@ -897,15 +784,10 @@ def main() -> int:
                     scheduled_gripper_idx = int(edge_indices[0])
                     scheduled_gripper_state = int(gripper_targets[scheduled_gripper_idx])
                     tcp_prefix = tcp_deltas[: scheduled_gripper_idx + 1]
-                    joint6_prefix = None
-                else:
-                    joint6_prefix = None
 
                 executor.submit(
                     tcp_prefix,
                     aligned_obs.aligned_tcp_pose_sim,
-                    joint6_deltas=joint6_prefix,
-                    semantic_joint6=None,
                 )
 
                 gripper_changed = scheduled_gripper_state is not None
@@ -917,7 +799,6 @@ def main() -> int:
                         f"executing TCP prefix ({len(tcp_prefix)} intervals)..."
                     )
                     executor.wait_until_idle()
-                    _sync_semantic_joint6_from_executor()
                     last_res = executor.last_result
                     if last_res and not last_res.ok:
                         print(f"    Track error before gripper command: {last_res.reason}")
@@ -929,7 +810,6 @@ def main() -> int:
                         f"  [{step:4d}] Executing first {len(tcp_prefix)} intervals, then re-infer..."
                     )
                     executor.wait_until_idle()
-                    _sync_semantic_joint6_from_executor()
                     last_res = executor.last_result
                     if last_res and not last_res.ok:
                         print(f"    Track error: {last_res.reason}")
@@ -960,7 +840,6 @@ def main() -> int:
             executor.clear_pending()
             print("\n  Waiting for in-flight trajectory to finish...")
             executor.wait_until_idle()
-            _sync_semantic_joint6_from_executor()
             executor.reset_state()
             if _rec_thread is not None:
                 _rec_stop.set()

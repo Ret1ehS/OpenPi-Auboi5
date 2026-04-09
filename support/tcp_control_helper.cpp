@@ -28,11 +28,6 @@ using namespace arcs::common_interface;
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
-constexpr double kDefaultMoveLineAcc = 1.2;
-constexpr double kDefaultMoveLineSpeed = 0.10;
-constexpr double kDefaultMoveLineBlendRadius = 0.01;
-constexpr double kMoveLineCheckSampleDist = 0.0025;
-
 using Vec3 = std::array<double, 3>;
 using Quat = std::array<double, 4>;
 using Mat4 = std::array<std::array<double, 4>, 4>;
@@ -102,15 +97,10 @@ struct Options {
     bool execute = false;
     bool has_target_pose = false;
     bool has_joint_target = false;
-    bool has_track_pose_file = false;
     bool daemon = false;
     std::string log_file;
     std::vector<double> target_pose;
     std::vector<double> joint_target;
-    std::string track_pose_file;
-    double track_time_s = 0.0125;
-    double smooth_scale = 0.5;
-    double delay_scale = 1.0;
 };
 
 void print_vec(const char *name, const std::vector<double> &values)
@@ -247,35 +237,6 @@ std::map<std::string, Vec3> compute_positions(const std::vector<double> &q, cons
     return positions;
 }
 
-std::vector<std::vector<double>> read_pose_file(const std::string &path)
-{
-    std::ifstream fin(path);
-    if (!fin) {
-        throw std::runtime_error("failed to open pose file: " + path);
-    }
-
-    std::vector<std::vector<double>> poses;
-    std::string line;
-    while (std::getline(fin, line)) {
-        if (line.empty()) {
-            continue;
-        }
-        std::istringstream iss(line);
-        std::vector<double> pose;
-        double value = 0.0;
-        while (iss >> value) {
-            pose.push_back(value);
-        }
-        if (!pose.empty()) {
-            if (pose.size() != 6) {
-                throw std::runtime_error("each pose row must contain 6 floats");
-            }
-            poses.push_back(pose);
-        }
-    }
-    return poses;
-}
-
 bool parse_args(int argc, char **argv, Options &opt)
 {
     for (int i = 1; i < argc; ++i) {
@@ -320,19 +281,9 @@ bool parse_args(int argc, char **argv, Options &opt)
             for (int j = 0; j < 6; ++j) {
                 opt.joint_target.push_back(std::stod(require_value("--joint-target")));
             }
-        } else if (arg == "--track-pose-file") {
-            opt.has_track_pose_file = true;
-            opt.track_pose_file = require_value("--track-pose-file");
-        } else if (arg == "--track-time-s") {
-            opt.track_time_s = std::stod(require_value("--track-time-s"));
-        } else if (arg == "--smooth-scale") {
-            opt.smooth_scale = std::stod(require_value("--smooth-scale"));
-        } else if (arg == "--delay-scale") {
-            opt.delay_scale = std::stod(require_value("--delay-scale"));
         } else if (arg == "--help" || arg == "-h") {
             std::cout
                 << "Usage: tcp_control_helper [--target-pose x y z rx ry rz | --joint-target q1..q6]\n"
-                << "                          [--track-pose-file path --track-time-s 0.05]\n"
                 << "                          [--execute] [--daemon] [--log-file path] [--robot-ip IP] [--port 30004]\n";
             return false;
         } else {
@@ -375,18 +326,6 @@ int wait_arrival_with_safety(RobotInterfacePtr robot, double stop_time_s)
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     return 0;
-}
-
-int wait_for_exec_start(RobotInterfacePtr robot, int timeout_ms)
-{
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (robot->getMotionControl()->getExecId() != -1) {
-            return robot->getMotionControl()->getExecId();
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
-    return -1;
 }
 
 bool safety_mode_allows_motion(SafetyModeType mode)
@@ -501,119 +440,6 @@ int ensure_robot_ready_for_motion(RobotInterfacePtr robot, MotionControlPtr moti
 
 const char *servo_ret_name(int code);
 
-int run_track_pose_sequence(RobotInterfacePtr robot,
-                            MotionControlPtr motion,
-                            RobotAlgorithmPtr algo,
-                            RobotConfigPtr config,
-                            const Options &opt)
-{
-    const auto poses = read_pose_file(opt.track_pose_file);
-    std::cout << "track_pose_file=" << opt.track_pose_file << std::endl;
-    std::cout << "track_steps=" << poses.size() << std::endl;
-    std::cout << "track_time_s=" << opt.track_time_s << std::endl;
-    std::cout << "track_smooth_scale=" << opt.smooth_scale << std::endl;
-    std::cout << "track_delay_scale=" << opt.delay_scale << std::endl;
-    std::cout << "speed_fraction=" << opt.speed_fraction << std::endl;
-    std::cout << "exec_mode=servoCartesian" << std::endl;
-
-    if (poses.empty()) {
-        std::cerr << "track pose file is empty" << std::endl;
-        return 27;
-    }
-    if (!opt.execute) {
-        return 0;
-    }
-
-    auto state = robot->getRobotState();
-    if (state->isCollisionOccurred() || !state->isWithinSafetyLimits()) {
-        std::cerr << "track execute aborted because robot is already in collision or outside safety limits" << std::endl;
-        return 28;
-    }
-
-    motion->setSpeedFraction(opt.speed_fraction);
-    const int servo_mode_before = motion->getServoModeSelect();
-    const double cycle_time_s = config->getCycletime();
-    const double lookahead_time = std::max(0.03, std::min(0.2, cycle_time_s));
-    const double gain = 150.0;
-    std::cout << "servo_mode_before=" << servo_mode_before << std::endl;
-    std::cout << "servo_cycle_time_s=" << cycle_time_s << std::endl;
-    std::cout << "servo_lookahead_time_s=" << lookahead_time << std::endl;
-    std::cout << "servo_gain=" << gain << std::endl;
-    const int servo_enter_ret = motion->setServoModeSelect(1);
-    const int servo_mode_after_enter = motion->getServoModeSelect();
-    std::cout << "servo_enter_ret=" << servo_enter_ret << std::endl;
-    std::cout << "servo_mode_after_enter=" << servo_mode_after_enter << std::endl;
-    if (servo_enter_ret != 0 || servo_mode_after_enter != 1) {
-        return 33;
-    }
-
-    auto cleanup_servo = [&]() {
-        const int servo_exit_ret = motion->setServoModeSelect(0);
-        std::cout << "servo_exit_ret=" << servo_exit_ret << std::endl;
-        std::cout << "servo_mode_after_exit=" << motion->getServoModeSelect() << std::endl;
-    };
-
-    std::vector<double> seed_q = state->getJointPositions();
-    int sent = 0;
-    int last_servo_ret = 0;
-
-    for (size_t idx = 0; idx < poses.size(); ++idx) {
-        std::vector<double> pose = poses[idx];
-
-        auto ik_result = algo->inverseKinematics(seed_q, pose);
-        std::vector<double> target_q = std::get<0>(ik_result);
-        const int ik_ret = std::get<1>(ik_result);
-        if (ik_ret != 0 || target_q.size() != 6) {
-            std::cout << "track_fail_index=" << idx << std::endl;
-            std::cout << "track_ik_ret=" << ik_ret << std::endl;
-            cleanup_servo();
-            return 29;
-        }
-
-        last_servo_ret = 0;
-        for (int retry = 0; retry < 5; ++retry) {
-            last_servo_ret = motion->servoCartesian(pose, 0.0, 0.0, opt.track_time_s, lookahead_time, gain);
-            if (last_servo_ret == 0) {
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        }
-        if (last_servo_ret != 0) {
-            std::cout << "track_fail_index=" << idx << std::endl;
-            std::cout << "servo_ret=" << last_servo_ret << std::endl;
-            std::cout << "servo_ret_name=" << servo_ret_name(last_servo_ret) << std::endl;
-            cleanup_servo();
-            return 31;
-        }
-
-        seed_q = target_q;
-        ++sent;
-        std::this_thread::sleep_for(std::chrono::duration<double>(opt.track_time_s));
-
-        state = robot->getRobotState();
-        if (state->isCollisionOccurred() || !state->isWithinSafetyLimits()) {
-            motion->stopJoint(1.0);
-            cleanup_servo();
-            std::cout << "track_fail_index=" << idx << std::endl;
-            std::cout << "track_abort_reason=safety" << std::endl;
-            std::cout << "servo_sent=" << sent << std::endl;
-            return 32;
-        }
-    }
-
-    std::this_thread::sleep_for(std::chrono::duration<double>(opt.track_time_s));
-    cleanup_servo();
-    const auto final_q = robot->getRobotState()->getJointPositions();
-    print_vec("final_q_rad", final_q);
-    std::cout << "servo_sent=" << sent << std::endl;
-    std::cout << "servo_ret=" << last_servo_ret << std::endl;
-    std::cout << "collision_after=" << robot->getRobotState()->isCollisionOccurred() << std::endl;
-    std::cout << "within_safety_limits_after=" << robot->getRobotState()->isWithinSafetyLimits() << std::endl;
-    std::cout << "robot_mode_after=" << robot->getRobotState()->getRobotModeType() << std::endl;
-    std::cout << "safety_mode_after=" << robot->getRobotState()->getSafetyModeType() << std::endl;
-    return 0;
-}
-
 // ---------------------------------------------------------------------------
 // Daemon mode: keep connection alive, read commands from stdin
 // ---------------------------------------------------------------------------
@@ -641,234 +467,9 @@ void print_snapshot(RobotInterfacePtr robot, RobotConfigPtr config)
 }
 
 // Parse a line of 6 space-separated doubles into a vector.
-bool parse_pose6(const std::string &line, std::vector<double> &out)
-{
-    out.clear();
-    std::istringstream iss(line);
-    double v;
-    while (iss >> v) {
-        out.push_back(v);
-    }
-    return out.size() == 6;
-}
-
-double pose_linear_distance(const std::vector<double> &a, const std::vector<double> &b)
-{
-    if (a.size() < 3 || b.size() < 3) {
-        return 0.0;
-    }
-    const double dx = a[0] - b[0];
-    const double dy = a[1] - b[1];
-    const double dz = a[2] - b[2];
-    return std::sqrt(dx * dx + dy * dy + dz * dz);
-}
-
-double compute_move_line_blend_radius(const std::vector<std::vector<double>> &poses,
-                                      size_t idx,
-                                      double requested_radius)
-{
-    if (requested_radius <= 0.0 || poses.size() < 2 || idx + 1 >= poses.size()) {
-        return 0.0;
-    }
-    const double next_dist = pose_linear_distance(poses[idx], poses[idx + 1]);
-    double limit_dist = next_dist;
-    if (idx > 0) {
-        limit_dist = std::min(limit_dist, pose_linear_distance(poses[idx - 1], poses[idx]));
-    }
-    const double radius = std::min(requested_radius, 0.35 * limit_dist);
-    return radius >= 1e-3 ? radius : 0.0;
-}
-
 double wrap_angle(double angle)
 {
     return std::atan2(std::sin(angle), std::cos(angle));
-}
-
-std::vector<double> interpolate_pose6(const std::vector<double> &a,
-                                      const std::vector<double> &b,
-                                      double t)
-{
-    std::vector<double> out(6, 0.0);
-    for (size_t i = 0; i < 3 && i < a.size() && i < b.size(); ++i) {
-        out[i] = a[i] + (b[i] - a[i]) * t;
-    }
-    for (size_t i = 3; i < 6 && i < a.size() && i < b.size(); ++i) {
-        out[i] = a[i] + wrap_angle(b[i] - a[i]) * t;
-    }
-    return out;
-}
-
-bool validate_pose_sample(RobotAlgorithmPtr algo,
-                          const std::vector<double> &pose,
-                          std::vector<double> &seed_q,
-                          std::string &reason,
-                          int &ik_ret)
-{
-    auto ik_result = algo->inverseKinematics(seed_q, pose);
-    auto target_q = std::get<0>(ik_result);
-    ik_ret = std::get<1>(ik_result);
-    if (ik_ret != 0 || target_q.size() != 6) {
-        if (ik_ret == 0) {
-            ik_ret = -1;
-        }
-        std::ostringstream oss;
-        oss << "ik_ret=" << ik_ret;
-        reason = oss.str();
-        return false;
-    }
-    seed_q = target_q;
-    return true;
-}
-
-bool validate_linear_segment_samples(RobotAlgorithmPtr algo,
-                                     const std::vector<double> &start_pose,
-                                     const std::vector<double> &end_pose,
-                                     const std::vector<double> &start_q,
-                                     size_t segment_index,
-                                     std::string &error_kind,
-                                     std::string &reason,
-                                     int &ik_ret,
-                                     size_t &sample_index)
-{
-    const double dist = pose_linear_distance(start_pose, end_pose);
-    const int sample_count = std::max(1, static_cast<int>(std::ceil(dist / kMoveLineCheckSampleDist)));
-    std::vector<double> seed_q = start_q;
-    for (int sample = 1; sample < sample_count; ++sample) {
-        const double t = static_cast<double>(sample) / static_cast<double>(sample_count);
-        const auto pose = interpolate_pose6(start_pose, end_pose, t);
-        if (!validate_pose_sample(
-                algo,
-                pose,
-                seed_q,
-                reason,
-                ik_ret)) {
-            error_kind = "segment_ik_fail";
-            sample_index = static_cast<size_t>(sample);
-            return false;
-        }
-    }
-    return true;
-}
-
-bool validate_blend_segment_samples(RobotAlgorithmPtr algo,
-                                    const std::vector<std::vector<double>> &poses,
-                                    const std::vector<std::vector<double>> &joint_solutions,
-                                    size_t via_index,
-                                    double blend_radius,
-                                    std::string &error_kind,
-                                    std::string &reason,
-                                    int &ik_ret,
-                                    size_t &sample_index)
-{
-    if (via_index == 0 || via_index + 1 >= poses.size() || via_index >= joint_solutions.size()) {
-        return true;
-    }
-    if (blend_radius <= 0.0) {
-        return true;
-    }
-
-    std::vector<std::vector<double>> blend_points;
-    try {
-        blend_points = algo->pathBlend3Points(
-            3,
-            joint_solutions[via_index - 1],
-            joint_solutions[via_index],
-            joint_solutions[via_index + 1],
-            blend_radius,
-            kMoveLineCheckSampleDist
-        );
-    } catch (const std::exception &exc) {
-        error_kind = "blend_path_exception";
-        reason = std::string("pathBlend3Points failed: ") + exc.what();
-        ik_ret = 0;
-        sample_index = 0;
-        return false;
-    }
-
-    std::vector<double> seed_q = joint_solutions[via_index - 1];
-    for (size_t sample = 0; sample < blend_points.size(); ++sample) {
-        if (blend_points[sample].size() < 3) {
-            continue;
-        }
-        std::vector<double> pose = poses[via_index];
-        pose[0] = blend_points[sample][0];
-        pose[1] = blend_points[sample][1];
-        pose[2] = blend_points[sample][2];
-        if (!blend_points.empty()) {
-            const double t = static_cast<double>(sample + 1) / static_cast<double>(blend_points.size() + 1);
-            if (t <= 0.5) {
-                const auto orient_pose = interpolate_pose6(poses[via_index - 1], poses[via_index], t * 2.0);
-                pose[3] = orient_pose[3];
-                pose[4] = orient_pose[4];
-                pose[5] = orient_pose[5];
-            } else {
-                const auto orient_pose = interpolate_pose6(poses[via_index], poses[via_index + 1], (t - 0.5) * 2.0);
-                pose[3] = orient_pose[3];
-                pose[4] = orient_pose[4];
-                pose[5] = orient_pose[5];
-            }
-        }
-        if (!validate_pose_sample(
-                algo,
-                pose,
-                seed_q,
-                reason,
-                ik_ret)) {
-            error_kind = "blend_ik_fail";
-            sample_index = sample;
-            return false;
-        }
-    }
-    return true;
-}
-
-bool validate_movel_chunk_swept_path(RobotAlgorithmPtr algo,
-                                     const std::vector<std::vector<double>> &poses,
-                                     const std::vector<std::vector<double>> &joint_solutions,
-                                     double requested_blend_radius,
-                                     std::string &error_kind,
-                                     std::string &reason,
-                                     int &ik_ret,
-                                     size_t &fail_index,
-                                     size_t &sample_index)
-{
-    if (poses.size() < 2 || joint_solutions.size() != poses.size()) {
-        return true;
-    }
-
-    for (size_t idx = 0; idx + 1 < poses.size(); ++idx) {
-        if (!validate_linear_segment_samples(
-                algo,
-                poses[idx],
-                poses[idx + 1],
-                joint_solutions[idx],
-                idx,
-                error_kind,
-                reason,
-                ik_ret,
-                sample_index)) {
-            fail_index = idx;
-            return false;
-        }
-    }
-
-    for (size_t idx = 1; idx + 1 < poses.size(); ++idx) {
-        const double radius = compute_move_line_blend_radius(poses, idx, requested_blend_radius);
-        if (!validate_blend_segment_samples(
-                algo,
-                poses,
-                joint_solutions,
-                idx,
-                radius,
-                error_kind,
-                reason,
-                ik_ret,
-                sample_index)) {
-            fail_index = idx;
-            return false;
-        }
-    }
-    return true;
 }
 
 std::string trim(const std::string &s)
@@ -1321,270 +922,6 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
             std::cout << "within_safety_limits_after=" << robot->getRobotState()->isWithinSafetyLimits() << std::endl;
             std::cout << "END" << std::endl;
 
-        } else if (line.rfind("movel_async_speed ", 0) == 0 ||
-                   line.rfind("movel_speed ", 0) == 0 ||
-                   line.rfind("movel_async ", 0) == 0 ||
-                   line.rfind("movel ", 0) == 0) {
-            // movel x y z rx ry rz [speed_frac]
-            // movel_async x y z rx ry rz [speed_frac]
-            // movel_speed x y z rx ry rz speed_mps
-            // movel_async_speed x y z rx ry rz speed_mps
-            // Cartesian linear move via moveLine.
-            if (servo_active) {
-                cleanup_servo();
-            }
-            const bool use_explicit_speed = line.rfind("movel_async_speed ", 0) == 0 ||
-                                            line.rfind("movel_speed ", 0) == 0;
-            const bool async_move = line.rfind("movel_async_speed ", 0) == 0 ||
-                                    line.rfind("movel_async ", 0) == 0;
-            const size_t prefix_len = use_explicit_speed
-                ? (async_move ? std::string("movel_async_speed ").size() : std::string("movel_speed ").size())
-                : (async_move ? std::string("movel_async ").size() : std::string("movel ").size());
-            // Parse: 6 pose values + optional speed
-            std::vector<double> pose(6);
-            double spd = opt.speed_fraction;
-            double line_speed = kDefaultMoveLineSpeed;
-            {
-                std::istringstream iss(line.substr(prefix_len));
-                for (int k = 0; k < 6; ++k) {
-                    if (!(iss >> pose[k])) { pose.clear(); break; }
-                }
-                double s;
-                if (iss >> s && s > 0.0) {
-                    if (use_explicit_speed) {
-                        line_speed = s;
-                        spd = line_speed / kDefaultMoveLineSpeed;
-                    } else if (s <= 1.0) {
-                        spd = s;
-                        line_speed = kDefaultMoveLineSpeed * spd;
-                    }
-                } else if (!use_explicit_speed) {
-                    line_speed = kDefaultMoveLineSpeed * spd;
-                }
-            }
-            if (pose.size() != 6) {
-                std::cout << "error=bad_pose" << std::endl;
-                std::cout << "END" << std::endl;
-                continue;
-            }
-            // Use fresh joint positions as IK seed
-            seed_q = robot->getRobotState()->getJointPositions();
-            // IK to get target joints
-            auto ik_result = algo->inverseKinematics(seed_q, pose);
-            auto target_q = std::get<0>(ik_result);
-            int ik_ret = std::get<1>(ik_result);
-            if (ik_ret != 0 || target_q.size() != 6) {
-                std::cout << "movel_ret=-1" << std::endl;
-                std::cout << "error=ik_fail" << std::endl;
-                std::cout << "END" << std::endl;
-                continue;
-            }
-            // Cancel queued motion first, then wait for steady + ensure Running
-            state = robot->getRobotState();
-            if (motion->getExecId() != -1 || !state->isSteady()) {
-                motion->stopMove(true, true);
-                // Wait for robot to become steady after stop (max 500ms)
-                auto steady_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-                while (std::chrono::steady_clock::now() < steady_deadline) {
-                    state = robot->getRobotState();
-                    if (motion->getExecId() == -1 && state->isSteady()) break;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                }
-            }
-            // Ensure the controller is cleared and ready before accepting moveLine.
-            const int ready_ret = ensure_robot_ready_for_motion(robot, motion, manage);
-            if (ready_ret != 0) {
-                std::cout << "movel_ret=-1" << std::endl;
-                std::cout << "error=robot_not_ready" << std::endl;
-                std::cout << "ready_ret=" << ready_ret << std::endl;
-                std::cout << "END" << std::endl;
-                continue;
-            }
-            motion->setSpeedFraction(1.0);
-            const double line_acc = kDefaultMoveLineAcc;
-            int move_ret = 0;
-            for (int retry = 0; retry < 40; ++retry) {
-                move_ret = motion->moveLine(pose, line_acc, line_speed, 0.0, 0.0);
-                if (move_ret == 0) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
-            std::cout << "movel_ret=" << move_ret << std::endl;
-            std::cout << "movel_mode=" << (async_move ? "moveLine_async" : "moveLine") << std::endl;
-            std::cout << "requested_speed_fraction=" << spd << std::endl;
-            std::cout << "applied_speed_fraction=" << spd << std::endl;
-            std::cout << "requested_speed_mps=" << line_speed << std::endl;
-            std::cout << "movel_acc=" << line_acc << std::endl;
-            std::cout << "movel_speed=" << line_speed << std::endl;
-            if (move_ret == 0 && async_move) {
-                int exec_id = wait_for_exec_start(robot, 300);
-                std::cout << "exec_id=" << exec_id << std::endl;
-            } else if (move_ret == 0) {
-                int wait_ret = wait_arrival_with_safety(robot, 1.0);
-                std::cout << "wait_ret=" << wait_ret << std::endl;
-            }
-            seed_q = robot->getRobotState()->getJointPositions();
-            hold_pose = std::get<0>(algo->forwardKinematics(seed_q));
-            print_vec("final_pose", hold_pose);
-            std::cout << "END" << std::endl;
-
-        } else if (line.rfind("movel_chunk ", 0) == 0) {
-            // movel_chunk N [speed_frac] [blend_radius]
-            if (servo_active) {
-                cleanup_servo();
-            }
-
-            int num_poses = 0;
-            double spd = opt.speed_fraction;
-            double blend_radius = kDefaultMoveLineBlendRadius;
-            {
-                std::istringstream iss(line.substr(12));
-                iss >> num_poses;
-                double parsed_spd = 0.0;
-                double parsed_blend = 0.0;
-                if (iss >> parsed_spd && parsed_spd > 0.0 && parsed_spd <= 1.0) {
-                    spd = parsed_spd;
-                }
-                if (iss >> parsed_blend && parsed_blend >= 0.0) {
-                    blend_radius = parsed_blend;
-                }
-            }
-
-            std::vector<std::vector<double>> poses;
-            poses.reserve(std::max(0, num_poses));
-            for (int i = 0; i < num_poses; ++i) {
-                std::string pline;
-                if (!std::getline(std::cin, pline)) {
-                    break;
-                }
-                std::vector<double> pose;
-                if (parse_pose6(trim(pline), pose)) {
-                    poses.push_back(pose);
-                }
-            }
-
-            if (poses.empty()) {
-                std::cout << "movel_chunk_ret=-1" << std::endl;
-                std::cout << "chunk_total=0" << std::endl;
-                std::cout << "chunk_queued=0" << std::endl;
-                std::cout << "error=empty_chunk" << std::endl;
-                std::cout << "END" << std::endl;
-                continue;
-            }
-
-            state = robot->getRobotState();
-            const int ready_ret = ensure_robot_ready_for_motion(robot, motion, manage);
-            if (ready_ret != 0) {
-                std::cout << "movel_chunk_ret=-1" << std::endl;
-                std::cout << "chunk_total=" << poses.size() << std::endl;
-                std::cout << "chunk_queued=0" << std::endl;
-                std::cout << "error=robot_not_ready" << std::endl;
-                std::cout << "ready_ret=" << ready_ret << std::endl;
-                std::cout << "END" << std::endl;
-                continue;
-            }
-
-            std::vector<double> check_seed_q = robot->getRobotState()->getJointPositions();
-            std::vector<std::vector<double>> joint_solutions;
-            joint_solutions.reserve(poses.size());
-            for (size_t idx = 0; idx < poses.size(); ++idx) {
-                auto ik_result = algo->inverseKinematics(check_seed_q, poses[idx]);
-                auto target_q = std::get<0>(ik_result);
-                int ik_ret = std::get<1>(ik_result);
-                if (ik_ret != 0 || target_q.size() != 6) {
-                    std::cout << "movel_chunk_ret=-1" << std::endl;
-                    std::cout << "chunk_total=" << poses.size() << std::endl;
-                    std::cout << "chunk_queued=0" << std::endl;
-                    std::cout << "error=ik_fail" << std::endl;
-                    std::cout << "ik_ret=" << ik_ret << std::endl;
-                    std::cout << "fail_index=" << idx << std::endl;
-                    std::cout << "END" << std::endl;
-                    poses.clear();
-                    break;
-                }
-                check_seed_q = target_q;
-                joint_solutions.push_back(target_q);
-            }
-            if (poses.empty()) {
-                continue;
-            }
-
-            std::string swept_error_kind;
-            std::string swept_reason;
-            int swept_ik_ret = 0;
-            size_t swept_fail_index = 0;
-            size_t swept_sample_index = 0;
-            if (!validate_movel_chunk_swept_path(
-                    algo,
-                    poses,
-                    joint_solutions,
-                    blend_radius,
-                    swept_error_kind,
-                    swept_reason,
-                    swept_ik_ret,
-                    swept_fail_index,
-                    swept_sample_index)) {
-                std::cout << "movel_chunk_ret=-1" << std::endl;
-                std::cout << "chunk_total=" << poses.size() << std::endl;
-                std::cout << "chunk_queued=0" << std::endl;
-                std::cout << "error=swept_path_fail" << std::endl;
-                std::cout << "swept_error_kind=" << swept_error_kind << std::endl;
-                std::cout << "swept_reason=" << swept_reason << std::endl;
-                std::cout << "ik_ret=" << swept_ik_ret << std::endl;
-                std::cout << "fail_index=" << swept_fail_index << std::endl;
-                std::cout << "sample_index=" << swept_sample_index << std::endl;
-                std::cout << "END" << std::endl;
-                continue;
-            }
-
-            motion->setSpeedFraction(1.0);
-            const double line_acc = kDefaultMoveLineAcc;
-            const double line_speed = kDefaultMoveLineSpeed;
-            int chunk_queued = 0;
-            int last_ret = 0;
-            int exec_id = -1;
-
-            for (size_t idx = 0; idx < poses.size(); ++idx) {
-                const double radius = compute_move_line_blend_radius(poses, idx, blend_radius);
-                last_ret = 0;
-                for (int retry = 0; retry < 20; ++retry) {
-                    last_ret = motion->moveLine(poses[idx], line_acc, line_speed, radius, 0.0);
-                    if (last_ret == 0) {
-                        break;
-                    }
-                    if (last_ret != 2 && last_ret != 3) {
-                        break;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                }
-                if (last_ret != 0) {
-                    break;
-                }
-                ++chunk_queued;
-                if (chunk_queued == 1) {
-                    exec_id = wait_for_exec_start(robot, 300);
-                }
-            }
-
-            seed_q = robot->getRobotState()->getJointPositions();
-            hold_pose = std::get<0>(algo->forwardKinematics(seed_q));
-            std::cout << "movel_chunk_ret=" << (last_ret == 0 && chunk_queued == static_cast<int>(poses.size()) ? 0 : last_ret) << std::endl;
-            std::cout << "chunk_total=" << poses.size() << std::endl;
-            std::cout << "chunk_queued=" << chunk_queued << std::endl;
-            std::cout << "exec_id=" << exec_id << std::endl;
-            std::cout << "movel_mode=moveLine_chunk" << std::endl;
-            std::cout << "requested_speed_fraction=" << spd << std::endl;
-            std::cout << "applied_speed_fraction=1" << std::endl;
-            std::cout << "movel_acc=" << line_acc << std::endl;
-            std::cout << "movel_speed=" << line_speed << std::endl;
-            std::cout << "movel_blend_radius=" << blend_radius << std::endl;
-            if (last_ret != 0 && chunk_queued != static_cast<int>(poses.size())) {
-                std::cout << "error=queue_failed" << std::endl;
-                std::cout << "motion_ret_name=" << servo_ret_name(last_ret) << std::endl;
-                std::cout << "fail_index=" << chunk_queued << std::endl;
-            }
-            print_vec("final_pose", hold_pose);
-            std::cout << "END" << std::endl;
-
         } else if (line == "motion_status") {
             auto robot_state = robot->getRobotState();
             std::cout << "exec_id=" << motion->getExecId() << std::endl;
@@ -1596,22 +933,6 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
             std::cout << "within_safety_limits=" << robot_state->isWithinSafetyLimits() << std::endl;
             print_vec("joint_q_rad", robot_state->getJointPositions());
             print_vec("tcp_pose", robot_state->getTcpPose());
-            std::cout << "END" << std::endl;
-
-        } else if (line == "wait_motion") {
-            auto robot_state = robot->getRobotState();
-            int wait_ret = 0;
-            if (!(motion->getExecId() == -1 && robot_state->isSteady())) {
-                wait_ret = wait_arrival_with_safety(robot, 1.0);
-            }
-            std::cout << "wait_ret=" << wait_ret << std::endl;
-            std::cout << "exec_id=" << motion->getExecId() << std::endl;
-            print_vec("final_q_rad", robot_state->getJointPositions());
-            print_vec("final_pose", robot_state->getTcpPose());
-            std::cout << "collision_after=" << robot_state->isCollisionOccurred() << std::endl;
-            std::cout << "within_safety_limits_after=" << robot_state->isWithinSafetyLimits() << std::endl;
-            std::cout << "robot_mode_after=" << robot_state->getRobotModeType() << std::endl;
-            std::cout << "safety_mode_after=" << robot_state->getSafetyModeType() << std::endl;
             std::cout << "END" << std::endl;
 
         } else if (line.rfind("stop_motion", 0) == 0) {
@@ -1764,18 +1085,6 @@ int main(int argc, char **argv)
     }
 
     if (!opt.execute) {
-        if (opt.has_track_pose_file) {
-            try {
-                const auto poses = read_pose_file(opt.track_pose_file);
-                std::cout << "track_pose_file=" << opt.track_pose_file << std::endl;
-                std::cout << "track_steps=" << poses.size() << std::endl;
-            } catch (const std::exception &e) {
-                std::cerr << e.what() << std::endl;
-                cli->logout();
-                cli->disconnect();
-                return 27;
-            }
-        }
         cli->logout();
         cli->disconnect();
         return 0;
@@ -1786,13 +1095,6 @@ int main(int argc, char **argv)
         cli->logout();
         cli->disconnect();
         return 23;
-    }
-
-    if (opt.has_track_pose_file) {
-        const int track_rc = run_track_pose_sequence(robot, motion, algo, config, opt);
-        cli->logout();
-        cli->disconnect();
-        return track_rc;
     }
 
     if (target_q.empty()) {

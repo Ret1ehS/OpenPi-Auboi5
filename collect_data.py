@@ -77,8 +77,6 @@ DEFAULT_ASYNC_MOVE_TIMEOUT_S = 30.0
 SERVO_CONTROL_DT = 0.01
 SERVO_ANGULAR_SPEED_RADPS = 0.60
 DEFAULT_J6_SPEED_RADPS = float(np.deg2rad(10.0))
-DEFAULT_J6_MOVE_SPEED_DEG = 10.0
-DEFAULT_J6_MOVE_ACC_DEG = 20.0
 DEFAULT_J6_HOME_RAD = 0.11434
 DEFAULT_J6_EXEC_TOL_RAD = float(np.deg2rad(1.0))
 ROTATE_ABS_DEG_MIN = 12.0
@@ -495,14 +493,6 @@ def ensure_joint_move_ok(result, label: str) -> None:
         raise RuntimeError(f"{label} failed: {result.reason}")
 
 
-def ensure_movel_ok(resp: dict[str, object], label: str) -> None:
-    move_ret = int(resp.get("movel_ret", -999))
-    wait_ret_raw = resp.get("wait_ret")
-    wait_ret = int(wait_ret_raw) if wait_ret_raw is not None else None
-    if move_ret != 0 or (wait_ret is not None and wait_ret != 0):
-        raise RuntimeError(f"{label} failed: {resp}")
-
-
 def ensure_gripper_ok(ok: bool, label: str) -> None:
     if not ok:
         raise RuntimeError(f"{label} failed")
@@ -759,7 +749,7 @@ def _execute_servo_segment(
     return frames
 
 
-def execute_movel_and_wait(
+def execute_pose_move_and_wait(
     daemon,
     target_real: np.ndarray,
     label: str,
@@ -844,64 +834,6 @@ def execute_and_record(
         target_joint6=target_joint6,
         semantic_joint6=semantic_joint6,
         force_live_mode=force_live_mode,
-        reuse_servo=reuse_servo,
-    )
-
-
-def execute_joint6_rotation_and_record(
-    daemon,
-    cameras: CameraPair,
-    target_joint6: float,
-    start_joint6: float,
-    gripper: float,
-    start_frame_idx: int,
-    *,
-    speed_deg: float = DEFAULT_J6_MOVE_SPEED_DEG,
-    acc_deg: float = DEFAULT_J6_MOVE_ACC_DEG,
-    timeout_s: float = DEFAULT_ASYNC_MOVE_TIMEOUT_S,
-    reuse_servo: bool = False,
-) -> list[RecordedFrame]:
-    """Rotate joint6 in servo mode and record real observations at 30Hz."""
-    from support.tcp_control import get_robot_snapshot
-
-    start_pose = np.asarray(get_robot_snapshot().tcp_pose, dtype=np.float64).reshape(6).copy()
-    return _execute_servo_segment(
-        daemon,
-        start_pose,
-        label=f"joint6 servo rotation @ frame {start_frame_idx}",
-        speed_mps=LINEAR_SPEED,
-        record=True,
-        cameras=cameras,
-        gripper=gripper,
-        start_frame_idx=start_frame_idx,
-        timeout_s=timeout_s,
-        target_joint6=float(target_joint6),
-        semantic_joint6=float(start_joint6),
-        force_live_mode=False,
-        reuse_servo=reuse_servo,
-    )
-
-
-def execute_joint6_rotation(
-    daemon,
-    target_joint6: float,
-    *,
-    speed_deg: float = DEFAULT_J6_MOVE_SPEED_DEG,
-    acc_deg: float = DEFAULT_J6_MOVE_ACC_DEG,
-    reuse_servo: bool = False,
-) -> None:
-    """Rotate joint6 in servo mode without recording."""
-    from support.tcp_control import get_robot_snapshot
-
-    current_pose = np.asarray(get_robot_snapshot().tcp_pose, dtype=np.float64).reshape(6).copy()
-    _execute_servo_segment(
-        daemon,
-        current_pose,
-        label=f"joint6 servo rotation to {float(target_joint6):.6f}rad",
-        speed_mps=LINEAR_SPEED,
-        record=False,
-        target_joint6=float(target_joint6),
-        force_live_mode=False,
         reuse_servo=reuse_servo,
     )
 
@@ -1245,7 +1177,7 @@ class CollectTaskRuntime:
 
     def return_home(self, label: str) -> np.ndarray:
         if not self.dry_run:
-            execute_movel_and_wait(
+            execute_pose_move_and_wait(
                 self.daemon,
                 self.home_real,
                 label,
@@ -1258,7 +1190,7 @@ class CollectTaskRuntime:
     def move_pose(self, target_real: np.ndarray, label: str) -> None:
         if self.dry_run:
             return
-        execute_movel_and_wait(
+        execute_pose_move_and_wait(
             self.daemon,
             np.asarray(target_real, dtype=np.float64).reshape(6).copy(),
             label,
@@ -1528,7 +1460,7 @@ def main() -> int:
             lift_pose = startup_tcp_pose.copy()
             lift_pose[2] = lift_z
             print(f"  Lifting to z={lift_z:.4f} m at startup xy before homing...")
-            execute_movel_and_wait(
+            execute_pose_move_and_wait(
                 daemon,
                 lift_pose,
                 "lift before homing",

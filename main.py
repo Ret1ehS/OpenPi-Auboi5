@@ -349,8 +349,8 @@ class TrajectoryExecutor:
             daemon.servo_begin_chunk(plan.start_pose_real)
             return snapshot, plan, step_joint6_targets, start_joint6, final_joint6
 
-        # hold_pose_real: when a chunk finishes, keep sending this pose to
-        # hold the robot in place (servo stays active, no stop/start gap).
+        # hold_pose_real: last successfully executed pose. The helper process
+        # keeps servo mode alive and holds this target between commands.
         hold_pose_real = None
         hold_joint6 = self.expected_joint6 if self._use_joint6 else None
 
@@ -375,12 +375,7 @@ class TrajectoryExecutor:
                 if current_plan is None:
                     item = _drain_latest_pending(timeout=0.05)
                     if item is None:
-                        # No new chunk – hold position if servo is active
-                        if servo_active and hold_pose_real is not None:
-                            if self._use_joint6 and hold_joint6 is not None:
-                                daemon.servo_pose_j6(hold_pose_real, hold_joint6)
-                            else:
-                                daemon.servo_pose(hold_pose_real)
+                        # No new chunk: helper-side keepalive holds last target.
                         self._idle.set()
                         continue
                     if item is self._sentinel:

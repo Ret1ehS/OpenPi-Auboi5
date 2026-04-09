@@ -8,7 +8,7 @@ Responsibilities:
 - read robot TCP state via tcp_control.py (daemon mode)
 - package an OpenPI-compatible observation dict:
     {
-      "observation/state": float32[7 or 8],  # yaw-mode or j6-mode
+      "observation/state": float32[7],  # yaw-mode
       "observation/image": uint8[224,224,3],
       "observation/wrist_image": uint8[224,224,3],
       "prompt": str,
@@ -132,8 +132,8 @@ class AlignedObservation:
     robot_snapshot: RobotSnapshot
     aligned_tcp_pose_sim: np.ndarray
     gripper_open_scalar: float
-    joint6_state_scalar: float | None
-    joint6_readback_scalar: float | None
+    yaw_state_scalar: float | None
+    yaw_readback_scalar: float | None
     main_frame: TimedFrame
     wrist_frame: TimedFrame
     image_pair_system_diff_us: int
@@ -362,7 +362,7 @@ class RealRobotOpenPIObservationBuilder:
         """Update the locally-cached fallback gripper scalar (1.0=open, 0.0=closed)."""
         self._gripper_open_scalar = float(value)
 
-    def set_semantic_joint6_scalar(self, value: float | None) -> None:
+    def set_semantic_yaw_scalar(self, value: float | None) -> None:
         _ = value
 
     def set_state_mode(self, mode: str) -> None:
@@ -477,7 +477,7 @@ class RealRobotOpenPIObservationBuilder:
         import time as _time
         for attempt in range(max_retries):
             try:
-                # Capture both cameras in parallel — each blocks on its own
+                # Capture both cameras in parallel - each blocks on its own
                 # USB pipeline, so concurrent reads cut wall-clock time roughly
                 # in half.
                 fut_main = self._pool.submit(self._collect_recent_frames, "main")
@@ -535,7 +535,7 @@ class RealRobotOpenPIObservationBuilder:
 
         aligned_tcp_pose_sim = real_pose_to_sim(robot_snapshot.tcp_pose)
         joint_q = np.asarray(robot_snapshot.joint_q, dtype=np.float64).reshape(-1)
-        joint6_readback = float(joint_q[5]) if joint_q.size >= 6 else None
+        yaw_readback = float(joint_q[5]) if joint_q.size >= 6 else None
         state = pose6_to_openpi_state(aligned_tcp_pose_sim, gripper_open)
 
         obs = {
@@ -550,8 +550,8 @@ class RealRobotOpenPIObservationBuilder:
             robot_snapshot=robot_snapshot,
             aligned_tcp_pose_sim=aligned_tcp_pose_sim,
             gripper_open_scalar=gripper_open,
-            joint6_state_scalar=None,
-            joint6_readback_scalar=joint6_readback,
+            yaw_state_scalar=None,
+            yaw_readback_scalar=yaw_readback,
             main_frame=main_frame,
             wrist_frame=wrist_frame,
             image_pair_system_diff_us=pair_diff_us,

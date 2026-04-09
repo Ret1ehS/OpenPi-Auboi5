@@ -13,7 +13,7 @@ PICK_TASK_PROBABILITY = 0.20
 NON_ROTATED_TABLE_PLACE_PROBABILITY = 0.0
 DEFAULT_ROTATE_DEG_MIN = 12.0
 DEFAULT_ROTATE_DEG_MAX = 22.5
-DEFAULT_J6_HOME_RAD = 0.11434
+DEFAULT_YAW_HOME_RAD = 0.11434
 LOCAL_CLEAR_INITIAL_RADIUS_M = 0.15
 LOCAL_CLEAR_RADIUS_EXPAND_M = 0.0
 LOCAL_CLEAR_POINTS_PER_RETRY = 8
@@ -149,8 +149,8 @@ class SceneState:
             if xy is None:
                 return None
             if "j6" in raw:
-                saved_j6 = _normalize_optional_j6(raw.get("j6"))
-                deg = float(np.rad2deg(float(saved_j6 or 0.0) - DEFAULT_J6_HOME_RAD))
+                saved_yaw = _normalize_optional_yaw(raw.get("j6"))
+                deg = float(np.rad2deg(float(saved_yaw or 0.0) - DEFAULT_YAW_HOME_RAD))
                 is_rotate = abs(deg) > 1e-6 and name != APPLE_NAME
             else:
                 deg = float(raw.get("deg", 0.0))
@@ -607,7 +607,7 @@ def _normalize_link(value: Any) -> str | None:
     return text if text else None
 
 
-def _normalize_optional_j6(value: Any) -> float | None:
+def _normalize_optional_yaw(value: Any) -> float | None:
     if value is None:
         return None
     try:
@@ -926,7 +926,7 @@ def should_align_yaw_for_step(runtime, step: TaskStep, lookup_scene_state: dict[
     target_yaw_rad = resolve_step_target_yaw_rad(runtime, step, lookup_scene_state)
     current_yaw_rad = float(runtime.get_live_tcp_pose()[5]) if not runtime.dry_run else float(runtime.home_real[5])
     need_align = bool(step.align_yaw) and (
-        abs(runtime.wrap_angle(float(current_yaw_rad) - float(target_yaw_rad))) > float(runtime.default_j6_exec_tol_rad)
+        abs(runtime.wrap_angle(float(current_yaw_rad) - float(target_yaw_rad))) > float(runtime.default_yaw_exec_tol_rad)
     )
     return need_align, float(target_yaw_rad)
 
@@ -948,13 +948,13 @@ def execute_pick_step(
     if runtime.dry_run:
         dummy_count = 12 + (3 if should_align_yaw else 0)
         sim_pose = real_pose_to_sim(runtime.home_real)
-        joint6 = runtime.local_exec_joint6_rad
+        yaw = runtime.local_exec_yaw_rad
         for idx in range(dummy_count):
             step_frames.append(
                 runtime.make_dummy_frame(
                     sim_pose=sim_pose,
                     gripper=1.0 if idx < dummy_count - 3 else 0.0,
-                    joint6=joint6,
+                    yaw=yaw,
                     frame_idx=frame_idx + idx,
                 )
             )
@@ -983,7 +983,7 @@ def execute_pick_step(
             gripper=1.0,
             start_frame_idx=frame_idx,
             record=record,
-            semantic_joint6=runtime.local_exec_joint6_rad,
+            semantic_yaw=runtime.local_exec_yaw_rad,
         )
         if record:
             step_frames.extend(seg)
@@ -1036,13 +1036,13 @@ def execute_place_step(
     if runtime.dry_run:
         dummy_count = 10 + (3 if should_align_yaw else 0)
         sim_pose = real_pose_to_sim(runtime.home_real)
-        joint6 = runtime.local_exec_joint6_rad
+        yaw = runtime.local_exec_yaw_rad
         for idx in range(dummy_count):
             step_frames.append(
                 runtime.make_dummy_frame(
                     sim_pose=sim_pose,
                     gripper=0.0 if idx < dummy_count - 3 else 1.0,
-                    joint6=joint6,
+                    yaw=yaw,
                     frame_idx=frame_idx + idx,
                 )
             )
@@ -1074,7 +1074,7 @@ def execute_place_step(
             gripper=0.0,
             start_frame_idx=frame_idx,
             record=record,
-            semantic_joint6=runtime.local_exec_joint6_rad,
+            semantic_yaw=runtime.local_exec_yaw_rad,
         )
         if record:
             step_frames.extend(seg)

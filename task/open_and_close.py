@@ -462,7 +462,7 @@ def execute_move_step(
                 runtime.make_dummy_frame(
                     sim_pose=sim_pose,
                     gripper=1.0,
-                    joint6=float(runtime.default_joint6_rad),
+                    yaw=float(runtime.default_yaw_rad),
                     frame_idx=frame_idx + idx,
                 )
             )
@@ -474,7 +474,7 @@ def execute_move_step(
         gripper=1.0,
         start_frame_idx=frame_idx,
         record=record,
-        semantic_joint6=float(runtime.default_joint6_rad),
+        semantic_yaw=float(runtime.default_yaw_rad),
     )
     if record:
         step_frames.extend(seg)

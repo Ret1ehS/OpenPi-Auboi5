@@ -161,7 +161,7 @@ def run_session(
     planned_pose_real = command_pose_real.copy()
     last_sent_pose_real: np.ndarray | None = None
     hold_pose_real: np.ndarray | None = None
-    hold_joint6_rad: float | None = None
+    hold_yaw_rad: float | None = None
     key_state = ContinuousKeyState()
     linear_axis_cmd = np.zeros(3, dtype=np.float64)
     rotate_axis_cmd = 0.0
@@ -207,7 +207,7 @@ def run_session(
             runtime.capture_manual_snapshot(
                 gripper=1.0 if local_gripper_open else 0.0,
                 frame_idx=frame_idx,
-                semantic_joint6=runtime.local_exec_joint6_rad,
+                semantic_yaw=runtime.local_exec_yaw_rad,
             )
         )
         frame_idx += 1
@@ -301,27 +301,27 @@ def run_session(
 
     def _ensure_servo_active() -> None:
         nonlocal servo_active, command_pose_real, planned_pose_real
-        nonlocal last_sent_pose_real, hold_pose_real, hold_joint6_rad
+        nonlocal last_sent_pose_real, hold_pose_real, hold_yaw_rad
         if runtime.dry_run or servo_active:
             return
         command_pose_real = runtime.get_live_tcp_pose()
         planned_pose_real = command_pose_real.copy()
         last_sent_pose_real = None
         hold_pose_real = None
-        hold_joint6_rad = None
+        hold_yaw_rad = None
         runtime.begin_stream_servo(command_pose_real)
         servo_active = True
 
     def _stop_servo() -> None:
         nonlocal servo_active, command_pose_real, planned_pose_real
-        nonlocal last_sent_pose_real, hold_pose_real, hold_joint6_rad
+        nonlocal last_sent_pose_real, hold_pose_real, hold_yaw_rad
         if runtime.dry_run:
             servo_active = False
             command_pose_real = runtime.get_live_tcp_pose()
             planned_pose_real = command_pose_real.copy()
             last_sent_pose_real = None
             hold_pose_real = None
-            hold_joint6_rad = None
+            hold_yaw_rad = None
             return
         if servo_active:
             try:
@@ -333,10 +333,10 @@ def run_session(
         planned_pose_real = command_pose_real.copy()
         last_sent_pose_real = None
         hold_pose_real = None
-        hold_joint6_rad = None
-        live_joint6 = runtime.get_live_joint6()
-        if live_joint6 is not None:
-            runtime.local_exec_joint6_rad = float(live_joint6)
+        hold_yaw_rad = None
+        live_yaw = runtime.get_live_yaw()
+        if live_yaw is not None:
+            runtime.local_exec_yaw_rad = float(live_yaw)
 
     def _maybe_record_active_tick(now_ts: float) -> None:
         if recording and now_ts >= next_record_ts:
@@ -390,7 +390,7 @@ def run_session(
     def _handle_discrete_key(key: str) -> bool:
         nonlocal recording, saving, recorded_frames, frame_idx, saved_episode_count
         nonlocal status_line, local_gripper_open, next_record_ts, input_suppress_until_ts
-        nonlocal command_pose_real, planned_pose_real, last_sent_pose_real, hold_pose_real, hold_joint6_rad
+        nonlocal command_pose_real, planned_pose_real, last_sent_pose_real, hold_pose_real, hold_yaw_rad
         if key == KEY_ENTER:
             _clear_pending_inputs()
             input_suppress_until_ts = time.monotonic() + float(ENTER_INPUT_SUPPRESS_S)
@@ -441,9 +441,9 @@ def run_session(
             input_suppress_until_ts = time.monotonic() + float(SPACE_INPUT_SUPPRESS_S)
             if ok:
                 local_gripper_open = bool(target_state == 1)
-                live_joint6 = runtime.get_live_joint6()
-                if live_joint6 is not None:
-                    runtime.local_exec_joint6_rad = float(live_joint6)
+                live_yaw = runtime.get_live_yaw()
+                if live_yaw is not None:
+                    runtime.local_exec_yaw_rad = float(live_yaw)
                 if recording:
                     _append_current_snapshot()
                 status_line = f"Gripper {'open' if local_gripper_open else 'closed'}"
@@ -465,7 +465,7 @@ def run_session(
             planned_pose_real[:] = command_pose_real
             last_sent_pose_real = None
             hold_pose_real = None
-            hold_joint6_rad = None
+            hold_yaw_rad = None
             _clear_pending_inputs()
             input_suppress_until_ts = time.monotonic() + float(HOME_INPUT_SUPPRESS_S)
             status_line = "Returned home"
@@ -617,7 +617,7 @@ def run_session(
                     if not runtime.dry_run:
                         _ensure_servo_active()
                     hold_pose_real = None
-                    hold_joint6_rad = None
+                    hold_yaw_rad = None
                     linear_velocity_xyz = np.zeros(3, dtype=np.float64)
                     yaw_velocity_radps = 0.0
                     if has_linear:
@@ -651,9 +651,9 @@ def run_session(
                         pose_ret = int(resp.get("servo_pose_ret", -1))
                         if pose_ret != 0:
                             raise RuntimeError(resp)
-                        live_joint6 = runtime.get_live_joint6()
-                        if live_joint6 is not None:
-                            runtime.local_exec_joint6_rad = float(live_joint6)
+                        live_yaw = runtime.get_live_yaw()
+                        if live_yaw is not None:
+                            runtime.local_exec_yaw_rad = float(live_yaw)
 
                     _maybe_record_active_tick(now_ts)
                     status_line = (
@@ -680,12 +680,12 @@ def run_session(
                             planned_pose_real = hold_pose_real.copy()
                             command_pose_real = hold_pose_real.copy()
                             last_sent_pose_real = hold_pose_real.copy()
-                            hold_joint6_rad = None
+                            hold_yaw_rad = None
                             last_motion_source_remote = False
                         resp = runtime.send_stream_pose(hold_pose_real)
-                        live_joint6 = runtime.get_live_joint6()
-                        if live_joint6 is not None:
-                            runtime.local_exec_joint6_rad = float(live_joint6)
+                        live_yaw = runtime.get_live_yaw()
+                        if live_yaw is not None:
+                            runtime.local_exec_yaw_rad = float(live_yaw)
                         pose_ret = int(resp.get("servo_pose_ret", -1))
                         if pose_ret != 0:
                             raise RuntimeError(resp)

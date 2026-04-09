@@ -10,10 +10,8 @@ Workflow (each episode):
   4. Save the recorded episode with auto-generated prompt "pick up the <color> cube"
 
 Saved format for the AUBO OpenPI pipeline:
-  states.npy     (N, 7|8) float32  yaw: [x, y, z, aa_x, aa_y, aa_z, gripper]
-                                   j6 : [x, y, z, aa_x, aa_y, aa_z, gripper, j6]
+  states.npy     (N, 7) float32    yaw: [x, y, z, aa_x, aa_y, aa_z, gripper]
   actions.npy    (N, 7) float32    yaw: [dx, dy, dz, droll, dpitch, dyaw, gripper_next]
-                                   j6 : [dx, dy, dz, droll, dpitch, dj6, gripper_next]
   timestamps.npy (N,)   float32  env_step / saved_fps
   env_steps.npy  (N,)   int64
   images.npz             contains main_images (N,224,224,3) and wrist_images (N,224,224,3)
@@ -76,9 +74,9 @@ LINEAR_SPEED = 0.10
 DEFAULT_ASYNC_MOVE_TIMEOUT_S = 30.0
 SERVO_CONTROL_DT = 0.01
 SERVO_ANGULAR_SPEED_RADPS = 0.60
-DEFAULT_J6_SPEED_RADPS = float(np.deg2rad(10.0))
-DEFAULT_J6_HOME_RAD = 0.11434
-DEFAULT_J6_EXEC_TOL_RAD = float(np.deg2rad(1.0))
+DEFAULT_YAW_SPEED_RADPS = float(np.deg2rad(10.0))
+DEFAULT_YAW_HOME_RAD = 0.11434
+DEFAULT_YAW_EXEC_TOL_RAD = float(np.deg2rad(1.0))
 ROTATE_ABS_DEG_MIN = 12.0
 ROTATE_ABS_DEG_MAX = 22.5
 
@@ -170,11 +168,11 @@ def _wrap_angle(angle: float) -> float:
     return float(np.arctan2(np.sin(angle), np.cos(angle)))
 
 
-def _require_joint6_readback(joint_q: np.ndarray, *, context: str) -> float:
+def _require_yaw_readback(joint_q: np.ndarray, *, context: str) -> float:
     joint_q_arr = np.asarray(joint_q, dtype=np.float64).reshape(-1)
     if joint_q_arr.size < 6:
         raise RuntimeError(
-            f"{context}: robot snapshot missing joint6 readback "
+            f"{context}: robot snapshot missing yaw readback "
             f"(joint_q size={joint_q_arr.size})"
         )
     return float(joint_q_arr[5])
@@ -185,7 +183,7 @@ def _normalize_state_mode(state_mode: str) -> str:
     return STATE_MODE_YAW
 
 
-def build_state_row(pose6_zyx: np.ndarray, gripper: float, joint6: float, *, state_mode: str) -> np.ndarray:
+def build_state_row(pose6_zyx: np.ndarray, gripper: float, yaw: float, *, state_mode: str) -> np.ndarray:
     """Build one state row for the selected collect-data mode."""
     _ = _normalize_state_mode(state_mode)
     pose = np.asarray(pose6_zyx, dtype=np.float64).reshape(6)
@@ -226,19 +224,19 @@ def quat_to_euler_wxyz(quat: np.ndarray) -> np.ndarray:
 def compute_delta_actions(
     pose6: np.ndarray,
     gripper: np.ndarray,
-    joint6: np.ndarray,
+    yaw: np.ndarray,
     *,
     state_mode: str,
 ) -> np.ndarray:
-    """Compute (N, 7) delta actions for yaw-mode or j6-mode datasets."""
+    """Compute (N, 7) delta actions for yaw-mode datasets."""
     _ = _normalize_state_mode(state_mode)
     pose6 = np.asarray(pose6, dtype=np.float32)
     gripper = np.asarray(gripper, dtype=np.float32).reshape(-1)
-    joint6 = np.asarray(joint6, dtype=np.float32).reshape(-1)
+    yaw = np.asarray(yaw, dtype=np.float32).reshape(-1)
     if pose6.ndim != 2 or pose6.shape[1] != 6:
         raise ValueError(f"pose6 must have shape (N, 6), got {pose6.shape}")
-    if gripper.shape[0] != pose6.shape[0] or joint6.shape[0] != pose6.shape[0]:
-        raise ValueError("pose6, gripper, and joint6 must have the same length")
+    if gripper.shape[0] != pose6.shape[0] or yaw.shape[0] != pose6.shape[0]:
+        raise ValueError("pose6, gripper, and yaw must have the same length")
 
     num_frames = int(pose6.shape[0])
     actions = np.zeros((num_frames, 7), dtype=np.float32)
@@ -539,8 +537,8 @@ def _build_servo_pose_targets(
     target_real: np.ndarray,
     *,
     speed_mps: float,
-    start_joint6: float | None = None,
-    target_joint6: float | None = None,
+    start_yaw: float | None = None,
+    target_yaw: float | None = None,
 ) -> tuple[list[np.ndarray], list[float] | None]:
     start_pose = np.asarray(start_real, dtype=np.float64).reshape(6)
     target_pose = np.asarray(target_real, dtype=np.float64).reshape(6)
@@ -554,9 +552,9 @@ def _build_servo_pose_targets(
     joint_time = 0.0
     joint_targets: list[float] | None = None
     joint_delta = 0.0
-    if target_joint6 is not None and start_joint6 is not None:
-        joint_delta = _wrap_angle(float(target_joint6) - float(start_joint6))
-        joint_time = abs(joint_delta) / max(float(DEFAULT_J6_SPEED_RADPS), 1e-6)
+    if target_yaw is not None and start_yaw is not None:
+        joint_delta = _wrap_angle(float(target_yaw) - float(start_yaw))
+        joint_time = abs(joint_delta) / max(float(DEFAULT_YAW_SPEED_RADPS), 1e-6)
 
     required_time = max(linear_time, angular_time, joint_time, float(SERVO_CONTROL_DT))
     step_count = max(1, int(np.ceil(required_time / float(SERVO_CONTROL_DT))))
@@ -564,9 +562,9 @@ def _build_servo_pose_targets(
         (start_pose + delta * (float(step_idx) / float(step_count))).copy()
         for step_idx in range(1, step_count + 1)
     ]
-    if target_joint6 is not None and start_joint6 is not None:
+    if target_yaw is not None and start_yaw is not None:
         joint_targets = [
-            float(start_joint6 + joint_delta * (float(step_idx) / float(step_count)))
+            float(start_yaw + joint_delta * (float(step_idx) / float(step_count)))
             for step_idx in range(1, step_count + 1)
         ]
     return pose_targets, joint_targets
@@ -575,8 +573,8 @@ def _build_servo_pose_targets(
 def _capture_recorded_frame(
     cameras: CameraPair,
     actual_real: np.ndarray,
-    semantic_joint6: float,
-    readback_joint6: float,
+    semantic_yaw: float,
+    readback_yaw: float,
     *,
     gripper: float,
     frame_idx: int,
@@ -588,8 +586,8 @@ def _capture_recorded_frame(
     return RecordedFrame(
         sim_pose6=actual_sim,
         gripper=float(gripper),
-        joint6=float(semantic_joint6),
-        joint6_readback=float(readback_joint6),
+        yaw=float(semantic_yaw),
+        yaw_readback=float(readback_yaw),
         main_image=preprocess_image(main_bgr),
         wrist_image=preprocess_image(wrist_bgr),
         timestamp=frame_idx * CONTROL_DT,
@@ -607,8 +605,8 @@ def _execute_servo_segment(
     gripper: float = 1.0,
     start_frame_idx: int = 0,
     timeout_s: float = DEFAULT_ASYNC_MOVE_TIMEOUT_S,
-    target_joint6: float | None = None,
-    semantic_joint6: float | None = None,
+    target_yaw: float | None = None,
+    semantic_yaw: float | None = None,
     force_live_mode: bool = True,
     reuse_servo: bool = False,
 ) -> list["RecordedFrame"]:
@@ -618,13 +616,13 @@ def _execute_servo_segment(
     start_snap = get_robot_snapshot()
     start_real = np.asarray(start_snap.tcp_pose, dtype=np.float64).reshape(6).copy()
     start_joint_q = np.asarray(start_snap.joint_q, dtype=np.float64).reshape(-1)
-    start_joint6 = _require_joint6_readback(start_joint_q, context=f"{label} start snapshot")
+    start_yaw = _require_yaw_readback(start_joint_q, context=f"{label} start snapshot")
     pose_targets, joint_targets = _build_servo_pose_targets(
         start_real,
         target_real,
         speed_mps=speed_mps,
-        start_joint6=start_joint6 if target_joint6 is not None else None,
-        target_joint6=target_joint6,
+        start_yaw=start_yaw if target_yaw is not None else None,
+        target_yaw=target_yaw,
     )
 
     require_force_guard = bool(force_live_mode and float(target_real[2]) < float(start_real[2]) - 1e-6)
@@ -634,7 +632,7 @@ def _execute_servo_segment(
     last_record_ts: float | None = None
     deadline = time.monotonic() + max(0.5, float(timeout_s))
     servo_started = False
-    current_semantic_joint6 = float(start_joint6 if semantic_joint6 is None else semantic_joint6)
+    current_semantic_yaw = float(start_yaw if semantic_yaw is None else semantic_yaw)
 
     def _record_snapshot(snap, *, force: bool = False) -> None:
         nonlocal frame_idx, next_record_deadline, last_record_ts
@@ -645,7 +643,7 @@ def _execute_servo_segment(
             return
         actual_real = np.asarray(snap.tcp_pose, dtype=np.float64).reshape(6).copy()
         joint_q = np.asarray(snap.joint_q, dtype=np.float64).reshape(-1)
-        actual_joint6 = _require_joint6_readback(
+        actual_yaw = _require_yaw_readback(
             joint_q,
             context=f"{label} record snapshot frame_idx={frame_idx}",
         )
@@ -653,8 +651,8 @@ def _execute_servo_segment(
             _capture_recorded_frame(
                 cameras,
                 actual_real,
-                current_semantic_joint6,
-                actual_joint6,
+                current_semantic_yaw,
+                actual_yaw,
                 gripper=gripper,
                 frame_idx=frame_idx,
             )
@@ -663,8 +661,8 @@ def _execute_servo_segment(
         last_record_ts = now
         next_record_deadline = now + CONTROL_DT
 
-    def _send_servo_command(pose_cmd: np.ndarray, joint6_cmd: float | None) -> dict[str, object]:
-        _ = joint6_cmd
+    def _send_servo_command(pose_cmd: np.ndarray, yaw_cmd: float | None) -> dict[str, object]:
+        _ = yaw_cmd
         return daemon.servo_pose(pose_cmd)
 
     try:
@@ -679,10 +677,10 @@ def _execute_servo_segment(
             raise RuntimeError(f"{label} aborted: force guard unavailable for downward motion")
 
         for idx, pose_cmd in enumerate(pose_targets):
-            joint6_cmd = None if joint_targets is None else joint_targets[idx]
-            if joint6_cmd is not None:
-                current_semantic_joint6 = float(joint6_cmd)
-            resp = _send_servo_command(pose_cmd, joint6_cmd)
+            yaw_cmd = None if joint_targets is None else joint_targets[idx]
+            if yaw_cmd is not None:
+                current_semantic_yaw = float(yaw_cmd)
+            resp = _send_servo_command(pose_cmd, yaw_cmd)
             pose_ret = int(resp.get("servo_pose_ret", -1))
             if pose_ret != 0:
                 raise RuntimeError(f"{label} servo failed: {resp}")
@@ -697,15 +695,15 @@ def _execute_servo_segment(
             snap = get_robot_snapshot()
             actual_real = np.asarray(snap.tcp_pose, dtype=np.float64).reshape(6).copy()
             joint_q = np.asarray(snap.joint_q, dtype=np.float64).reshape(-1)
-            actual_joint6 = _require_joint6_readback(
+            actual_yaw = _require_yaw_readback(
                 joint_q,
                 context=f"{label} final hold snapshot",
             )
-            joint6_ok = (
-                target_joint6 is None
-                or abs(_wrap_angle(actual_joint6 - float(target_joint6))) <= DEFAULT_J6_EXEC_TOL_RAD
+            yaw_ok = (
+                target_yaw is None
+                or abs(_wrap_angle(actual_yaw - float(target_yaw))) <= DEFAULT_YAW_EXEC_TOL_RAD
             )
-            if _pose_close(actual_real, target_real) and joint6_ok:
+            if _pose_close(actual_real, target_real) and yaw_ok:
                 force_final_record = (
                     record
                     and (last_record_ts is None or (time.monotonic() - last_record_ts) > (0.5 * CONTROL_DT))
@@ -716,12 +714,12 @@ def _execute_servo_segment(
                 raise RuntimeError(
                     f"{label} timed out waiting for target "
                     f"(target={np.round(target_real, 5).tolist()}, actual={np.round(actual_real, 5).tolist()}, "
-                    f"target_joint6={None if target_joint6 is None else round(float(target_joint6), 6)}, "
-                    f"actual_joint6={round(actual_joint6, 6)})"
+                    f"target_yaw={None if target_yaw is None else round(float(target_yaw), 6)}, "
+                    f"actual_yaw={round(actual_yaw, 6)})"
                 )
-            if target_joint6 is not None:
-                current_semantic_joint6 = float(target_joint6)
-            resp = _send_servo_command(target_real, target_joint6)
+            if target_yaw is not None:
+                current_semantic_yaw = float(target_yaw)
+            resp = _send_servo_command(target_real, target_yaw)
             pose_ret = int(resp.get("servo_pose_ret", -1))
             if pose_ret != 0:
                 raise RuntimeError(f"{label} final servo hold failed: {resp}")
@@ -755,7 +753,7 @@ def execute_pose_move_and_wait(
     label: str,
     *,
     speed_mps: float,
-    target_joint6: float | None = None,
+    target_yaw: float | None = None,
     timeout_s: float = DEFAULT_ASYNC_MOVE_TIMEOUT_S,
     force_live_mode: bool = True,
     reuse_servo: bool = False,
@@ -766,7 +764,7 @@ def execute_pose_move_and_wait(
         label=label,
         speed_mps=speed_mps,
         record=False,
-        target_joint6=target_joint6,
+        target_yaw=target_yaw,
         timeout_s=timeout_s,
         force_live_mode=force_live_mode,
         reuse_servo=reuse_servo,
@@ -799,8 +797,8 @@ def stop_motion_and_confirm(daemon, label: str) -> dict[str, object]:
 class RecordedFrame:
     sim_pose6: np.ndarray
     gripper: float
-    joint6: float
-    joint6_readback: float
+    yaw: float
+    yaw_readback: float
     main_image: np.ndarray
     wrist_image: np.ndarray
     timestamp: float
@@ -814,8 +812,8 @@ def execute_and_record(
     start_frame_idx: int,
     speed_mps: float,
     timeout_s: float = DEFAULT_ASYNC_MOVE_TIMEOUT_S,
-    target_joint6: float | None = None,
-    semantic_joint6: float | None = None,
+    target_yaw: float | None = None,
+    semantic_yaw: float | None = None,
     force_live_mode: bool = True,
     record: bool = True,
     reuse_servo: bool = False,
@@ -831,8 +829,8 @@ def execute_and_record(
         gripper=gripper,
         start_frame_idx=start_frame_idx,
         timeout_s=timeout_s,
-        target_joint6=target_joint6,
-        semantic_joint6=semantic_joint6,
+        target_yaw=target_yaw,
+        semantic_yaw=semantic_yaw,
         force_live_mode=force_live_mode,
         reuse_servo=reuse_servo,
     )
@@ -843,22 +841,22 @@ def capture_manual_snapshot(
     *,
     gripper: float,
     frame_idx: int,
-    semantic_joint6: float,
+    semantic_yaw: float,
 ) -> RecordedFrame:
     from support.tcp_control import get_robot_snapshot
 
     snap = get_robot_snapshot()
     actual_real = np.asarray(snap.tcp_pose, dtype=np.float64).reshape(6).copy()
     joint_q = np.asarray(snap.joint_q, dtype=np.float64).reshape(-1)
-    readback_joint6 = _require_joint6_readback(
+    readback_yaw = _require_yaw_readback(
         joint_q,
         context=f"manual snapshot frame_idx={frame_idx}",
     )
     return _capture_recorded_frame(
         cameras,
         actual_real,
-        float(semantic_joint6),
-        float(readback_joint6),
+        float(semantic_yaw),
+        float(readback_yaw),
         gripper=gripper,
         frame_idx=frame_idx,
     )
@@ -880,8 +878,8 @@ def prepare_episode_for_save(
     raw_times = np.array([float(frame.timestamp) for frame in frames], dtype=np.float64)
     raw_pose6 = np.stack([np.asarray(frame.sim_pose6, dtype=np.float64).reshape(6) for frame in frames], axis=0)
     raw_gripper = np.array([float(frame.gripper) for frame in frames], dtype=np.float32)
-    raw_joint6 = np.array([float(frame.joint6) for frame in frames], dtype=np.float32)
-    raw_joint6_readback = np.array([float(frame.joint6_readback) for frame in frames], dtype=np.float32)
+    raw_yaw = np.array([float(frame.yaw) for frame in frames], dtype=np.float32)
+    raw_yaw_readback = np.array([float(frame.yaw_readback) for frame in frames], dtype=np.float32)
     raw_main_images = np.stack([frame.main_image for frame in frames], axis=0)
     raw_wrist_images = np.stack([frame.wrist_image for frame in frames], axis=0)
 
@@ -893,17 +891,17 @@ def prepare_episode_for_save(
         states = np.zeros((target_count, state_dim), dtype=np.float32)
         pose6_saved = raw_pose6.astype(np.float32, copy=True)
         gripper_saved = raw_gripper.astype(np.float32, copy=True)
-        joint6_saved = raw_joint6.astype(np.float32, copy=True)
+        yaw_saved = raw_yaw.astype(np.float32, copy=True)
         main_images = raw_main_images.copy()
         wrist_images = raw_wrist_images.copy()
         for out_idx in range(target_count):
             states[out_idx] = build_state_row(
                 pose6_saved[out_idx],
                 gripper_saved[out_idx],
-                joint6_saved[out_idx],
+                yaw_saved[out_idx],
                 state_mode=mode,
             )
-        actions = compute_delta_actions(pose6_saved, gripper_saved, joint6_saved, state_mode=mode)
+        actions = compute_delta_actions(pose6_saved, gripper_saved, yaw_saved, state_mode=mode)
         return (
             states,
             actions,
@@ -922,8 +920,8 @@ def prepare_episode_for_save(
     states = np.zeros((target_count, state_dim), dtype=np.float32)
     pose6_resampled = np.zeros((target_count, 6), dtype=np.float32)
     gripper_resampled = np.zeros((target_count,), dtype=np.float32)
-    joint6_resampled = np.zeros((target_count,), dtype=np.float32)
-    joint6_readback_resampled = np.zeros((target_count,), dtype=np.float32)
+    yaw_resampled = np.zeros((target_count,), dtype=np.float32)
+    yaw_readback_resampled = np.zeros((target_count,), dtype=np.float32)
     main_images = np.zeros((target_count, IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
     wrist_images = np.zeros((target_count, IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
 
@@ -958,28 +956,28 @@ def prepare_episode_for_save(
         grip_idx = int(np.searchsorted(raw_times, target_t, side="right") - 1)
         grip_idx = min(max(grip_idx, 0), len(raw_gripper) - 1)
         if left == right:
-            interp_joint6 = float(raw_joint6[left])
-            interp_joint6_readback = float(raw_joint6_readback[left])
+            interp_yaw = float(raw_yaw[left])
+            interp_yaw_readback = float(raw_yaw_readback[left])
         else:
-            joint6_delta = _wrap_angle(float(raw_joint6[right] - raw_joint6[left]))
-            interp_joint6 = float(raw_joint6[left] + alpha * joint6_delta)
-            joint6_readback_delta = _wrap_angle(float(raw_joint6_readback[right] - raw_joint6_readback[left]))
-            interp_joint6_readback = float(raw_joint6_readback[left] + alpha * joint6_readback_delta)
+            yaw_delta = _wrap_angle(float(raw_yaw[right] - raw_yaw[left]))
+            interp_yaw = float(raw_yaw[left] + alpha * yaw_delta)
+            yaw_readback_delta = _wrap_angle(float(raw_yaw_readback[right] - raw_yaw_readback[left]))
+            interp_yaw_readback = float(raw_yaw_readback[left] + alpha * yaw_readback_delta)
 
         pose6_resampled[out_idx] = interp_pose6.astype(np.float32)
         gripper_resampled[out_idx] = float(raw_gripper[grip_idx])
-        joint6_resampled[out_idx] = np.float32(interp_joint6)
-        joint6_readback_resampled[out_idx] = np.float32(interp_joint6_readback)
+        yaw_resampled[out_idx] = np.float32(interp_yaw)
+        yaw_readback_resampled[out_idx] = np.float32(interp_yaw_readback)
         states[out_idx] = build_state_row(
             interp_pose6,
             gripper_resampled[out_idx],
-            joint6_resampled[out_idx],
+            yaw_resampled[out_idx],
             state_mode=mode,
         )
         main_images[out_idx] = raw_main_images[image_idx]
         wrist_images[out_idx] = raw_wrist_images[image_idx]
 
-    actions = compute_delta_actions(pose6_resampled, gripper_resampled, joint6_resampled, state_mode=mode)
+    actions = compute_delta_actions(pose6_resampled, gripper_resampled, yaw_resampled, state_mode=mode)
     return (
         states,
         actions,
@@ -1078,9 +1076,9 @@ class CollectTaskRuntime:
     place_height_offset_m: float
     home_real: np.ndarray
     origin_xy: np.ndarray
-    default_joint6_rad: float = DEFAULT_J6_HOME_RAD
-    local_exec_joint6_rad: float = DEFAULT_J6_HOME_RAD
-    default_j6_exec_tol_rad: float = DEFAULT_J6_EXEC_TOL_RAD
+    default_yaw_rad: float = DEFAULT_YAW_HOME_RAD
+    local_exec_yaw_rad: float = DEFAULT_YAW_HOME_RAD
+    default_yaw_exec_tol_rad: float = DEFAULT_YAW_EXEC_TOL_RAD
     cleanup_scene_state: dict[str, dict[str, object]] | None = None
     runtime_held_object: str | None = None
     held_servo_depth: int = 0
@@ -1124,7 +1122,7 @@ class CollectTaskRuntime:
         snap_local = get_robot_snapshot()
         return np.asarray(snap_local.tcp_pose, dtype=np.float64).reshape(6).copy()
 
-    def get_live_joint6(self) -> float | None:
+    def get_live_yaw(self) -> float | None:
         from support.tcp_control import get_robot_snapshot
 
         snap_local = get_robot_snapshot()
@@ -1210,7 +1208,7 @@ class CollectTaskRuntime:
         gripper: float,
         start_frame_idx: int,
         record: bool,
-        semantic_joint6: float | None = None,
+        semantic_yaw: float | None = None,
     ) -> list[RecordedFrame]:
         return execute_and_record(
             self.daemon,
@@ -1219,7 +1217,7 @@ class CollectTaskRuntime:
             gripper=gripper,
             start_frame_idx=start_frame_idx,
             speed_mps=self.linear_speed,
-            semantic_joint6=self.local_exec_joint6_rad if semantic_joint6 is None else semantic_joint6,
+            semantic_yaw=self.local_exec_yaw_rad if semantic_yaw is None else semantic_yaw,
             record=record,
             reuse_servo=self.hold_servo_active,
         )
@@ -1229,22 +1227,22 @@ class CollectTaskRuntime:
         *,
         gripper: float,
         frame_idx: int,
-        semantic_joint6: float | None = None,
+        semantic_yaw: float | None = None,
     ) -> RecordedFrame:
-        joint6 = self.local_exec_joint6_rad if semantic_joint6 is None else semantic_joint6
+        yaw = self.local_exec_yaw_rad if semantic_yaw is None else semantic_yaw
         return capture_manual_snapshot(
             self.cameras,
             gripper=gripper,
             frame_idx=frame_idx,
-            semantic_joint6=float(joint6),
+            semantic_yaw=float(yaw),
         )
 
-    def make_dummy_frame(self, *, sim_pose: np.ndarray, gripper: float, joint6: float, frame_idx: int) -> RecordedFrame:
+    def make_dummy_frame(self, *, sim_pose: np.ndarray, gripper: float, yaw: float, frame_idx: int) -> RecordedFrame:
         return RecordedFrame(
             sim_pose6=np.asarray(sim_pose, dtype=np.float64).reshape(6).copy(),
             gripper=float(gripper),
-            joint6=float(joint6),
-            joint6_readback=float(joint6),
+            yaw=float(yaw),
+            yaw_readback=float(yaw),
             main_image=np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8),
             wrist_image=np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8),
             timestamp=frame_idx * CONTROL_DT,
@@ -1492,9 +1490,9 @@ def main() -> int:
         place_height_offset_m=float(PLACE_HEIGHT_OFFSET_M),
         home_real=home_real.copy(),
         origin_xy=origin_xy.copy(),
-        default_joint6_rad=float(DEFAULT_J6_HOME_RAD),
-        local_exec_joint6_rad=float(DEFAULT_J6_HOME_RAD),
-        default_j6_exec_tol_rad=float(DEFAULT_J6_EXEC_TOL_RAD),
+        default_yaw_rad=float(DEFAULT_YAW_HOME_RAD),
+        local_exec_yaw_rad=float(DEFAULT_YAW_HOME_RAD),
+        default_yaw_exec_tol_rad=float(DEFAULT_YAW_EXEC_TOL_RAD),
     )
     print(f"  Init real TCP: {np.round(init_real, 5).tolist()}")
     print(f"  Init policy TCP:  {np.round(init_sim, 5).tolist()}")

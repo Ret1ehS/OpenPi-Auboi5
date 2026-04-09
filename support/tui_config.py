@@ -118,7 +118,7 @@ class CollectTUIConfig:
     resume_mode: str       # "continue" | "reset"
     task: str              # "pick_and_place" | "open_and_close" | "keyboard_teleop"
     save_fps: int          # 30 | 50
-    state_mode: str        # "yaw" | "j6"
+    state_mode: str        # "yaw"
     quit: bool = False
 
 
@@ -173,7 +173,7 @@ def _render(
     selectable_idx = 0
     for row in rows:
         if isinstance(row, SeparatorItem):
-            lines.append(f"  {DIM}{'─' * 50}{RESET}")
+            lines.append(f"  {DIM}{'-' * 50}{RESET}")
             continue
 
         row_label = row.label if hasattr(row, "label") else ""

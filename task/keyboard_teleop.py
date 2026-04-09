@@ -510,12 +510,14 @@ def run_session(
                     planned_pose_real = _clip_command_pose(planned_pose_real)
                     if remote_active:
                         command_pose_real = planned_pose_real.copy()
-                    elif motion_transition_started:
-                        command_pose_real = planned_pose_real.copy()
+                        command_pose_real = _apply_pose_deadband(command_pose_real)
                     else:
-                        command_pose_real = _build_lookahead_pose(linear_velocity_xyz, yaw_velocity_radps)
-                    command_pose_real = _clamp_command_lead(command_pose_real)
-                    command_pose_real = _apply_pose_deadband(command_pose_real)
+                        if motion_transition_started:
+                            command_pose_real = planned_pose_real.copy()
+                        else:
+                            command_pose_real = _build_lookahead_pose(linear_velocity_xyz, yaw_velocity_radps)
+                        command_pose_real = _clamp_command_lead(command_pose_real)
+                        command_pose_real = _apply_pose_deadband(command_pose_real)
 
                     if not runtime.dry_run:
                         if config.state_mode == STATE_MODE_J6 and has_rotate and not has_linear:
@@ -555,8 +557,12 @@ def run_session(
                 else:
                     if servo_active:
                         if hold_pose_real is None:
-                            if last_motion_source_remote and not runtime.dry_run:
-                                hold_pose_real = runtime.get_live_tcp_pose()
+                            if last_motion_source_remote:
+                                hold_pose_real = (
+                                    last_sent_pose_real.copy()
+                                    if last_sent_pose_real is not None
+                                    else planned_pose_real.copy()
+                                )
                             else:
                                 hold_pose_real = (
                                     last_sent_pose_real.copy()

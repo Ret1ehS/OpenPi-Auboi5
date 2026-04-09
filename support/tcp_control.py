@@ -876,36 +876,6 @@ class _DaemonHelper:
         self._servo_force_guard_live_mode = bool(self._servo_force_guard_force_live or warning_active)
         return resp
 
-    def servo_pose_j6(self, pose6: np.ndarray, joint6: float) -> dict[str, object]:
-        """Send one absolute task target with explicit j6 target in servo mode."""
-        requested = np.asarray(pose6, dtype=np.float64).reshape(POSE_DIM)
-        reference = self._current_servo_reference_pose()
-        guarded, force_z_n, scale, adjusted, warning_active = self._apply_servo_z_admittance(
-            requested,
-            reference,
-            timeout_s=0.0,
-        )
-        cmd = "servo_pose_j6 " + " ".join(f"{v:.12g}" for v in guarded) + f" {float(joint6):.12g}"
-        with self._lock:
-            resp = self._send_cmd(cmd)
-        resp.update(
-            _force_guard_meta(
-                force_z_n,
-                scale,
-                adjusted,
-                warning_active,
-                blocked_z_m=self._servo_force_guard_block_z_m,
-                target_fz_n=self._servo_force_target_fz_n,
-            )
-        )
-        self._last_servo_pose_real = guarded
-        if force_z_n is not None or scale is not None:
-            self._servo_force_guard_fz_n = force_z_n
-            self._servo_force_guard_scale = scale
-        self._servo_force_guard_warning_active = bool(warning_active)
-        self._servo_force_guard_live_mode = bool(self._servo_force_guard_force_live or warning_active)
-        return resp
-
     def servo_chunk(self, poses_real: list[np.ndarray]) -> dict[str, object]:
         """Send a batch of poses to execute with C++-side timing.
         All poses are sent at once; C++ handles the precise sleep intervals."""

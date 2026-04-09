@@ -103,8 +103,7 @@ MenuRow = ToggleItem | TextItem | ActionItem | SeparatorItem | StartItem
 class TUIConfig:
     policy_location: str  # "remote" | "local"
     pose_frame: str       # "real" | "sim"
-    obs_state_mode: str   # "yaw" | "j6"
-    lock_yaw: bool
+    obs_state_mode: str   # "yaw"
     dry_run: bool
     exec_speed_mps: float  # max TCP linear speed (m/s) for servo execution
     speed_mode: str = "limited"  # "limited" | "native"
@@ -456,7 +455,6 @@ def _snapshot_config(rows: list[MenuRow]) -> TUIConfig:
         policy_location=_get_toggle(rows, "Policy"),
         pose_frame=_get_toggle(rows, "Frame"),
         obs_state_mode="yaw",
-        lock_yaw=True,
         dry_run=_get_env_bool("OPENPI_DEBUG_DRY_RUN", False),
         exec_speed_mps=_get_float(rows, "Exec Speed (m/s)", 0.05),
         speed_mode=speed_mode,

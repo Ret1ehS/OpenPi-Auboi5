@@ -62,13 +62,11 @@ class TrajectoryExecutor:
         self,
         *,
         execute: bool,
-        lock_yaw: bool,
         max_speed_mps: float = 0.05,
         use_joint6: bool = False,
         initial_joint6_rad: float = DEFAULT_J6_HOME_RAD,
     ):
         self._execute = execute
-        self._lock_yaw = lock_yaw
         self._max_speed_mps = max_speed_mps
         self._use_joint6 = bool(use_joint6)
         self._queue: queue.Queue = queue.Queue(maxsize=2)
@@ -241,7 +239,6 @@ class TrajectoryExecutor:
             plan = retime_tcp_action_chunk(
                 tcp_deltas,
                 start_pose_sim=start_sim,
-                lock_yaw=self._lock_yaw,
                 max_linear_speed_mps=self._max_speed_mps,
             )
 
@@ -547,7 +544,6 @@ def main() -> int:
             policy_location="remote",
             pose_frame="real",
             obs_state_mode=STATE_MODE_YAW,
-            lock_yaw=True,
             dry_run=False,
             exec_speed_mps=0.05,
         )
@@ -584,7 +580,7 @@ def main() -> int:
             try:
                 snap = get_robot_snapshot()
                 print(f"  Pose frame: {get_alignment_mode()}")
-                print(f"  Execute: {execute_now}  Lock Yaw: {cfg_now.lock_yaw}")
+                print(f"  Execute: {execute_now}")
                 print(f"  Speed Mode: {cfg_now.speed_mode}  Exec Speed: {cfg_now.exec_speed_mps} m/s")
                 print(f"  TCP pose: {np.round(snap.tcp_pose, 5).tolist()}")
                 print(f"  Joint q (deg): {np.round(np.degrees(snap.joint_q), 2).tolist()}")
@@ -609,7 +605,7 @@ def main() -> int:
     print(f"\nConfiguration:")
     print(f"  Policy:     {cfg.policy_location}")
     print(f"  Frame:      {cfg.pose_frame}")
-    print(f"  State Mode: {cfg.obs_state_mode} (lock_yaw={'yes' if cfg.lock_yaw else 'no'})")
+    print(f"  State Mode: {cfg.obs_state_mode}")
     print(f"  Speed Mode: {cfg.speed_mode}")
     if cfg.speed_mode == "limited":
         print(f"  Exec Speed: {cfg.exec_speed_mps} m/s")
@@ -658,7 +654,6 @@ def main() -> int:
     is_native_speed = cfg.speed_mode == "native"
     executor = TrajectoryExecutor(
         execute=execute,
-        lock_yaw=cfg.lock_yaw,
         max_speed_mps=effective_speed,
         use_joint6=use_joint6_mode,
         initial_joint6_rad=float(DEFAULT_J6_HOME_RAD),
@@ -692,7 +687,7 @@ def main() -> int:
                 snap = get_robot_snapshot()
                 print(f"  Policy: {type(policy).__name__}  load_time={policy_load_s:.3f}s")
                 print(f"  Pose frame: {get_alignment_mode()}")
-                print(f"  Execute: {execute}  Lock Yaw: {cfg.lock_yaw}")
+                print(f"  Execute: {execute}")
                 print(f"  TCP pose: {np.round(snap.tcp_pose, 5).tolist()}")
                 print(f"  Joint q (deg): {np.round(np.degrees(snap.joint_q), 2).tolist()}")
                 print(f"  Collision: {snap.collision}")
@@ -748,7 +743,7 @@ def main() -> int:
         # --- Start inference loop ---
         prompt = cmd
         print(f"Starting inference loop with prompt: \"{prompt}\"")
-        print(f"  Execute={execute}  LockYaw={cfg.lock_yaw}  PoseFrame={get_alignment_mode()}")
+        print(f"  Execute={execute}  PoseFrame={get_alignment_mode()}")
         print("  Press Ctrl+C to stop.\n")
 
         policy.reset()

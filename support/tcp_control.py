@@ -1139,13 +1139,9 @@ def get_robot_snapshot(
 def integrate_delta_tcp_pose(
     pose6_zyx: np.ndarray,
     delta6: np.ndarray,
-    *,
-    lock_yaw: bool = False,
 ) -> np.ndarray:
     pose = np.asarray(pose6_zyx, dtype=np.float64).reshape(POSE_DIM)
     delta = np.asarray(delta6, dtype=np.float64).reshape(OPENPI_DELTA_DIM).copy()
-    if lock_yaw:
-        delta[5] = 0.0
     out = pose.copy()
     out[:3] = pose[:3] + delta[:3]
     out[3:] = wrap_euler_zyx(pose[3:] + delta[3:])
@@ -1294,7 +1290,6 @@ def apply_tcp_delta(
     delta6: np.ndarray,
     *,
     expected_pose_sim: np.ndarray | None = None,
-    lock_yaw: bool = False,
     execute: bool = True,
     speed_deg: float = DEFAULT_SPEED_DEG,
     acc_deg: float = DEFAULT_ACC_DEG,
@@ -1333,7 +1328,7 @@ def apply_tcp_delta(
         tracking_err = 0.0
 
     # Integrate delta in sim frame
-    target_sim = integrate_delta_tcp_pose(start_sim, target_input, lock_yaw=lock_yaw)
+    target_sim = integrate_delta_tcp_pose(start_sim, target_input)
 
     # Convert to real frame for IK / execution
     target_real = sim_pose_to_real(target_sim)
@@ -1447,7 +1442,6 @@ def retime_tcp_action_chunk(
     delta_actions: np.ndarray,
     *,
     start_pose_sim: np.ndarray,
-    lock_yaw: bool = False,
     control_dt_s: float = DEFAULT_TRACK_CONTROL_DT_S,
     max_linear_speed_mps: float = DEFAULT_TCP_LINEAR_SPEED_MPS,
     max_angular_speed_radps: float = DEFAULT_TCP_ANGULAR_SPEED_RADPS,
@@ -1474,8 +1468,6 @@ def retime_tcp_action_chunk(
 
     for idx, raw_delta in enumerate(actions):
         delta = np.asarray(raw_delta, dtype=np.float64).reshape(OPENPI_DELTA_DIM).copy()
-        if lock_yaw:
-            delta[5] = 0.0
 
         linear_dist = float(np.linalg.norm(delta[:3]))
         angular_dist = float(np.linalg.norm(delta[3:]))
@@ -1487,7 +1479,7 @@ def retime_tcp_action_chunk(
 
         for _ in range(step_count):
             # Integrate in sim frame
-            current_sim = integrate_delta_tcp_pose(current_sim, step_delta, lock_yaw=lock_yaw)
+            current_sim = integrate_delta_tcp_pose(current_sim, step_delta)
             # Convert to real frame for robot SDK
             current_real = sim_pose_to_real(current_sim)
             # Clip TCP z in real frame to minimum safe height
@@ -1527,7 +1519,6 @@ def integrate_delta_actions_to_target(
     delta_actions: np.ndarray,
     *,
     start_pose_sim: np.ndarray,
-    lock_yaw: bool = False,
 ) -> IntegratedTarget:
     """Integrate all delta actions and return only the final target pose."""
     actions = np.asarray(delta_actions, dtype=np.float64)
@@ -1541,7 +1532,7 @@ def integrate_delta_actions_to_target(
     start_real = sim_pose_to_real(start_sim)
 
     for raw_delta in actions:
-        current_sim = integrate_delta_tcp_pose(current_sim, raw_delta, lock_yaw=lock_yaw)
+        current_sim = integrate_delta_tcp_pose(current_sim, raw_delta)
 
     current_real = sim_pose_to_real(current_sim)
 
@@ -1558,7 +1549,6 @@ def execute_tcp_action_chunk(
     delta_actions: np.ndarray,
     *,
     expected_pose_sim: np.ndarray | None = None,
-    lock_yaw: bool = False,
     execute: bool = True,
     blocking: bool = True,
     reset_err_m: float = RESET_ERR_M,
@@ -1621,7 +1611,6 @@ def execute_tcp_action_chunk(
     target = retime_tcp_action_chunk(
         delta_actions,
         start_pose_sim=start_sim,
-        lock_yaw=lock_yaw,
     )
 
     if not target.steps:

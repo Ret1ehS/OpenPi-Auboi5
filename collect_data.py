@@ -1229,6 +1229,7 @@ class CollectTaskRuntime:
                 self.home_real,
                 label,
                 speed_mps=self.linear_speed,
+                reuse_servo=self.hold_servo_active,
             )
             return self.refresh_home_pose()
         self.origin_xy = self.home_real[:2].copy()
@@ -1242,6 +1243,7 @@ class CollectTaskRuntime:
             np.asarray(target_real, dtype=np.float64).reshape(6).copy(),
             label,
             speed_mps=self.linear_speed,
+            reuse_servo=self.hold_servo_active,
         )
 
     def z_for_pick_level(self, level: int) -> float:
@@ -1802,53 +1804,57 @@ def main() -> int:
                         print(f"Unsupported input '{cmd}', exiting.")
                         break
 
-            if not args.dry_run:
-                runtime.return_home("pre-episode return home")
-                ensure_gripper_ok(
-                    command_gripper_state(1, timeout_s=args.gripper_timeout),
-                    "open gripper before episode",
-                )
+            runtime.begin_task_servo()
+            try:
+                if not args.dry_run:
+                    runtime.return_home("pre-episode return home")
+                    ensure_gripper_ok(
+                        command_gripper_state(1, timeout_s=args.gripper_timeout),
+                        "open gripper before episode",
+                    )
 
-            if selected_task == "pick_and_place":
-                recorded = pp_record_episode(runtime, pick_session, plan)
-                save_episode(
-                    recorded.frames,
-                    save_dir,
-                    recorded.plan.prompt,
-                    save_fps=save_fps,
-                    state_mode=collect_state_mode,
-                )
-                pp_finalize_episode(runtime, pick_session, recorded)
-            elif selected_task == "storage":
-                recorded = st_record_episode(runtime, storage_session, plan)
-                save_episode(
-                    recorded.frames,
-                    save_dir,
-                    recorded.plan.prompt,
-                    save_fps=save_fps,
-                    state_mode=collect_state_mode,
-                )
-                st_finalize_episode(runtime, storage_session, recorded)
-            else:
-                recorded_cycle = oc_record_cycle(runtime, open_close_session, cycle_plan)
-                save_episode(
-                    recorded_cycle.combined_open_frames,
-                    save_dir,
-                    recorded_cycle.plan.open_plan.prompt,
-                    save_fps=save_fps,
-                    state_mode=collect_state_mode,
-                )
-                save_episode(
-                    recorded_cycle.close_frames,
-                    save_dir,
-                    recorded_cycle.plan.close_plan.prompt,
-                    save_fps=save_fps,
-                    state_mode=collect_state_mode,
-                )
-                oc_finalize_cycle(open_close_session, recorded_cycle)
+                if selected_task == "pick_and_place":
+                    recorded = pp_record_episode(runtime, pick_session, plan)
+                    save_episode(
+                        recorded.frames,
+                        save_dir,
+                        recorded.plan.prompt,
+                        save_fps=save_fps,
+                        state_mode=collect_state_mode,
+                    )
+                    pp_finalize_episode(runtime, pick_session, recorded)
+                elif selected_task == "storage":
+                    recorded = st_record_episode(runtime, storage_session, plan)
+                    save_episode(
+                        recorded.frames,
+                        save_dir,
+                        recorded.plan.prompt,
+                        save_fps=save_fps,
+                        state_mode=collect_state_mode,
+                    )
+                    st_finalize_episode(runtime, storage_session, recorded)
+                else:
+                    recorded_cycle = oc_record_cycle(runtime, open_close_session, cycle_plan)
+                    save_episode(
+                        recorded_cycle.combined_open_frames,
+                        save_dir,
+                        recorded_cycle.plan.open_plan.prompt,
+                        save_fps=save_fps,
+                        state_mode=collect_state_mode,
+                    )
+                    save_episode(
+                        recorded_cycle.close_frames,
+                        save_dir,
+                        recorded_cycle.plan.close_plan.prompt,
+                        save_fps=save_fps,
+                        state_mode=collect_state_mode,
+                    )
+                    oc_finalize_cycle(open_close_session, recorded_cycle)
 
-            if not args.dry_run:
-                runtime.return_home("post-episode return home")
+                if not args.dry_run:
+                    runtime.return_home("post-episode return home")
+            finally:
+                runtime.end_task_servo()
 
             if selected_task == "pick_and_place":
                 save_collect_state(

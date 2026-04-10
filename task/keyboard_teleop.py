@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import threading
 from typing import Any, Callable
@@ -53,6 +53,9 @@ MAX_LINEAR_LEAD_M = 0.010
 MAX_YAW_LEAD_RAD = float(np.deg2rad(4.0))
 POSE_SEND_DEADBAND_M = 0.00035
 POSE_SEND_DEADBAND_RAD = float(np.deg2rad(0.06))
+STATE_DEDUP_POS_TOL_M = 0.00025
+STATE_DEDUP_ANG_TOL_RAD = float(np.deg2rad(0.10))
+STATE_DEDUP_GRIP_TOL = 1e-6
 
 
 @dataclass(frozen=True)
@@ -129,6 +132,33 @@ class _TerminalInputPump:
             time.sleep(float(INPUT_POLL_DT_S))
 
 
+def _same_recorded_state(prev: Any, curr: Any) -> bool:
+    prev_pose = np.asarray(prev.sim_pose6, dtype=np.float64).reshape(6)
+    curr_pose = np.asarray(curr.sim_pose6, dtype=np.float64).reshape(6)
+    pos_delta = float(np.linalg.norm(curr_pose[:3] - prev_pose[:3]))
+    ang_delta = np.arctan2(np.sin(curr_pose[3:] - prev_pose[3:]), np.cos(curr_pose[3:] - prev_pose[3:]))
+    grip_delta = abs(float(curr.gripper) - float(prev.gripper))
+    return (
+        pos_delta <= float(STATE_DEDUP_POS_TOL_M)
+        and float(np.linalg.norm(ang_delta)) <= float(STATE_DEDUP_ANG_TOL_RAD)
+        and grip_delta <= float(STATE_DEDUP_GRIP_TOL)
+    )
+
+
+def _dedupe_consecutive_frames(frames: list[Any]) -> list[Any]:
+    if not frames:
+        return []
+    deduped = [frames[0]]
+    for frame in frames[1:]:
+        if _same_recorded_state(deduped[-1], frame):
+            continue
+        deduped.append(frame)
+    return [
+        replace(frame, timestamp=float(idx) * float(RAW_RECORD_DT_S))
+        for idx, frame in enumerate(deduped)
+    ]
+
+
 def run_session(
     runtime,
     *,
@@ -148,13 +178,15 @@ def run_session(
     saving = False
     recorded_frames: list[Any] = []
     frame_idx = 0
+    record_lock = threading.Lock()
+    record_thread: threading.Thread | None = None
+    record_stop_event: threading.Event | None = None
     saved_episode_count = 0
     current_prompt_text = str(config.prompt).strip()
     move_step_m = float(runtime.linear_speed) * float(CONTROL_DT_S) * float(TARGET_HORIZON_SCALE)
     rotate_step_deg = float(DEFAULT_ROTATE_SPEED_DEGPS) * float(CONTROL_DT_S) * float(TARGET_HORIZON_SCALE)
-    status_line = "Ready. Enter starts recording. Idle periods are not recorded."
+    status_line = "Ready. Enter starts recording. Recorder runs at 30Hz while recording."
     next_ui_refresh_ts = 0.0
-    next_record_ts = 0.0
     next_control_ts = time.monotonic()
     servo_active = False
     command_pose_real = runtime.get_live_tcp_pose()
@@ -200,18 +232,54 @@ def run_session(
         return out
 
     def _append_current_snapshot() -> None:
-        nonlocal frame_idx, next_record_ts
-        if not recording:
-            return
-        recorded_frames.append(
-            runtime.capture_manual_snapshot(
+        nonlocal frame_idx
+        with record_lock:
+            frame = runtime.capture_manual_snapshot(
                 gripper=1.0 if local_gripper_open else 0.0,
                 frame_idx=frame_idx,
                 semantic_yaw=runtime.local_exec_yaw_rad,
             )
-        )
-        frame_idx += 1
-        next_record_ts = time.monotonic() + float(RAW_RECORD_DT_S)
+            recorded_frames.append(frame)
+            frame_idx += 1
+
+    def _stop_record_thread() -> None:
+        nonlocal record_thread, record_stop_event
+        stop_event = record_stop_event
+        thread = record_thread
+        record_stop_event = None
+        record_thread = None
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None:
+            thread.join(timeout=1.0)
+
+    def _start_record_thread() -> None:
+        nonlocal record_thread, record_stop_event
+        stop_event = threading.Event()
+        record_stop_event = stop_event
+
+        def _record_loop() -> None:
+            next_ts = time.monotonic()
+            while not stop_event.is_set():
+                now_ts = time.monotonic()
+                if now_ts < next_ts:
+                    stop_event.wait(min(float(next_ts - now_ts), 0.002))
+                    continue
+                _append_current_snapshot()
+                next_ts += float(RAW_RECORD_DT_S)
+                if (time.monotonic() - next_ts) > float(RAW_RECORD_DT_S):
+                    next_ts = time.monotonic()
+
+        record_thread = threading.Thread(target=_record_loop, name="keyboard-recorder", daemon=True)
+        record_thread.start()
+
+    def _finalize_recorded_frames() -> list[Any]:
+        _stop_record_thread()
+        if recording:
+            _append_current_snapshot()
+        with record_lock:
+            frames_copy = list(recorded_frames)
+        return _dedupe_consecutive_frames(frames_copy)
 
     term: RawTerminal | None = None
     input_pump: _TerminalInputPump | None = None
@@ -338,10 +406,6 @@ def run_session(
         if live_yaw is not None:
             runtime.local_exec_yaw_rad = float(live_yaw)
 
-    def _maybe_record_active_tick(now_ts: float) -> None:
-        if recording and now_ts >= next_record_ts:
-            _append_current_snapshot()
-
     def _clip_command_pose(pose_real: np.ndarray) -> np.ndarray:
         pose = np.asarray(pose_real, dtype=np.float64).reshape(6).copy()
         pose[0] = float(np.clip(pose[0], float(config.workspace_x_min), float(config.workspace_x_max)))
@@ -389,41 +453,47 @@ def run_session(
 
     def _handle_discrete_key(key: str) -> bool:
         nonlocal recording, saving, recorded_frames, frame_idx, saved_episode_count
-        nonlocal status_line, local_gripper_open, next_record_ts, input_suppress_until_ts
+        nonlocal status_line, local_gripper_open, input_suppress_until_ts
         nonlocal command_pose_real, planned_pose_real, last_sent_pose_real, hold_pose_real, hold_yaw_rad
         if key == KEY_ENTER:
             _clear_pending_inputs()
             input_suppress_until_ts = time.monotonic() + float(ENTER_INPUT_SUPPRESS_S)
             if not recording:
                 recording = True
-                recorded_frames = []
-                frame_idx = 0
-                next_record_ts = 0.0
+                with record_lock:
+                    recorded_frames = []
+                    frame_idx = 0
                 _append_current_snapshot()
+                _start_record_thread()
                 status_line = f"Recording started: {_current_prompt()}"
             else:
-                recording = False
                 saving = True
                 status_line = f"Saving prompt: {_current_prompt()}"
                 _render_ui(force=True)
-                if recorded_frames:
+                frames_to_save = _finalize_recorded_frames()
+                recording = False
+                if frames_to_save:
                     try:
                         episode_dir = save_episode_fn(
-                            recorded_frames,
+                            frames_to_save,
                             save_dir,
                             _current_prompt(),
                             save_fps=config.save_fps,
                             state_mode=config.state_mode,
                         )
                         saved_episode_count += 1
-                        status_line = f"Saved {episode_dir.name} for prompt: {_current_prompt()}"
+                        status_line = (
+                            f"Saved {episode_dir.name} for prompt: {_current_prompt()} "
+                            f"({len(frames_to_save)} frames)"
+                        )
                     finally:
                         saving = False
                 else:
                     saving = False
                     status_line = "Recording stopped: no frames captured"
-                recorded_frames = []
-                frame_idx = 0
+                with record_lock:
+                    recorded_frames = []
+                    frame_idx = 0
             _clear_pending_inputs()
             input_suppress_until_ts = time.monotonic() + float(ENTER_INPUT_SUPPRESS_S)
             return True
@@ -655,7 +725,6 @@ def run_session(
                         if live_yaw is not None:
                             runtime.local_exec_yaw_rad = float(live_yaw)
 
-                    _maybe_record_active_tick(now_ts)
                     status_line = (
                         f"Move vx={linear_axis_cmd[0]*float(runtime.linear_speed)*1000.0:+.1f}mm/s "
                         f"vy={linear_axis_cmd[1]*float(runtime.linear_speed)*1000.0:+.1f}mm/s "
@@ -697,6 +766,7 @@ def run_session(
                 _stop_servo()
             next_control_ts = float(next_control_ts + float(CONTROL_DT_S))
     finally:
+        _stop_record_thread()
         _stop_servo()
         input_pump.stop()
         if remote_relay is not None:

@@ -791,9 +791,17 @@ def _execute_servo_segment(
     from support.tcp_control import get_robot_snapshot
 
     target_real = np.asarray(target_real, dtype=np.float64).reshape(6).copy()
-    start_snap = get_robot_snapshot()
-    start_real = np.asarray(start_snap.tcp_pose, dtype=np.float64).reshape(6).copy()
-    start_joint_q = np.asarray(start_snap.joint_q, dtype=np.float64).reshape(-1)
+    start_real: np.ndarray | None = None
+    if reuse_servo and hasattr(daemon, "get_servo_reference_pose"):
+        try:
+            ref_pose = daemon.get_servo_reference_pose()
+        except Exception:
+            ref_pose = None
+        if ref_pose is not None:
+            start_real = np.asarray(ref_pose, dtype=np.float64).reshape(6).copy()
+    if start_real is None:
+        start_snap = get_robot_snapshot()
+        start_real = np.asarray(start_snap.tcp_pose, dtype=np.float64).reshape(6).copy()
     start_yaw = float(_wrap_angle(start_real[5]))
     pose_targets, joint_targets = _build_servo_pose_targets(
         start_real,

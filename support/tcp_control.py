@@ -700,6 +700,12 @@ class _DaemonHelper:
             return self._last_servo_pose_real
         return _get_live_tcp_pose_real()
 
+    def get_servo_reference_pose(self) -> np.ndarray | None:
+        with self._lock:
+            if self._last_servo_pose_real is None:
+                return None
+            return np.asarray(self._last_servo_pose_real, dtype=np.float64).reshape(POSE_DIM).copy()
+
     def _servo_force_guard_dt_s(self) -> float:
         now = time.monotonic()
         if self._servo_force_guard_last_apply_ts_s is None:

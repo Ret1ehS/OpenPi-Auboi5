@@ -588,7 +588,7 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
     auto algo = robot->getRobotAlgorithm();
     std::ofstream diag_log;
     if (!opt.log_file.empty()) {
-        diag_log.open(opt.log_file, std::ios::out | std::ios::trunc);
+        diag_log.open(opt.log_file, std::ios::out | std::ios::app);
     }
     auto log_diag = [&](const std::string &line) {
         if (!diag_log.is_open()) {
@@ -597,6 +597,8 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
         diag_log << line << std::endl;
         diag_log.flush();
     };
+    log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+             ",\"event\":\"daemon_start\",\"pid\":" + std::to_string(::getpid()) + "}");
 
     // Print initial snapshot so caller knows we're ready
     print_snapshot(robot, config);
@@ -614,6 +616,9 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
 
     auto cleanup_servo = [&]() {
         if (servo_active) {
+            log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                     ",\"event\":\"servo_exit\",\"sent\":" + std::to_string(sent) +
+                     ",\"hold_pose\":" + vec_to_json(hold_pose) + "}");
             motion->setServoModeSelect(0);
             servo_active = false;
             std::cout << "servo_active=0" << std::endl;
@@ -693,6 +698,9 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
             state = robot->getRobotState();
             const int ready_ret = ensure_robot_ready_for_motion(robot, motion, manage);
             if (ready_ret != 0) {
+                log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                         ",\"event\":\"servo_start\",\"ok\":false,\"error\":\"robot_not_ready\",\"ready_ret\":" +
+                         std::to_string(ready_ret) + "}");
                 std::cout << "servo_start_ret=-1" << std::endl;
                 std::cout << "error=robot_not_ready" << std::endl;
                 std::cout << "ready_ret=" << ready_ret << std::endl;
@@ -709,6 +717,9 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
             servo_gain = 150.0;
             int enter_ret = motion->setServoModeSelect(1);
             if (enter_ret != 0 || motion->getServoModeSelect() != 1) {
+                log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                         ",\"event\":\"servo_start\",\"ok\":false,\"error\":\"enter_servo_failed\",\"enter_ret\":" +
+                         std::to_string(enter_ret) + "}");
                 std::cout << "servo_start_ret=" << enter_ret << std::endl;
                 std::cout << "error=enter_servo_failed" << std::endl;
                 std::cout << "END" << std::endl;
@@ -720,6 +731,12 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
             hold_pose = std::get<0>(algo->forwardKinematics(seed_q));
             hold_joint_mode = true;
             sent = 0;
+            log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                     ",\"event\":\"servo_start\",\"ok\":true,\"track_time_s\":" +
+                     std::to_string(servo_track_time_s) + ",\"lookahead_s\":" +
+                     std::to_string(servo_lookahead) + ",\"gain\":" +
+                     std::to_string(servo_gain) + ",\"seed_q\":" + vec_to_json(seed_q) +
+                     ",\"hold_pose\":" + vec_to_json(hold_pose) + "}");
             std::cout << "servo_start_ret=0" << std::endl;
             std::cout << "servo_track_time_s=" << servo_track_time_s << std::endl;
             std::cout << "END" << std::endl;
@@ -741,12 +758,16 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
         } else if (line.rfind("servo_pose ", 0) == 0) {
             // servo_pose x y z rx ry rz
             if (!servo_active) {
+                log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                         ",\"event\":\"servo_pose\",\"ok\":false,\"error\":\"servo_not_active\"}");
                 std::cout << "error=servo_not_active" << std::endl;
                 std::cout << "END" << std::endl;
                 continue;
             }
             std::vector<double> pose;
             if (!parse_pose6(line.substr(11), pose)) {
+                log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                         ",\"event\":\"servo_pose\",\"ok\":false,\"error\":\"bad_pose\"}");
                 std::cout << "error=bad_pose" << std::endl;
                 std::cout << "END" << std::endl;
                 continue;
@@ -758,6 +779,10 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
             auto target_q = std::get<0>(ik_result);
             int ik_ret = std::get<1>(ik_result);
             if (ik_ret != 0 || target_q.size() != 6) {
+                log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                         ",\"event\":\"servo_pose\",\"ok\":false,\"error\":\"ik_fail\",\"ik_ret\":" +
+                         std::to_string(ik_ret) + ",\"seed_q\":" + vec_to_json(seed_q) +
+                         ",\"target_pose\":" + vec_to_json(pose) + "}");
                 std::cout << "servo_pose_ret=-1" << std::endl;
                 std::cout << "error=ik_fail" << std::endl;
                 std::cout << "ik_ret=" << ik_ret << std::endl;
@@ -772,6 +797,10 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
             if (servo_ret != 0) {
+                log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                         ",\"event\":\"servo_pose\",\"ok\":false,\"error\":\"servo_fail\",\"servo_ret\":" +
+                         std::to_string(servo_ret) + ",\"seed_q\":" + vec_to_json(seed_q) +
+                         ",\"target_pose\":" + vec_to_json(pose) + ",\"target_q\":" + vec_to_json(target_q) + "}");
                 std::cout << "servo_pose_ret=" << servo_ret << std::endl;
                 std::cout << "servo_ret_name=" << servo_ret_name(servo_ret) << std::endl;
                 std::cout << "error=servo_fail" << std::endl;
@@ -793,10 +822,19 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
             if (state->isCollisionOccurred() || !state->isWithinSafetyLimits()) {
                 motion->stopJoint(1.0);
                 cleanup_servo();
+                log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                         ",\"event\":\"servo_pose\",\"ok\":false,\"error\":\"safety\",\"sent\":" +
+                         std::to_string(sent) + ",\"hold_pose\":" + vec_to_json(hold_pose) + "}");
                 std::cout << "servo_pose_ret=-3" << std::endl;
                 std::cout << "error=safety" << std::endl;
                 std::cout << "END" << std::endl;
                 continue;
+            }
+
+            if (sent <= 5 || (sent % 25) == 0) {
+                log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                         ",\"event\":\"servo_pose\",\"ok\":true,\"sent\":" + std::to_string(sent) +
+                         ",\"target_pose\":" + vec_to_json(pose) + ",\"target_q\":" + vec_to_json(target_q) + "}");
             }
 
             std::cout << "servo_pose_ret=0" << std::endl;
@@ -836,6 +874,9 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
             }
             int num_poses = 0;
             { std::istringstream iss(line.substr(12)); iss >> num_poses; }
+            log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                     ",\"event\":\"servo_chunk\",\"phase\":\"start\",\"requested\":" +
+                     std::to_string(num_poses) + "}");
 
             // Read all poses directly — data is either already in the
             // iostream buffer or arrives within microseconds.  Do NOT
@@ -865,6 +906,10 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
                 if (ik_ret != 0 || target_q.size() != 6) {
                     chunk_ok = false;
                     chunk_error = "ik_fail";
+                    log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                             ",\"event\":\"servo_chunk\",\"ok\":false,\"error\":\"ik_fail\",\"index\":" +
+                             std::to_string(idx) + ",\"ik_ret\":" + std::to_string(ik_ret) +
+                             ",\"target_pose\":" + vec_to_json(pose) + "}");
                     break;
                 }
                 // Servo
@@ -877,6 +922,10 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
                 if (servo_ret != 0) {
                     chunk_ok = false;
                     chunk_error = std::string("servo_fail:") + servo_ret_name(servo_ret);
+                    log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                             ",\"event\":\"servo_chunk\",\"ok\":false,\"error\":\"servo_fail\",\"index\":" +
+                             std::to_string(idx) + ",\"servo_ret\":" + std::to_string(servo_ret) +
+                             ",\"target_pose\":" + vec_to_json(pose) + ",\"target_q\":" + vec_to_json(target_q) + "}");
                     std::cout << "servo_ret=" << servo_ret << std::endl;
                     std::cout << "servo_ret_name=" << servo_ret_name(servo_ret) << std::endl;
                     break;
@@ -895,9 +944,17 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
                     cleanup_servo();
                     chunk_ok = false;
                     chunk_error = "safety";
+                    log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                             ",\"event\":\"servo_chunk\",\"ok\":false,\"error\":\"safety\",\"index\":" +
+                             std::to_string(idx) + ",\"sent\":" + std::to_string(chunk_sent) + "}");
                     break;
                 }
             }
+            log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                     ",\"event\":\"servo_chunk\",\"ok\":" + std::string(chunk_ok ? "true" : "false") +
+                     ",\"chunk_sent\":" + std::to_string(chunk_sent) +
+                     ",\"chunk_total\":" + std::to_string(chunk_poses.size()) +
+                     ",\"error\":\"" + chunk_error + "\"}");
             std::cout << "servo_chunk_ret=" << (chunk_ok ? 0 : -1) << std::endl;
             std::cout << "chunk_sent=" << chunk_sent << std::endl;
             std::cout << "chunk_total=" << chunk_poses.size() << std::endl;
@@ -928,6 +985,9 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
             int total_sent = sent;
             cleanup_servo();
             auto final_q = robot->getRobotState()->getJointPositions();
+            log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                     ",\"event\":\"servo_stop\",\"servo_sent\":" + std::to_string(total_sent) +
+                     ",\"final_q\":" + vec_to_json(final_q) + "}");
             print_vec("final_q_rad", final_q);
             std::cout << "servo_sent=" << total_sent << std::endl;
             std::cout << "collision_after=" << robot->getRobotState()->isCollisionOccurred() << std::endl;
@@ -985,6 +1045,11 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
             if (!(motion->getExecId() == -1 && robot_state->isSteady())) {
                 wait_ret = -3;
             }
+            log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                     ",\"event\":\"stop_motion\",\"stop_ret\":" + std::to_string(stop_ret) +
+                     ",\"wait_ret\":" + std::to_string(wait_ret) +
+                     ",\"exec_id\":" + std::to_string(motion->getExecId()) +
+                     ",\"is_steady\":" + std::string(robot_state->isSteady() ? "true" : "false") + "}");
 
             std::cout << "stop_ret=" << stop_ret << std::endl;
             std::cout << "wait_ret=" << wait_ret << std::endl;
@@ -999,6 +1064,8 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
             std::cout << "END" << std::endl;
 
         } else if (line == "quit" || line == "exit") {
+            log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                     ",\"event\":\"daemon_exit\",\"reason\":\"quit\"}");
             cleanup_servo();
             break;
         } else {

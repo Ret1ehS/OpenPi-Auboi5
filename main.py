@@ -17,6 +17,7 @@ Inference loop:
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import sys
@@ -550,6 +551,17 @@ def main() -> int:
         max_speed_mps=effective_speed,
     )
     executor.start()
+    infer_log_dir = SCRIPT_DIR / "log"
+    infer_log_dir.mkdir(parents=True, exist_ok=True)
+    infer_log_path = infer_log_dir / "main_inference.log"
+
+    def _append_infer_log(event: dict[str, object]) -> None:
+        payload = {
+            "ts_ms": int(time.time() * 1000),
+            **event,
+        }
+        with open(infer_log_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     # --- Prompt input loop ---
     print("\n=== Ready. Enter a prompt to start inference. ===")
@@ -636,6 +648,16 @@ def main() -> int:
         print(f"Starting inference loop with prompt: \"{prompt}\"")
         print(f"  Execute={execute}  PoseFrame={get_alignment_mode()}")
         print("  Press Ctrl+C to stop.\n")
+        _append_infer_log(
+            {
+                "event": "session_start",
+                "prompt": prompt,
+                "execute": bool(execute),
+                "pose_frame": str(get_alignment_mode()),
+                "speed_mode": str(cfg.speed_mode),
+                "exec_speed_mps": None if cfg.speed_mode == "native" else float(cfg.exec_speed_mps),
+            }
+        )
 
         policy.reset()
         executor.reset_state()
@@ -785,6 +807,27 @@ def main() -> int:
                     scheduled_gripper_state = int(gripper_targets[scheduled_gripper_idx])
                     tcp_prefix = tcp_deltas[: scheduled_gripper_idx + 1]
 
+                prefix_integral = np.sum(tcp_prefix, axis=0, dtype=np.float64) if len(tcp_prefix) else np.zeros((6,), dtype=np.float64)
+                prefix_abs_integral = np.sum(np.abs(tcp_prefix), axis=0, dtype=np.float64) if len(tcp_prefix) else np.zeros((6,), dtype=np.float64)
+                full_integral = np.sum(tcp_deltas, axis=0, dtype=np.float64) if len(tcp_deltas) else np.zeros((6,), dtype=np.float64)
+                _append_infer_log(
+                    {
+                        "event": "inference_chunk",
+                        "step": int(step),
+                        "prompt": prompt,
+                        "infer_time_s": float(infer_time),
+                        "raw_action_count": int(len(raw_actions)),
+                        "exec_action_count": int(len(exec_actions)),
+                        "prefix_action_count": int(len(tcp_prefix)),
+                        "full_integral": [float(v) for v in full_integral.tolist()],
+                        "prefix_integral": [float(v) for v in prefix_integral.tolist()],
+                        "prefix_abs_integral": [float(v) for v in prefix_abs_integral.tolist()],
+                        "gripper_changed": bool(scheduled_gripper_state is not None),
+                        "scheduled_gripper_idx": None if scheduled_gripper_idx is None else int(scheduled_gripper_idx),
+                        "scheduled_gripper_state": None if scheduled_gripper_state is None else int(scheduled_gripper_state),
+                    }
+                )
+
                 executor.submit(
                     tcp_prefix,
                     aligned_obs.aligned_tcp_pose_sim,
@@ -841,6 +884,14 @@ def main() -> int:
             print("\n  Waiting for in-flight trajectory to finish...")
             executor.wait_until_idle()
             executor.reset_state()
+            _append_infer_log(
+                {
+                    "event": "session_stop",
+                    "prompt": prompt,
+                    "steps": int(step),
+                    "reason": "keyboard_interrupt",
+                }
+            )
             if _rec_thread is not None:
                 _rec_stop.set()
                 _rec_thread.join(timeout=3)

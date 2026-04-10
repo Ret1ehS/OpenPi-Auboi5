@@ -268,7 +268,7 @@ class ContinuousKeyState:
                 vertical = (1.0 if up else 0.0) - (1.0 if down else 0.0)
                 horizontal = (1.0 if left else 0.0) - (1.0 if right else 0.0)
                 z_axis = (1.0 if ctrl_up else 0.0) - (1.0 if ctrl_down else 0.0)
-                yaw_axis = (1.0 if ctrl_left else 0.0) - (1.0 if ctrl_right else 0.0)
+                yaw_axis = (1.0 if ctrl_right else 0.0) - (1.0 if ctrl_left else 0.0)
                 return vertical, horizontal, z_axis, yaw_axis
 
             up = self._up
@@ -279,7 +279,7 @@ class ContinuousKeyState:
         vertical = (1.0 if up else 0.0) - (1.0 if down else 0.0)
         horizontal = (1.0 if left else 0.0) - (1.0 if right else 0.0)
         if ctrl:
-            return 0.0, 0.0, vertical, horizontal
+            return 0.0, 0.0, vertical, -horizontal
         return vertical, horizontal, 0.0, 0.0
 
     def _on_press(self, key) -> None:

@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import json
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -324,6 +325,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-capture-fps", type=float, default=DEFAULT_RAW_CAPTURE_FPS)
     parser.add_argument("--json-out", type=str, default="")
     parser.add_argument("--keep-bad", action="store_true", help="Only report bad episodes, do not delete or renumber.")
+    parser.add_argument(
+        "--delete-bad",
+        action="store_true",
+        help="Delete failed episodes without interactive confirmation and renumber the remainder.",
+    )
     return parser.parse_args()
 
 
@@ -371,52 +377,7 @@ def renumber_episode_dirs(data_dir: Path) -> list[dict[str, str]]:
     return rename_log
 
 
-def main() -> int:
-    args = parse_args()
-    data_dir = Path(args.data_dir).resolve()
-    if not data_dir.exists():
-        raise FileNotFoundError(f"data dir not found: {data_dir}")
-
-    if args.episode:
-        episode_dirs = [data_dir / args.episode]
-    else:
-        episode_dirs = collect_episode_dirs(data_dir)
-
-    reports = [inspect_episode(ep_dir, raw_capture_fps=float(args.raw_capture_fps)) for ep_dir in episode_dirs if ep_dir.exists()]
-    deleted_episodes: list[str] = []
-    rename_log: list[dict[str, str]] = []
-
-    if not args.keep_bad:
-        deleted_episodes = delete_bad_episodes(reports, data_dir)
-        if deleted_episodes:
-            print(f"Deleted bad episodes: {deleted_episodes}")
-            rename_log = renumber_episode_dirs(data_dir)
-            if rename_log:
-                print("Renumbered remaining episodes:")
-                for item in rename_log:
-                    print(f"  {item['from']} -> {item['to']}")
-            episode_dirs = collect_episode_dirs(data_dir)
-            reports = [inspect_episode(ep_dir, raw_capture_fps=float(args.raw_capture_fps)) for ep_dir in episode_dirs if ep_dir.exists()]
-
-    summary = {
-        "data_dir": str(data_dir),
-        "raw_capture_fps": float(args.raw_capture_fps),
-        "deleted_episodes": deleted_episodes,
-        "renamed_episodes": rename_log,
-        "episodes": [
-            {
-                "episode": r.episode,
-                "status": r.status,
-                "task": r.task,
-                "n_frames": r.n_frames,
-                "errors": r.errors,
-                "warnings": r.warnings,
-                "metrics": r.metrics,
-            }
-            for r in reports
-        ],
-    }
-
+def print_reports(reports: list[EpisodeReport]) -> tuple[int, int, int]:
     ok = warn = fail = 0
     for report in reports:
         if report.status == "ok":
@@ -441,8 +402,80 @@ def main() -> int:
                     f"ratio={metric['unique_ratio']:.3f} zero={metric['zero_frames']} "
                     f"dup_run={metric['longest_duplicate_run']}"
                 )
+    return ok, warn, fail
 
+
+def should_delete_bad_episodes(*, args: argparse.Namespace, failed_reports: list[EpisodeReport]) -> bool:
+    if not failed_reports:
+        return False
+    if args.keep_bad:
+        return False
+    if args.delete_bad:
+        return True
+    if not sys.stdin.isatty():
+        print("\nNon-interactive session detected. Skipping deletion.")
+        print("Re-run with --delete-bad to delete failed episodes without a prompt.")
+        return False
+
+    print("\nFailed episodes:")
+    for report in failed_reports:
+        print(f"  {report.episode}: {', '.join(report.errors)}")
+    answer = input("\nDelete failed episodes and renumber the remainder? [y/N]: ").strip().lower()
+    return answer in {"y", "yes"}
+
+
+def main() -> int:
+    args = parse_args()
+    data_dir = Path(args.data_dir).resolve()
+    if not data_dir.exists():
+        raise FileNotFoundError(f"data dir not found: {data_dir}")
+
+    if args.episode:
+        episode_dirs = [data_dir / args.episode]
+    else:
+        episode_dirs = collect_episode_dirs(data_dir)
+
+    reports = [inspect_episode(ep_dir, raw_capture_fps=float(args.raw_capture_fps)) for ep_dir in episode_dirs if ep_dir.exists()]
+    deleted_episodes: list[str] = []
+    rename_log: list[dict[str, str]] = []
+
+    ok, warn, fail = print_reports(reports)
     print(f"\nSummary: ok={ok} warn={warn} fail={fail} total={len(reports)}")
+
+    failed_reports = [report for report in reports if report.status == "fail"]
+    if should_delete_bad_episodes(args=args, failed_reports=failed_reports):
+        deleted_episodes = delete_bad_episodes(reports, data_dir)
+        if deleted_episodes:
+            print(f"Deleted bad episodes: {deleted_episodes}")
+            rename_log = renumber_episode_dirs(data_dir)
+            if rename_log:
+                print("Renumbered remaining episodes:")
+                for item in rename_log:
+                    print(f"  {item['from']} -> {item['to']}")
+            episode_dirs = collect_episode_dirs(data_dir)
+            reports = [inspect_episode(ep_dir, raw_capture_fps=float(args.raw_capture_fps)) for ep_dir in episode_dirs if ep_dir.exists()]
+            print("\nPost-delete check:")
+            ok, warn, fail = print_reports(reports)
+            print(f"\nSummary: ok={ok} warn={warn} fail={fail} total={len(reports)}")
+
+    summary = {
+        "data_dir": str(data_dir),
+        "raw_capture_fps": float(args.raw_capture_fps),
+        "deleted_episodes": deleted_episodes,
+        "renamed_episodes": rename_log,
+        "episodes": [
+            {
+                "episode": r.episode,
+                "status": r.status,
+                "task": r.task,
+                "n_frames": r.n_frames,
+                "errors": r.errors,
+                "warnings": r.warnings,
+                "metrics": r.metrics,
+            }
+            for r in reports
+        ],
+    }
 
     json_out = Path(args.json_out).resolve() if args.json_out else data_dir / "dataset_health_report.json"
     json_out.write_text(json.dumps(summary, indent=2), encoding="utf-8")

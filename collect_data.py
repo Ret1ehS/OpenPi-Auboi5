@@ -588,6 +588,8 @@ def _build_servo_pose_targets(
     speed_mps: float,
     start_yaw: float | None = None,
     target_yaw: float | None = None,
+    angular_speed_radps: float | None = None,
+    yaw_speed_radps: float | None = None,
 ) -> tuple[list[np.ndarray], list[float] | None]:
     start_pose = np.asarray(start_real, dtype=np.float64).reshape(6)
     target_pose = np.asarray(target_real, dtype=np.float64).reshape(6)
@@ -597,13 +599,15 @@ def _build_servo_pose_targets(
     linear_dist = float(np.linalg.norm(delta[:3]))
     angular_dist = float(np.linalg.norm(delta[3:]))
     linear_time = linear_dist / max(float(speed_mps), 1e-6)
-    angular_time = angular_dist / max(float(SERVO_ANGULAR_SPEED_RADPS), 1e-6)
+    pose_angular_speed = float(SERVO_ANGULAR_SPEED_RADPS if angular_speed_radps is None else angular_speed_radps)
+    angular_time = angular_dist / max(pose_angular_speed, 1e-6)
     joint_time = 0.0
     joint_targets: list[float] | None = None
     joint_delta = 0.0
     if target_yaw is not None and start_yaw is not None:
         joint_delta = _wrap_angle(float(target_yaw) - float(start_yaw))
-        joint_time = abs(joint_delta) / max(float(DEFAULT_YAW_SPEED_RADPS), 1e-6)
+        joint_speed = float(DEFAULT_YAW_SPEED_RADPS if yaw_speed_radps is None else yaw_speed_radps)
+        joint_time = abs(joint_delta) / max(joint_speed, 1e-6)
 
     required_time = max(linear_time, angular_time, joint_time, float(SERVO_CONTROL_DT))
     step_count = max(1, int(np.ceil(required_time / float(SERVO_CONTROL_DT))))
@@ -643,6 +647,129 @@ def _capture_recorded_frame(
     )
 
 
+class _SegmentServoRunner:
+    def __init__(
+        self,
+        daemon,
+        *,
+        label: str,
+        start_real: np.ndarray,
+        target_real: np.ndarray,
+        pose_targets: list[np.ndarray],
+        target_yaw: float | None,
+        joint_targets: list[float] | None,
+        semantic_yaw: float,
+        require_force_guard: bool,
+        force_live_mode: bool,
+        reuse_servo: bool,
+        yaw_speed_radps: float | None,
+    ) -> None:
+        self.daemon = daemon
+        self.label = label
+        self.start_real = np.asarray(start_real, dtype=np.float64).reshape(6).copy()
+        self.target_real = np.asarray(target_real, dtype=np.float64).reshape(6).copy()
+        self.pose_targets = [np.asarray(p, dtype=np.float64).reshape(6).copy() for p in pose_targets]
+        self.target_yaw = None if target_yaw is None else float(target_yaw)
+        self.joint_targets = None if joint_targets is None else [float(v) for v in joint_targets]
+        self.current_semantic_yaw = float(semantic_yaw)
+        self.require_force_guard = bool(require_force_guard)
+        self.force_live_mode = bool(force_live_mode)
+        self.reuse_servo = bool(reuse_servo)
+        self.yaw_speed_radps = None if yaw_speed_radps is None else float(yaw_speed_radps)
+        self.started_servo = False
+        self.stream_finished = False
+        self.last_force_guard_adjusted = False
+        self.last_force_guard_scale: float | None = None
+        self.error: Exception | None = None
+        self._stop_event = threading.Event()
+        self._done_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, name=f"collect-servo-{label}", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def request_stop(self) -> None:
+        self._stop_event.set()
+
+    def join(self, timeout: float | None = None) -> None:
+        self._thread.join(timeout=timeout)
+
+    @property
+    def done(self) -> bool:
+        return self._done_event.is_set()
+
+    def _check_servo_response(self, resp: dict[str, object], *, context: str) -> None:
+        pose_ret = int(resp.get("servo_pose_ret", -1))
+        if pose_ret != 0:
+            raise RuntimeError(f"{context} failed: {resp}")
+        if self.require_force_guard and resp.get("force_guard_fz_n") is None:
+            raise RuntimeError(f"{context} lost force guard")
+        self.last_force_guard_adjusted = _coerce_bool(resp.get("force_guard_adjusted"))
+        self.last_force_guard_scale = _coerce_optional_float(resp.get("force_guard_scale"))
+
+    def _wait_until(self, target_ts: float) -> bool:
+        while not self._stop_event.is_set():
+            now = time.monotonic()
+            remaining = float(target_ts - now)
+            if remaining <= 0.0:
+                return True
+            self._stop_event.wait(min(remaining, 0.002))
+        return False
+
+    def _run(self) -> None:
+        next_send_ts = time.monotonic()
+        try:
+            if not self.reuse_servo:
+                start_resp = self.daemon.servo_start(SERVO_CONTROL_DT)
+                self.started_servo = True
+                if int(start_resp.get("servo_start_ret", -1)) != 0:
+                    raise RuntimeError(f"{self.label} servo_start failed: {start_resp}")
+
+            begin_resp = self.daemon.servo_begin_chunk(self.start_real, force_live_mode=self.force_live_mode)
+            if self.require_force_guard and begin_resp.get("force_guard_fz_n") is None:
+                raise RuntimeError(f"{self.label} aborted: force guard unavailable for downward motion")
+            self.last_force_guard_adjusted = _coerce_bool(begin_resp.get("force_guard_adjusted"))
+            self.last_force_guard_scale = _coerce_optional_float(begin_resp.get("force_guard_scale"))
+
+            for idx, pose_cmd in enumerate(self.pose_targets):
+                if not self._wait_until(next_send_ts):
+                    return
+                yaw_cmd = None if self.joint_targets is None else self.joint_targets[idx]
+                if yaw_cmd is not None:
+                    self.current_semantic_yaw = float(yaw_cmd)
+                resp = self.daemon.servo_pose(pose_cmd)
+                self._check_servo_response(resp, context=f"{self.label} servo pose")
+                next_send_ts += float(SERVO_CONTROL_DT)
+                late_by = time.monotonic() - next_send_ts
+                if late_by > float(SERVO_CONTROL_DT):
+                    next_send_ts = time.monotonic()
+
+            self.stream_finished = True
+            while not self._stop_event.is_set():
+                if self.target_yaw is not None:
+                    self.current_semantic_yaw = float(self.target_yaw)
+                if not self._wait_until(next_send_ts):
+                    return
+                resp = self.daemon.servo_pose(self.target_real)
+                self._check_servo_response(resp, context=f"{self.label} final servo hold")
+                next_send_ts += float(SERVO_CONTROL_DT)
+                late_by = time.monotonic() - next_send_ts
+                if late_by > float(SERVO_CONTROL_DT):
+                    next_send_ts = time.monotonic()
+        except Exception as exc:
+            self.error = exc
+        finally:
+            if self.started_servo:
+                try:
+                    self.daemon.servo_stop()
+                except Exception:
+                    try:
+                        stop_motion_and_confirm(self.daemon, f"{self.label} cleanup")
+                    except Exception:
+                        pass
+            self._done_event.set()
+
+
 def _execute_servo_segment(
     daemon,
     target_real: np.ndarray,
@@ -658,6 +785,8 @@ def _execute_servo_segment(
     semantic_yaw: float | None = None,
     force_live_mode: bool = True,
     reuse_servo: bool = False,
+    angular_speed_radps: float | None = None,
+    yaw_speed_radps: float | None = None,
 ) -> list["RecordedFrame"]:
     from support.tcp_control import get_robot_snapshot
 
@@ -672,6 +801,8 @@ def _execute_servo_segment(
         speed_mps=speed_mps,
         start_yaw=start_yaw if target_yaw is not None else None,
         target_yaw=target_yaw,
+        angular_speed_radps=angular_speed_radps,
+        yaw_speed_radps=yaw_speed_radps,
     )
 
     require_force_guard = bool(force_live_mode and float(target_real[2]) < float(start_real[2]) - 1e-6)
@@ -682,10 +813,9 @@ def _execute_servo_segment(
     per_step_budget_s = 0.08 if record else 0.04
     stream_budget_s = float(len(pose_targets)) * float(per_step_budget_s) + 5.0
     deadline = time.monotonic() + max(0.5, float(timeout_s), float(stream_budget_s))
-    servo_started = False
-    current_semantic_yaw = float(start_yaw if semantic_yaw is None else semantic_yaw)
+    initial_semantic_yaw = float(start_yaw if semantic_yaw is None else semantic_yaw)
 
-    def _record_snapshot(snap, *, force: bool = False) -> None:
+    def _record_snapshot(snap, current_semantic_yaw: float, *, force: bool = False) -> None:
         nonlocal frame_idx, next_record_deadline, last_record_ts
         if not record or cameras is None:
             return
@@ -711,39 +841,31 @@ def _execute_servo_segment(
         frame_idx += 1
         last_record_ts = now
         next_record_deadline = now + CONTROL_DT
+    runner = _SegmentServoRunner(
+        daemon,
+        label=label,
+        start_real=start_real,
+        target_real=target_real,
+        pose_targets=pose_targets,
+        target_yaw=target_yaw,
+        joint_targets=joint_targets,
+        semantic_yaw=initial_semantic_yaw,
+        require_force_guard=require_force_guard,
+        force_live_mode=force_live_mode,
+        reuse_servo=reuse_servo,
+        yaw_speed_radps=yaw_speed_radps,
+    )
+    runner.start()
 
-    def _send_servo_command(pose_cmd: np.ndarray, yaw_cmd: float | None) -> dict[str, object]:
-        _ = yaw_cmd
-        return daemon.servo_pose(pose_cmd)
-
+    monitor_dt_s = 0.005
     try:
-        if not reuse_servo:
-            start_resp = daemon.servo_start(SERVO_CONTROL_DT)
-            servo_started = True
-            if int(start_resp.get("servo_start_ret", -1)) != 0:
-                raise RuntimeError(f"{label} servo_start failed: {start_resp}")
-
-        begin_resp = daemon.servo_begin_chunk(start_real, force_live_mode=force_live_mode)
-        if require_force_guard and begin_resp.get("force_guard_fz_n") is None:
-            raise RuntimeError(f"{label} aborted: force guard unavailable for downward motion")
-
-        for idx, pose_cmd in enumerate(pose_targets):
-            yaw_cmd = None if joint_targets is None else joint_targets[idx]
-            if yaw_cmd is not None:
-                current_semantic_yaw = float(yaw_cmd)
-            resp = _send_servo_command(pose_cmd, yaw_cmd)
-            pose_ret = int(resp.get("servo_pose_ret", -1))
-            if pose_ret != 0:
-                raise RuntimeError(f"{label} servo failed: {resp}")
-            if require_force_guard and resp.get("force_guard_fz_n") is None:
-                raise RuntimeError(f"{label} aborted: force guard lost during downward motion")
-            snap = get_robot_snapshot()
-            _record_snapshot(snap, force=not frames or idx == len(pose_targets) - 1)
-            if time.monotonic() > deadline:
-                raise RuntimeError(f"{label} timed out while streaming to target {np.round(target_real, 5).tolist()}")
-
         while True:
+            if runner.error is not None:
+                raise runner.error
+
             snap = get_robot_snapshot()
+            _record_snapshot(snap, float(runner.current_semantic_yaw), force=not frames)
+
             actual_real = np.asarray(snap.tcp_pose, dtype=np.float64).reshape(6).copy()
             joint_q = np.asarray(snap.joint_q, dtype=np.float64).reshape(-1)
             actual_yaw_readback = _require_yaw_readback(
@@ -755,14 +877,36 @@ def _execute_servo_segment(
                 target_yaw is None
                 or abs(_wrap_angle(actual_tcp_yaw - float(target_yaw))) <= DEFAULT_YAW_EXEC_TOL_RAD
             )
-            if _pose_close(actual_real, target_real) and yaw_ok:
+
+            if runner.stream_finished and _pose_close(actual_real, target_real) and yaw_ok:
                 force_final_record = (
                     record
                     and (last_record_ts is None or (time.monotonic() - last_record_ts) > (0.5 * CONTROL_DT))
                 )
-                _record_snapshot(snap, force=force_final_record)
+                _record_snapshot(snap, float(runner.current_semantic_yaw), force=force_final_record)
+                runner.request_stop()
+                runner.join(timeout=2.0)
+                if runner.error is not None:
+                    raise runner.error
                 break
+
+            if runner.stream_finished and require_force_guard and runner.last_force_guard_adjusted:
+                deadline = max(deadline, time.monotonic() + max(0.5, float(CONTROL_DT) * 4.0))
+                if runner.last_force_guard_scale is not None and runner.last_force_guard_scale <= 1e-6:
+                    _record_snapshot(snap, float(runner.current_semantic_yaw), force=True)
+                    runner.request_stop()
+                    runner.join(timeout=2.0)
+                    if runner.error is not None:
+                        raise runner.error
+                    break
+
             if time.monotonic() > deadline:
+                runner.request_stop()
+                runner.join(timeout=2.0)
+                if runner.error is not None:
+                    raise runner.error
+                if not runner.stream_finished:
+                    raise RuntimeError(f"{label} timed out while streaming to target {np.round(target_real, 5).tolist()}")
                 raise RuntimeError(
                     f"{label} timed out waiting for target "
                     f"(target={np.round(target_real, 5).tolist()}, actual={np.round(actual_real, 5).tolist()}, "
@@ -770,32 +914,11 @@ def _execute_servo_segment(
                     f"actual_tcp_yaw={round(actual_tcp_yaw, 6)}, "
                     f"actual_yaw_readback={round(actual_yaw_readback, 6)})"
                 )
-            if target_yaw is not None:
-                current_semantic_yaw = float(target_yaw)
-            resp = _send_servo_command(target_real, target_yaw)
-            pose_ret = int(resp.get("servo_pose_ret", -1))
-            if pose_ret != 0:
-                raise RuntimeError(f"{label} final servo hold failed: {resp}")
-            if require_force_guard and resp.get("force_guard_fz_n") is None:
-                raise RuntimeError(f"{label} aborted: force guard lost during downward hold")
-            force_guard_adjusted = _coerce_bool(resp.get("force_guard_adjusted"))
-            force_guard_scale = _coerce_optional_float(resp.get("force_guard_scale"))
-            if require_force_guard and force_guard_adjusted:
-                deadline = max(deadline, time.monotonic() + max(0.5, float(CONTROL_DT) * 4.0))
-                if force_guard_scale is not None and force_guard_scale <= 1e-6:
-                    hold_snap = get_robot_snapshot()
-                    _record_snapshot(hold_snap, force=True)
-                    break
-            _record_snapshot(get_robot_snapshot())
+
+            time.sleep(monitor_dt_s)
     finally:
-        if servo_started:
-            try:
-                daemon.servo_stop()
-            except Exception:
-                try:
-                    stop_motion_and_confirm(daemon, f"{label} cleanup")
-                except Exception:
-                    pass
+        runner.request_stop()
+        runner.join(timeout=2.0)
 
     return frames
 
@@ -810,6 +933,8 @@ def execute_pose_move_and_wait(
     timeout_s: float = DEFAULT_ASYNC_MOVE_TIMEOUT_S,
     force_live_mode: bool = True,
     reuse_servo: bool = False,
+    angular_speed_radps: float | None = None,
+    yaw_speed_radps: float | None = None,
 ) -> dict[str, object]:
     _execute_servo_segment(
         daemon,
@@ -821,6 +946,8 @@ def execute_pose_move_and_wait(
         timeout_s=timeout_s,
         force_live_mode=force_live_mode,
         reuse_servo=reuse_servo,
+        angular_speed_radps=angular_speed_radps,
+        yaw_speed_radps=yaw_speed_radps,
     )
     return {"servo_execute": "ok"}
 
@@ -870,6 +997,8 @@ def execute_and_record(
     force_live_mode: bool = True,
     record: bool = True,
     reuse_servo: bool = False,
+    angular_speed_radps: float | None = None,
+    yaw_speed_radps: float | None = None,
 ) -> list[RecordedFrame]:
     """Execute one servo segment at 100Hz and record executed state at 30Hz."""
     return _execute_servo_segment(
@@ -886,6 +1015,8 @@ def execute_and_record(
         semantic_yaw=semantic_yaw,
         force_live_mode=force_live_mode,
         reuse_servo=reuse_servo,
+        angular_speed_radps=angular_speed_radps,
+        yaw_speed_radps=yaw_speed_radps,
     )
 
 
@@ -1267,6 +1398,8 @@ class CollectTaskRuntime:
         target_yaw: float | None = None,
         speed_mps: float | None = None,
         timeout_s: float | None = None,
+        angular_speed_radps: float | None = None,
+        yaw_speed_radps: float | None = None,
     ) -> list[RecordedFrame]:
         effective_semantic_yaw = (
             None
@@ -1283,6 +1416,8 @@ class CollectTaskRuntime:
             target_yaw=target_yaw,
             semantic_yaw=effective_semantic_yaw,
             timeout_s=DEFAULT_ASYNC_MOVE_TIMEOUT_S if timeout_s is None else float(timeout_s),
+            angular_speed_radps=angular_speed_radps,
+            yaw_speed_radps=yaw_speed_radps,
             record=record,
             reuse_servo=self.hold_servo_active,
         )

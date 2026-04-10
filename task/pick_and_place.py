@@ -938,7 +938,12 @@ def execute_pick_step(
     record: bool,
     frame_idx: int,
     lookup_scene_state: dict[str, dict[str, Any]],
+    approach_speed_mps: float | None = None,
+    align_speed_mps: float | None = None,
+    descend_speed_mps: float | None = None,
     lift_speed_mps: float | None = None,
+    angular_speed_radps: float | None = None,
+    yaw_speed_radps: float | None = None,
 ):
     target_xy = np.asarray(step.xy, dtype=np.float64).reshape(2)
     target_z = float(runtime.z_for_pick_level(step.level))
@@ -971,6 +976,7 @@ def execute_pick_step(
         gripper=1.0,
         start_frame_idx=frame_idx,
         record=record,
+        speed_mps=approach_speed_mps,
     )
     if record:
         step_frames.extend(seg)
@@ -985,6 +991,9 @@ def execute_pick_step(
             start_frame_idx=frame_idx,
             record=record,
             semantic_yaw=runtime.local_exec_yaw_rad,
+            speed_mps=align_speed_mps,
+            angular_speed_radps=angular_speed_radps,
+            yaw_speed_radps=yaw_speed_radps,
         )
         if record:
             step_frames.extend(seg)
@@ -996,6 +1005,9 @@ def execute_pick_step(
         gripper=1.0,
         start_frame_idx=frame_idx,
         record=record,
+        speed_mps=descend_speed_mps,
+        angular_speed_radps=angular_speed_radps,
+        yaw_speed_radps=yaw_speed_radps,
     )
     if record:
         step_frames.extend(seg)
@@ -1013,6 +1025,8 @@ def execute_pick_step(
         start_frame_idx=frame_idx,
         record=record,
         speed_mps=lift_speed_mps,
+        angular_speed_radps=angular_speed_radps,
+        yaw_speed_radps=yaw_speed_radps,
     )
     if record:
         step_frames.extend(seg)

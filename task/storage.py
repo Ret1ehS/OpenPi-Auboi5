@@ -22,9 +22,8 @@ FORBIDDEN_Y_MIN_M = 0.07
 STORAGE_DROP_X_M = 0.56
 STORAGE_DROP_Y_M = 0.21
 STORAGE_DROP_Z_M = 0.270
-STORAGE_TRAVEL_SPEED_SCALE = 3.0
 STORAGE_LIFT_SPEED_SCALE = 3.0
-STORAGE_DESCEND_SPEED_SCALE = 3.0
+STORAGE_FAST_YAW_SPEED_RADPS = float(np.deg2rad(360.0))
 
 
 @dataclass
@@ -316,9 +315,8 @@ def record_episode(
         float(plan.drop_z),
         float(basket_yaw),
     )
-    fast_lift_speed = float(runtime.linear_speed) * float(STORAGE_LIFT_SPEED_SCALE)
-    fast_travel_speed = float(runtime.linear_speed) * float(STORAGE_TRAVEL_SPEED_SCALE)
-    fast_descend_speed = float(runtime.linear_speed) * float(STORAGE_DESCEND_SPEED_SCALE)
+    fast_uniform_speed = float(runtime.linear_speed) * float(STORAGE_LIFT_SPEED_SCALE)
+    fast_yaw_speed = float(STORAGE_FAST_YAW_SPEED_RADPS)
 
     if runtime.dry_run:
         from support.pose_align import real_pose_to_sim
@@ -331,7 +329,12 @@ def record_episode(
             record=True,
             frame_idx=frame_idx,
             lookup_scene_state=execution_scene_state,
-            lift_speed_mps=fast_lift_speed,
+            approach_speed_mps=fast_uniform_speed,
+            align_speed_mps=fast_uniform_speed,
+            descend_speed_mps=fast_uniform_speed,
+            lift_speed_mps=fast_uniform_speed,
+            angular_speed_radps=fast_yaw_speed,
+            yaw_speed_radps=fast_yaw_speed,
         )
         frames.extend(pick_frames)
         for _ in range(24):
@@ -378,7 +381,12 @@ def record_episode(
             record=True,
             frame_idx=frame_idx,
             lookup_scene_state=execution_scene_state,
-            lift_speed_mps=fast_lift_speed,
+            approach_speed_mps=fast_uniform_speed,
+            align_speed_mps=fast_uniform_speed,
+            descend_speed_mps=fast_uniform_speed,
+            lift_speed_mps=fast_uniform_speed,
+            angular_speed_radps=fast_yaw_speed,
+            yaw_speed_radps=fast_yaw_speed,
         )
         frames.extend(pick_frames)
         runtime.runtime_held_object = plan.object_name
@@ -389,7 +397,9 @@ def record_episode(
             start_frame_idx=frame_idx,
             record=True,
             target_yaw=float(basket_yaw),
-            speed_mps=fast_travel_speed,
+            speed_mps=fast_uniform_speed,
+            angular_speed_radps=fast_yaw_speed,
+            yaw_speed_radps=fast_yaw_speed,
         )
         frames.extend(seg)
         frame_idx += len(seg)
@@ -400,7 +410,9 @@ def record_episode(
             start_frame_idx=frame_idx,
             record=True,
             target_yaw=float(basket_yaw),
-            speed_mps=fast_descend_speed,
+            speed_mps=fast_uniform_speed,
+            angular_speed_radps=fast_yaw_speed,
+            yaw_speed_radps=fast_yaw_speed,
         )
         frames.extend(seg)
         frame_idx += len(seg)
@@ -420,7 +432,9 @@ def record_episode(
             start_frame_idx=frame_idx,
             record=True,
             target_yaw=float(basket_yaw),
-            speed_mps=fast_lift_speed,
+            speed_mps=fast_uniform_speed,
+            angular_speed_radps=fast_yaw_speed,
+            yaw_speed_radps=fast_yaw_speed,
         )
         frames.extend(seg)
     finally:

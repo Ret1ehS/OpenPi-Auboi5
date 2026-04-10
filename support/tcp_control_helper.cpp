@@ -98,6 +98,7 @@ struct Options {
     bool has_target_pose = false;
     bool has_joint_target = false;
     bool daemon = false;
+    double track_time_s = 0.01;
     std::string log_file;
     std::vector<double> target_pose;
     std::vector<double> joint_target;
@@ -480,6 +481,17 @@ std::string trim(const std::string &s)
     while (!r.empty() && (r.front() == ' '))
         r.erase(r.begin());
     return r;
+}
+
+bool parse_pose6(const std::string &line, std::vector<double> &out)
+{
+    out.clear();
+    std::istringstream iss(line);
+    double v = 0.0;
+    while (iss >> v) {
+        out.push_back(v);
+    }
+    return out.size() == 6;
 }
 
 const char *servo_ret_name(int code)

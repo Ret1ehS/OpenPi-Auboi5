@@ -174,6 +174,19 @@ def _quat_to_axis_angle_wxyz(quat_wxyz: np.ndarray) -> np.ndarray:
     return (axis * angle).astype(np.float32)
 
 
+def _axis_angle_to_quat_wxyz(axis_angle: np.ndarray) -> np.ndarray:
+    aa = np.asarray(axis_angle, dtype=np.float64).reshape(3)
+    angle = float(np.linalg.norm(aa))
+    if angle <= 1e-12:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    axis = aa / angle
+    half = 0.5 * angle
+    return np.array(
+        [np.cos(half), axis[0] * np.sin(half), axis[1] * np.sin(half), axis[2] * np.sin(half)],
+        dtype=np.float64,
+    )
+
+
 def _wrap_angle(angle: float) -> float:
     return float(np.arctan2(np.sin(angle), np.cos(angle)))
 
@@ -265,6 +278,31 @@ def compute_delta_actions(
         else:
             actions[idx, :6] = 0.0
             actions[idx, 6] = gripper[idx]
+    return actions
+
+
+def compute_actions_from_saved_states(states: np.ndarray, *, state_mode: str) -> np.ndarray:
+    _ = _normalize_state_mode(state_mode)
+    states = np.asarray(states, dtype=np.float32)
+    num_frames = int(states.shape[0])
+    actions = np.zeros((num_frames, 7), dtype=np.float32)
+    if num_frames <= 0:
+        return actions
+
+    pos = states[:, :3].astype(np.float64)
+    axis_angle = states[:, 3:6].astype(np.float64)
+    grip = states[:, 6].astype(np.float32)
+    eulers = np.stack([quat_to_euler_wxyz(_axis_angle_to_quat_wxyz(aa)) for aa in axis_angle], axis=0)
+
+    for idx in range(num_frames):
+        if idx < num_frames - 1:
+            actions[idx, :3] = (pos[idx + 1] - pos[idx]).astype(np.float32)
+            deulers = np.arctan2(np.sin(eulers[idx + 1] - eulers[idx]), np.cos(eulers[idx + 1] - eulers[idx]))
+            actions[idx, 3:6] = deulers.astype(np.float32)
+            actions[idx, 6] = grip[idx + 1]
+        else:
+            actions[idx, :6] = 0.0
+            actions[idx, 6] = grip[idx]
     return actions
 
 
@@ -1093,7 +1131,7 @@ def prepare_episode_for_save(
                 yaw_saved[out_idx],
                 state_mode=mode,
             )
-        actions = compute_delta_actions(pose6_saved, gripper_saved, yaw_saved, state_mode=mode)
+        actions = compute_actions_from_saved_states(states, state_mode=mode)
         return (
             states,
             actions,
@@ -1169,7 +1207,7 @@ def prepare_episode_for_save(
         main_images[out_idx] = raw_main_images[image_idx]
         wrist_images[out_idx] = raw_wrist_images[image_idx]
 
-    actions = compute_delta_actions(pose6_resampled, gripper_resampled, yaw_resampled, state_mode=mode)
+    actions = compute_actions_from_saved_states(states, state_mode=mode)
     return (
         states,
         actions,

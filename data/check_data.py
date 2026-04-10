@@ -39,6 +39,9 @@ QUAT_NORM_FAIL = 1e-2
 ACTION_ERR_WARN_STRICT = 1e-4
 ACTION_ERR_WARN_ORIENTATION = 1e-3
 ACTION_ERR_FAIL = 1e-3
+CHECK_PASSED_KEY = "check_data_passed"
+CHECKER_VERSION_KEY = "check_data_checker_version"
+CHECKER_VERSION = 1
 
 
 @dataclass
@@ -50,6 +53,14 @@ class EpisodeReport:
     errors: list[str]
     warnings: list[str]
     metrics: dict[str, Any]
+
+
+def read_episode_metadata(ep_dir: Path) -> dict[str, Any]:
+    return json.loads((ep_dir / "metadata.json").read_text(encoding="utf-8"))
+
+
+def write_episode_metadata(ep_dir: Path, metadata: dict[str, Any]) -> None:
+    (ep_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
 def _wrap_angle(angle: float) -> float:
@@ -164,7 +175,7 @@ def image_stream_metrics(arr: np.ndarray, *, saved_fps: float, raw_capture_fps: 
     }
 
 
-def inspect_episode(ep_dir: Path, *, raw_capture_fps: float) -> EpisodeReport:
+def inspect_episode(ep_dir: Path, *, raw_capture_fps: float, force_recheck: bool = False) -> EpisodeReport:
     errors: list[str] = []
     warnings: list[str] = []
     metrics: dict[str, Any] = {}
@@ -189,7 +200,23 @@ def inspect_episode(ep_dir: Path, *, raw_capture_fps: float) -> EpisodeReport:
             metrics={},
         )
 
-    metadata = json.loads((ep_dir / "metadata.json").read_text(encoding="utf-8"))
+    metadata = read_episode_metadata(ep_dir)
+    if not force_recheck and bool(metadata.get(CHECK_PASSED_KEY, False)):
+        n_frames = int(metadata.get("n_frames", 0) or 0)
+        task = metadata.get("task")
+        metrics["task"] = task
+        metrics["n_frames"] = n_frames
+        metrics["skipped_prechecked"] = True
+        return EpisodeReport(
+            episode=ep_dir.name,
+            status="skip",
+            task=task,
+            n_frames=n_frames,
+            errors=[],
+            warnings=["skipped: metadata already marked as passed"],
+            metrics=metrics,
+        )
+
     states = np.load(ep_dir / "states.npy")
     actions = np.load(ep_dir / "actions.npy")
     timestamps = np.load(ep_dir / "timestamps.npy")
@@ -330,6 +357,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Delete failed episodes without interactive confirmation and renumber the remainder.",
     )
+    parser.add_argument(
+        "--force-recheck",
+        action="store_true",
+        help="Ignore metadata pass markers and re-run checks for every episode.",
+    )
     return parser.parse_args()
 
 
@@ -384,6 +416,8 @@ def print_reports(reports: list[EpisodeReport]) -> tuple[int, int, int]:
             ok += 1
         elif report.status == "warn":
             warn += 1
+        elif report.status == "skip":
+            pass
         else:
             fail += 1
 
@@ -403,6 +437,28 @@ def print_reports(reports: list[EpisodeReport]) -> tuple[int, int, int]:
                     f"dup_run={metric['longest_duplicate_run']}"
                 )
     return ok, warn, fail
+
+
+def update_metadata_pass_markers(reports: list[EpisodeReport], data_dir: Path) -> None:
+    for report in reports:
+        ep_dir = data_dir / report.episode
+        meta_path = ep_dir / "metadata.json"
+        if not meta_path.exists():
+            continue
+        try:
+            metadata = read_episode_metadata(ep_dir)
+        except Exception:
+            continue
+
+        if report.status == "ok":
+            metadata[CHECK_PASSED_KEY] = True
+            metadata[CHECKER_VERSION_KEY] = CHECKER_VERSION
+        elif report.status in {"warn", "fail"}:
+            metadata.pop(CHECK_PASSED_KEY, None)
+            metadata.pop(CHECKER_VERSION_KEY, None)
+        else:
+            continue
+        write_episode_metadata(ep_dir, metadata)
 
 
 def should_delete_bad_episodes(*, args: argparse.Namespace, failed_reports: list[EpisodeReport]) -> bool:
@@ -435,12 +491,17 @@ def main() -> int:
     else:
         episode_dirs = collect_episode_dirs(data_dir)
 
-    reports = [inspect_episode(ep_dir, raw_capture_fps=float(args.raw_capture_fps)) for ep_dir in episode_dirs if ep_dir.exists()]
+    reports = [
+        inspect_episode(ep_dir, raw_capture_fps=float(args.raw_capture_fps), force_recheck=bool(args.force_recheck))
+        for ep_dir in episode_dirs
+        if ep_dir.exists()
+    ]
     deleted_episodes: list[str] = []
     rename_log: list[dict[str, str]] = []
 
     ok, warn, fail = print_reports(reports)
     print(f"\nSummary: ok={ok} warn={warn} fail={fail} total={len(reports)}")
+    update_metadata_pass_markers(reports, data_dir)
 
     failed_reports = [report for report in reports if report.status == "fail"]
     if should_delete_bad_episodes(args=args, failed_reports=failed_reports):
@@ -453,10 +514,15 @@ def main() -> int:
                 for item in rename_log:
                     print(f"  {item['from']} -> {item['to']}")
             episode_dirs = collect_episode_dirs(data_dir)
-            reports = [inspect_episode(ep_dir, raw_capture_fps=float(args.raw_capture_fps)) for ep_dir in episode_dirs if ep_dir.exists()]
+            reports = [
+                inspect_episode(ep_dir, raw_capture_fps=float(args.raw_capture_fps), force_recheck=bool(args.force_recheck))
+                for ep_dir in episode_dirs
+                if ep_dir.exists()
+            ]
             print("\nPost-delete check:")
             ok, warn, fail = print_reports(reports)
             print(f"\nSummary: ok={ok} warn={warn} fail={fail} total={len(reports)}")
+            update_metadata_pass_markers(reports, data_dir)
 
     summary = {
         "data_dir": str(data_dir),

@@ -679,7 +679,9 @@ def _execute_servo_segment(
     frame_idx = int(start_frame_idx)
     next_record_deadline = time.monotonic()
     last_record_ts: float | None = None
-    deadline = time.monotonic() + max(0.5, float(timeout_s))
+    per_step_budget_s = 0.08 if record else 0.04
+    stream_budget_s = float(len(pose_targets)) * float(per_step_budget_s) + 5.0
+    deadline = time.monotonic() + max(0.5, float(timeout_s), float(stream_budget_s))
     servo_started = False
     current_semantic_yaw = float(start_yaw if semantic_yaw is None else semantic_yaw)
 
@@ -1261,6 +1263,8 @@ class CollectTaskRuntime:
         record: bool,
         semantic_yaw: float | None = None,
         target_yaw: float | None = None,
+        speed_mps: float | None = None,
+        timeout_s: float | None = None,
     ) -> list[RecordedFrame]:
         effective_semantic_yaw = (
             None
@@ -1273,9 +1277,10 @@ class CollectTaskRuntime:
             target_real,
             gripper=gripper,
             start_frame_idx=start_frame_idx,
-            speed_mps=self.linear_speed,
+            speed_mps=self.linear_speed if speed_mps is None else float(speed_mps),
             target_yaw=target_yaw,
             semantic_yaw=effective_semantic_yaw,
+            timeout_s=DEFAULT_ASYNC_MOVE_TIMEOUT_S if timeout_s is None else float(timeout_s),
             record=record,
             reuse_servo=self.hold_servo_active,
         )

@@ -22,6 +22,7 @@ FORBIDDEN_Y_MIN_M = 0.07
 STORAGE_DROP_X_M = 0.56
 STORAGE_DROP_Y_M = 0.21
 STORAGE_DROP_Z_M = 0.270
+STORAGE_TRAVEL_SPEED_SCALE = 1.6
 
 
 @dataclass
@@ -381,6 +382,7 @@ def record_episode(
             start_frame_idx=frame_idx,
             record=True,
             target_yaw=float(basket_yaw),
+            speed_mps=float(runtime.linear_speed) * float(STORAGE_TRAVEL_SPEED_SCALE),
         )
         frames.extend(seg)
         frame_idx += len(seg)
@@ -410,6 +412,7 @@ def record_episode(
             start_frame_idx=frame_idx,
             record=True,
             target_yaw=float(basket_yaw),
+            speed_mps=float(runtime.linear_speed) * float(STORAGE_TRAVEL_SPEED_SCALE),
         )
         frames.extend(seg)
     finally:

@@ -131,6 +131,16 @@ from task.open_and_close import (
     restore_session as oc_restore_session,
     STACK_PROBABILITY as OC_STACK_PROBABILITY,
 )
+from task.storage import (
+    StorageSession,
+    describe_episode as st_describe_episode,
+    finalize_episode as st_finalize_episode,
+    has_remaining_objects as st_has_remaining_objects,
+    plan_next_episode as st_plan_next_episode,
+    prepare_session as st_prepare_session,
+    record_episode as st_record_episode,
+    restore_session as st_restore_session,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +377,7 @@ def save_collect_state(
     held_object: str | None = None,
     open_close_reference: OpenCloseReference | None = None,
     obstacle_scene: ObstacleScene | None = None,
+    storage_state: dict[str, object] | None = None,
 ) -> None:
     payload = _load_raw_state_payload(data_dir)
     legacy_open_close_reference = _deserialize_open_close_reference(payload.get("open_close_reference"))
@@ -377,12 +388,12 @@ def save_collect_state(
             "reference": _serialize_open_close_reference(legacy_open_close_reference),
         }
     payload.pop("open_close_reference", None)
-    if open_close_reference is None:
+    if open_close_reference is None and storage_state is None:
         payload["object_states"] = scene_state
         payload["color_index"] = int(color_index)
         payload["episode_count"] = int(episode_count)
         payload["held_object"] = _normalize_held_object(held_object)
-    else:
+    elif open_close_reference is not None:
         oc_state: dict[str, object] = {
             "episode_count": int(episode_count),
             "reference": _serialize_open_close_reference(open_close_reference),
@@ -390,6 +401,8 @@ def save_collect_state(
         if obstacle_scene is not None:
             oc_state["obstacles"] = obstacle_scene.to_serializable()
         payload["open_close_state"] = oc_state
+    if storage_state is not None:
+        payload["storage_state"] = storage_state
     path = _state_file_path(data_dir)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
@@ -439,9 +452,31 @@ def load_collect_state(data_dir: Path) -> dict | None:
         color_index = _load_state_counter(payload, "color_index")
         episode_count = _load_state_counter(payload, "episode_count")
         held_object = _normalize_held_object(payload.get("held_object"))
+        storage_state_payload = payload.get("storage_state")
+        storage_state: dict[str, object] | None = None
+        if isinstance(storage_state_payload, dict):
+            storage_scene_raw = storage_state_payload.get("scene_state")
+            storage_scene = load_scene_state(storage_scene_raw) if isinstance(storage_scene_raw, dict) else None
+            storage_next_index = _load_state_counter(storage_state_payload, "next_index")
+            storage_episode_count = _load_state_counter(storage_state_payload, "episode_count")
+            storage_held_object = _normalize_held_object(storage_state_payload.get("held_object"))
+            if storage_scene is not None or storage_next_index is not None or storage_episode_count is not None:
+                storage_state = {
+                    "scene_state": storage_scene or {},
+                    "next_index": 0 if storage_next_index is None else storage_next_index,
+                    "episode_count": 0 if storage_episode_count is None else storage_episode_count,
+                    "held_object": storage_held_object,
+                }
         has_valid_counters = color_index is not None and episode_count is not None
         has_valid_open_close_episode_count = open_close_episode_count is not None
-        if scene_state is None and open_close_reference is None and not has_valid_counters and not has_valid_open_close_episode_count:
+        has_valid_storage_state = storage_state is not None
+        if (
+            scene_state is None
+            and open_close_reference is None
+            and not has_valid_counters
+            and not has_valid_open_close_episode_count
+            and not has_valid_storage_state
+        ):
             return None
         return {
             "scene_state": scene_state or {},
@@ -453,6 +488,7 @@ def load_collect_state(data_dir: Path) -> dict | None:
             "has_valid_open_close_episode_count": has_valid_open_close_episode_count,
             "open_close_reference": open_close_reference,
             "obstacle_scene": obstacle_scene,
+            "storage_state": storage_state,
         }
     except Exception:
         return None
@@ -474,6 +510,19 @@ def clear_open_close_state(data_dir: Path) -> None:
         return
     payload.pop("open_close_state", None)
     payload.pop("open_close_reference", None)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+
+
+def clear_storage_state(data_dir: Path) -> None:
+    path = _state_file_path(data_dir)
+    if not path.exists():
+        return
+    payload = _load_raw_state_payload(data_dir)
+    if not payload:
+        clear_collect_state(data_dir)
+        return
+    payload.pop("storage_state", None)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
 
@@ -1209,18 +1258,30 @@ class CollectTaskRuntime:
         start_frame_idx: int,
         record: bool,
         semantic_yaw: float | None = None,
+        target_yaw: float | None = None,
     ) -> list[RecordedFrame]:
-        return execute_and_record(
+        effective_semantic_yaw = (
+            None
+            if target_yaw is not None and semantic_yaw is None
+            else (self.local_exec_yaw_rad if semantic_yaw is None else float(semantic_yaw))
+        )
+        frames = execute_and_record(
             self.daemon,
             self.cameras,
             target_real,
             gripper=gripper,
             start_frame_idx=start_frame_idx,
             speed_mps=self.linear_speed,
-            semantic_yaw=self.local_exec_yaw_rad if semantic_yaw is None else semantic_yaw,
+            target_yaw=target_yaw,
+            semantic_yaw=effective_semantic_yaw,
             record=record,
             reuse_servo=self.hold_servo_active,
         )
+        if target_yaw is not None:
+            self.local_exec_yaw_rad = float(target_yaw)
+        elif semantic_yaw is not None:
+            self.local_exec_yaw_rad = float(semantic_yaw)
+        return frames
 
     def capture_manual_snapshot(
         self,
@@ -1315,7 +1376,7 @@ def main() -> int:
         return 0
 
     selected_task = str(tui_cfg.task)
-    if selected_task in {"open_and_close", "keyboard_teleop"}:
+    if selected_task in {"open_and_close", "keyboard_teleop", "storage"}:
         tui_cfg.mode = "manual"
         tui_cfg.auto_episodes = 1
     auto_episodes = 0 if tui_cfg.mode == "manual" else int(tui_cfg.auto_episodes)
@@ -1334,7 +1395,7 @@ def main() -> int:
     print(f"  Pose Frame: {get_alignment_mode()}")
     print(f"  Speed:      {LINEAR_SPEED} m/s")
     print(f"  Dry-run:    {args.dry_run}")
-    if selected_task not in {"pick_and_place", "open_and_close", "keyboard_teleop"}:
+    if selected_task not in {"pick_and_place", "open_and_close", "keyboard_teleop", "storage"}:
         print(f"Unsupported task '{selected_task}'.")
         return 1
 
@@ -1345,6 +1406,17 @@ def main() -> int:
         workspace_y_max=WORKSPACE_Y_MAX,
         min_spacing_m=MIN_CUBE_SPACING_M,
         object_height_m=CUBE_HEIGHT_M,
+        rotate_deg_min=ROTATE_ABS_DEG_MIN,
+        rotate_deg_max=ROTATE_ABS_DEG_MAX,
+    )
+    storage_planner_config = PlannerConfig(
+        workspace_x_min=WORKSPACE_X_MIN,
+        workspace_x_max=WORKSPACE_X_MAX,
+        workspace_y_min=WORKSPACE_Y_MIN,
+        workspace_y_max=WORKSPACE_Y_MAX,
+        min_spacing_m=MIN_CUBE_SPACING_M,
+        object_height_m=CUBE_HEIGHT_M,
+        non_rotated_table_place_probability=0.5,
         rotate_deg_min=ROTATE_ABS_DEG_MIN,
         rotate_deg_max=ROTATE_ABS_DEG_MAX,
     )
@@ -1362,6 +1434,10 @@ def main() -> int:
         print(f"Objects:      {list(OBJECT_ORDER)}")
         print("Prompt mode:  auto random ('pick up ...' / 'put ... on ...')")
         print("Task mix:     20% pick / 80% place")
+    elif selected_task == "storage":
+        print(f"Objects:      {list(OBJECT_ORDER)}")
+        print("Prompt mode:  fixed order ('put the ... into storage basket')")
+        print("Task mix:     one pass, sequential storage drop")
     elif selected_task == "keyboard_teleop":
         print("Prompt mode:  manual text prompt")
         print("Task mix:     operator-controlled keyboard teleop")
@@ -1375,12 +1451,22 @@ def main() -> int:
             f"saved state indicates the gripper is still holding '{saved_held_object}'. "
             "Please manually restore the scene and restart with resume=reset."
         )
+    saved_storage_state = saved_state_preview.get("storage_state") if saved_state_preview else None
+    saved_storage_held_object = None
+    if isinstance(saved_storage_state, dict):
+        saved_storage_held_object = _normalize_held_object(saved_storage_state.get("held_object"))
+    if selected_task == "storage" and resume_mode == "continue" and saved_storage_held_object is not None:
+        raise RuntimeError(
+            f"saved storage state indicates the gripper is still holding '{saved_storage_held_object}'. "
+            "Please manually restore the scene and restart with resume=reset."
+        )
 
     cameras: CameraPair | None = None
     daemon = None
     runtime: CollectTaskRuntime | None = None
     pick_session = PickAndPlaceSession(scene_state={})
     open_close_session = OpenCloseSession()
+    storage_session = StorageSession(scene_state={})
     cleanup_state = {"done": False}
 
     def cleanup_collection() -> None:
@@ -1392,6 +1478,9 @@ def main() -> int:
         if runtime is not None and selected_task == "pick_and_place":
             latest_scene_state = runtime.cleanup_scene_state if runtime.cleanup_scene_state is not None else pick_session.scene_state
             held_object = runtime.runtime_held_object
+        elif runtime is not None and selected_task == "storage":
+            latest_scene_state = runtime.cleanup_scene_state if runtime.cleanup_scene_state is not None else storage_session.scene_state
+            held_object = runtime.runtime_held_object
         if selected_task == "pick_and_place" and latest_scene_state:
             save_collect_state(
                 save_dir,
@@ -1399,6 +1488,20 @@ def main() -> int:
                 pick_session.task_index,
                 pick_session.episode_count,
                 held_object=held_object,
+            )
+            print(f"  State saved to {_state_file_path(save_dir)}")
+        elif selected_task == "storage" and latest_scene_state:
+            save_collect_state(
+                save_dir,
+                {},
+                0,
+                0,
+                storage_state={
+                    "scene_state": latest_scene_state,
+                    "next_index": int(storage_session.next_index),
+                    "episode_count": int(storage_session.episode_count),
+                    "held_object": _normalize_held_object(held_object),
+                },
             )
             print(f"  State saved to {_state_file_path(save_dir)}")
         elif selected_task == "open_and_close" and open_close_session.reference is not None:
@@ -1511,6 +1614,12 @@ def main() -> int:
             clear_collect_state(save_dir)
             pick_session = PickAndPlaceSession(scene_state={})
             print("  State cleared. Starting fresh.")
+    elif selected_task == "storage":
+        storage_session, should_clear_storage_state = st_restore_session(saved, resume_mode=resume_mode)
+        if should_clear_storage_state:
+            clear_storage_state(save_dir)
+            storage_session = StorageSession(scene_state={})
+            print("  Storage state cleared. Starting fresh.")
     else:
         open_close_session, should_clear_open_close_state = oc_restore_session(saved, resume_mode=resume_mode)
         if should_clear_open_close_state:
@@ -1553,6 +1662,20 @@ def main() -> int:
             pick_session.task_index,
             pick_session.episode_count,
         )
+    elif selected_task == "storage":
+        st_prepare_session(runtime, storage_session, config=storage_planner_config)
+        save_collect_state(
+            save_dir,
+            {},
+            0,
+            0,
+            storage_state={
+                "scene_state": storage_session.scene_state,
+                "next_index": int(storage_session.next_index),
+                "episode_count": int(storage_session.episode_count),
+                "held_object": None,
+            },
+        )
     else:
         if open_close_session.reference is None:
             set_runtime_alignment(startup_tcp_pose)
@@ -1582,9 +1705,16 @@ def main() -> int:
     if auto_episodes > 0:
         print(f"Auto mode: {auto_episodes} episodes, no pause between episodes.")
     else:
-        print("Manual mode: press ENTER to collect the next random episode.")
+        if selected_task == "storage":
+            print("Manual mode: start once, then the task runs through the remaining objects sequentially.")
+        else:
+            print("Manual mode: press ENTER to collect the next random episode.")
     if selected_task == "pick_and_place":
         print("Task policy: 20% pick / 80% place")
+    elif selected_task == "storage":
+        print("Task policy: fixed order red -> green -> blue -> apple")
+        print("Drop policy: move to basket point while unwinding yaw to baseline")
+        print("Stop policy: task exits automatically after all objects are stored")
     else:
         print("Task policy: each cycle performs open, then close")
         print("Save policy: split into one 'open' episode and one 'close' episode")
@@ -1596,7 +1726,7 @@ def main() -> int:
             current_episode_count = (
                 pick_session.episode_count
                 if selected_task == "pick_and_place"
-                else open_close_session.episode_count
+                else (storage_session.episode_count if selected_task == "storage" else open_close_session.episode_count)
             )
             if 0 < max_ep <= current_episode_count:
                 print(f"\nReached {current_episode_count} episodes. Done.")
@@ -1611,6 +1741,17 @@ def main() -> int:
             if selected_task == "pick_and_place":
                 plan = pp_plan_next_episode(pick_session, config=planner_config)
                 pp_describe_episode(plan, episode_count=pick_session.episode_count)
+            elif selected_task == "storage":
+                if not st_has_remaining_objects(storage_session):
+                    print(f"\nAll storage objects completed after {storage_session.episode_count} episodes.")
+                    break
+                plan = st_plan_next_episode(storage_session)
+                remaining_after_save = max(0, len(OBJECT_ORDER) - (storage_session.next_index + 1))
+                st_describe_episode(
+                    plan,
+                    episode_count=storage_session.episode_count,
+                    remaining_count=remaining_after_save,
+                )
             else:
                 cycle_plan = oc_plan_cycle(
                     runtime,
@@ -1631,24 +1772,35 @@ def main() -> int:
             if auto_episodes > 0:
                 if selected_task == "pick_and_place":
                     print(f"  Auto: recording ({pick_session.episode_count + 1}/{auto_episodes})")
+                elif selected_task == "storage":
+                    print(
+                        "  Auto: recording storage episode "
+                        f"{storage_session.episode_count + 1}/{len(OBJECT_ORDER)}"
+                    )
                 else:
                     print(
                         "  Auto: recording cycle -> episodes "
                         f"{open_close_session.episode_count + 1}-{open_close_session.episode_count + 2}/{auto_episodes}"
                     )
             else:
-                prompt_text = (
-                    "  Press ENTER to record this cycle, or q to quit: "
-                    if selected_task == "open_and_close"
-                    else "  Press ENTER to record this episode, or q to quit: "
-                )
-                cmd = input(prompt_text).strip().lower()
-                if cmd in QUIT_TOKENS:
-                    print("Exit requested.")
-                    break
-                if cmd:
-                    print(f"Unsupported input '{cmd}', exiting.")
-                    break
+                if selected_task == "storage":
+                    print(
+                        "  Storage: recording next object automatically "
+                        f"({storage_session.next_index + 1}/{len(OBJECT_ORDER)})"
+                    )
+                else:
+                    prompt_text = (
+                        "  Press ENTER to record this cycle, or q to quit: "
+                        if selected_task == "open_and_close"
+                        else "  Press ENTER to record this episode, or q to quit: "
+                    )
+                    cmd = input(prompt_text).strip().lower()
+                    if cmd in QUIT_TOKENS:
+                        print("Exit requested.")
+                        break
+                    if cmd:
+                        print(f"Unsupported input '{cmd}', exiting.")
+                        break
 
             if not args.dry_run:
                 runtime.return_home("pre-episode return home")
@@ -1667,6 +1819,16 @@ def main() -> int:
                     state_mode=collect_state_mode,
                 )
                 pp_finalize_episode(runtime, pick_session, recorded)
+            elif selected_task == "storage":
+                recorded = st_record_episode(runtime, storage_session, plan)
+                save_episode(
+                    recorded.frames,
+                    save_dir,
+                    recorded.plan.prompt,
+                    save_fps=save_fps,
+                    state_mode=collect_state_mode,
+                )
+                st_finalize_episode(runtime, storage_session, recorded)
             else:
                 recorded_cycle = oc_record_cycle(runtime, open_close_session, cycle_plan)
                 save_episode(
@@ -1695,6 +1857,19 @@ def main() -> int:
                     pick_session.task_index,
                     pick_session.episode_count,
                 )
+            elif selected_task == "storage":
+                save_collect_state(
+                    save_dir,
+                    {},
+                    0,
+                    0,
+                    storage_state={
+                        "scene_state": storage_session.scene_state,
+                        "next_index": int(storage_session.next_index),
+                        "episode_count": int(storage_session.episode_count),
+                        "held_object": None,
+                    },
+                )
             else:
                 save_collect_state(
                     save_dir,
@@ -1709,7 +1884,7 @@ def main() -> int:
         stopped_episode_count = (
             pick_session.episode_count
             if selected_task == "pick_and_place"
-            else open_close_session.episode_count
+            else (storage_session.episode_count if selected_task == "storage" else open_close_session.episode_count)
         )
         print(f"\n\nCollection stopped after {stopped_episode_count} episodes.")
     except RuntimeError as exc:

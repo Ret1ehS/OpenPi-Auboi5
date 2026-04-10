@@ -116,7 +116,7 @@ class CollectTUIConfig:
     mode: str              # "manual" | "auto"
     auto_episodes: int
     resume_mode: str       # "continue" | "reset"
-    task: str              # "pick_and_place" | "open_and_close" | "keyboard_teleop"
+    task: str              # "pick_and_place" | "open_and_close" | "keyboard_teleop" | "storage"
     save_fps: int          # 30 | 50
     state_mode: str        # "yaw"
     quit: bool = False
@@ -489,13 +489,13 @@ def _snapshot_collect_config(rows: list[MenuRow]) -> CollectTUIConfig:
 def _collect_disabled_labels(rows: list[MenuRow]) -> set[str]:
     disabled: set[str] = set()
     task = _get_toggle(rows, "Task")
-    if _get_toggle(rows, "Mode") != "auto" or task in {"open_and_close", "keyboard_teleop"}:
+    if _get_toggle(rows, "Mode") != "auto" or task in {"open_and_close", "keyboard_teleop", "storage"}:
         disabled.add("Auto Episodes")
     return disabled
 
 
 def _is_manual_locked_task(rows: list[MenuRow]) -> bool:
-    return _get_toggle(rows, "Task") in {"open_and_close", "keyboard_teleop"}
+    return _get_toggle(rows, "Task") in {"open_and_close", "keyboard_teleop", "storage"}
 
 
 def _enforce_collect_task_constraints(rows: list[MenuRow]) -> None:
@@ -542,8 +542,8 @@ def run_collect_tui_config(
         ToggleItem("Save FPS", ["30", "50"], selected=_choice_index(["30", "50"], str(default_save_fps), 0)),
         ToggleItem(
             "Task",
-            ["pick_and_place", "open_and_close", "keyboard_teleop"],
-            selected=_choice_index(["pick_and_place", "open_and_close", "keyboard_teleop"], default_task, 0),
+            ["pick_and_place", "open_and_close", "keyboard_teleop", "storage"],
+            selected=_choice_index(["pick_and_place", "open_and_close", "keyboard_teleop", "storage"], default_task, 0),
         ),
         TextItem("Auto Episodes", str(max(1, int(default_auto_episodes)))),
         SeparatorItem(),

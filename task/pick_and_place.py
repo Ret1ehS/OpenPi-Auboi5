@@ -938,6 +938,7 @@ def execute_pick_step(
     record: bool,
     frame_idx: int,
     lookup_scene_state: dict[str, dict[str, Any]],
+    lift_speed_mps: float | None = None,
 ):
     target_xy = np.asarray(step.xy, dtype=np.float64).reshape(2)
     target_z = float(runtime.z_for_pick_level(step.level))
@@ -1011,6 +1012,7 @@ def execute_pick_step(
         gripper=0.0,
         start_frame_idx=frame_idx,
         record=record,
+        speed_mps=lift_speed_mps,
     )
     if record:
         step_frames.extend(seg)

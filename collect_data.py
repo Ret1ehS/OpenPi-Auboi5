@@ -665,7 +665,7 @@ def _execute_servo_segment(
     start_snap = get_robot_snapshot()
     start_real = np.asarray(start_snap.tcp_pose, dtype=np.float64).reshape(6).copy()
     start_joint_q = np.asarray(start_snap.joint_q, dtype=np.float64).reshape(-1)
-    start_yaw = _require_yaw_readback(start_joint_q, context=f"{label} start snapshot")
+    start_yaw = float(_wrap_angle(start_real[5]))
     pose_targets, joint_targets = _build_servo_pose_targets(
         start_real,
         target_real,
@@ -746,13 +746,14 @@ def _execute_servo_segment(
             snap = get_robot_snapshot()
             actual_real = np.asarray(snap.tcp_pose, dtype=np.float64).reshape(6).copy()
             joint_q = np.asarray(snap.joint_q, dtype=np.float64).reshape(-1)
-            actual_yaw = _require_yaw_readback(
+            actual_yaw_readback = _require_yaw_readback(
                 joint_q,
                 context=f"{label} final hold snapshot",
             )
+            actual_tcp_yaw = float(_wrap_angle(actual_real[5]))
             yaw_ok = (
                 target_yaw is None
-                or abs(_wrap_angle(actual_yaw - float(target_yaw))) <= DEFAULT_YAW_EXEC_TOL_RAD
+                or abs(_wrap_angle(actual_tcp_yaw - float(target_yaw))) <= DEFAULT_YAW_EXEC_TOL_RAD
             )
             if _pose_close(actual_real, target_real) and yaw_ok:
                 force_final_record = (
@@ -766,7 +767,8 @@ def _execute_servo_segment(
                     f"{label} timed out waiting for target "
                     f"(target={np.round(target_real, 5).tolist()}, actual={np.round(actual_real, 5).tolist()}, "
                     f"target_yaw={None if target_yaw is None else round(float(target_yaw), 6)}, "
-                    f"actual_yaw={round(actual_yaw, 6)})"
+                    f"actual_tcp_yaw={round(actual_tcp_yaw, 6)}, "
+                    f"actual_yaw_readback={round(actual_yaw_readback, 6)})"
                 )
             if target_yaw is not None:
                 current_semantic_yaw = float(target_yaw)

@@ -23,7 +23,8 @@ STORAGE_DROP_X_M = 0.56
 STORAGE_DROP_Y_M = 0.21
 STORAGE_DROP_Z_M = 0.270
 STORAGE_TRAVEL_SPEED_SCALE = 3.0
-STORAGE_LIFT_SPEED_SCALE = 2.0
+STORAGE_LIFT_SPEED_SCALE = 3.0
+STORAGE_DESCEND_SPEED_SCALE = 3.0
 
 
 @dataclass
@@ -315,6 +316,9 @@ def record_episode(
         float(plan.drop_z),
         float(basket_yaw),
     )
+    fast_lift_speed = float(runtime.linear_speed) * float(STORAGE_LIFT_SPEED_SCALE)
+    fast_travel_speed = float(runtime.linear_speed) * float(STORAGE_TRAVEL_SPEED_SCALE)
+    fast_descend_speed = float(runtime.linear_speed) * float(STORAGE_DESCEND_SPEED_SCALE)
 
     if runtime.dry_run:
         from support.pose_align import real_pose_to_sim
@@ -327,7 +331,7 @@ def record_episode(
             record=True,
             frame_idx=frame_idx,
             lookup_scene_state=execution_scene_state,
-            lift_speed_mps=float(runtime.linear_speed) * float(STORAGE_LIFT_SPEED_SCALE),
+            lift_speed_mps=fast_lift_speed,
         )
         frames.extend(pick_frames)
         for _ in range(24):
@@ -374,7 +378,7 @@ def record_episode(
             record=True,
             frame_idx=frame_idx,
             lookup_scene_state=execution_scene_state,
-            lift_speed_mps=float(runtime.linear_speed) * float(STORAGE_LIFT_SPEED_SCALE),
+            lift_speed_mps=fast_lift_speed,
         )
         frames.extend(pick_frames)
         runtime.runtime_held_object = plan.object_name
@@ -385,7 +389,7 @@ def record_episode(
             start_frame_idx=frame_idx,
             record=True,
             target_yaw=float(basket_yaw),
-            speed_mps=float(runtime.linear_speed) * float(STORAGE_TRAVEL_SPEED_SCALE),
+            speed_mps=fast_travel_speed,
         )
         frames.extend(seg)
         frame_idx += len(seg)
@@ -396,6 +400,7 @@ def record_episode(
             start_frame_idx=frame_idx,
             record=True,
             target_yaw=float(basket_yaw),
+            speed_mps=fast_descend_speed,
         )
         frames.extend(seg)
         frame_idx += len(seg)
@@ -415,7 +420,7 @@ def record_episode(
             start_frame_idx=frame_idx,
             record=True,
             target_yaw=float(basket_yaw),
-            speed_mps=float(runtime.linear_speed) * float(STORAGE_LIFT_SPEED_SCALE),
+            speed_mps=fast_lift_speed,
         )
         frames.extend(seg)
     finally:

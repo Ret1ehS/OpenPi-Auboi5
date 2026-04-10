@@ -141,10 +141,18 @@ def restore_session(
     raw_storage_state = saved.get("storage_state") if isinstance(saved, dict) else None
 
     if isinstance(raw_storage_state, dict):
+        if resume_mode == "reset":
+            print("\n  Found saved storage state. reset selected, so it will be cleared.")
+            should_clear_saved_state = True
+            return session, should_clear_saved_state
+
         raw_scene_state = raw_storage_state.get("scene_state", {})
         normalized_state = load_scene_state(raw_scene_state) if isinstance(raw_scene_state, dict) else None
         if normalized_state is None:
-            raise RuntimeError("saved storage scene state is invalid")
+            raise RuntimeError(
+                "saved storage scene state is invalid. "
+                "Restart with resume=reset to clear the broken storage state."
+            )
 
         next_index = int(raw_storage_state.get("next_index", 0))
         episode_count = int(raw_storage_state.get("episode_count", 0))
@@ -158,14 +166,11 @@ def restore_session(
                 f"    {name}: xy=({xy[0]:.4f}, {xy[1]:.4f}), "
                 f"is_rotate={bool(state['is_rotate'])}, deg={float(state['deg']):.1f}"
             )
-        if resume_mode == "reset":
-            should_clear_saved_state = True
-        else:
-            session.scene_state = normalized_state
-            session.next_index = max(0, min(next_index, len(OBJECT_ORDER)))
-            session.episode_count = max(0, episode_count)
-            session.skip_prep = True
-            print("  Resuming storage task from saved state.")
+        session.scene_state = normalized_state
+        session.next_index = max(0, min(next_index, len(OBJECT_ORDER)))
+        session.episode_count = max(0, episode_count)
+        session.skip_prep = True
+        print("  Resuming storage task from saved state.")
     elif resume_mode == "continue":
         print("\n  Resume selected, but no saved storage state exists. Starting fresh.")
 

@@ -187,11 +187,14 @@ class TrajectoryExecutor:
         def _plan_from_item(item):
             nonlocal servo_active
             tcp_deltas, submitted_observed_pose = item
-            _ = submitted_observed_pose
             snapshot = get_robot_snapshot()
-            # Match the earlier stable behavior: each new chunk integrates
-            # from the current live robot pose at execution time.
-            start_sim = real_pose_to_sim(snapshot.tcp_pose)
+            if submitted_observed_pose is not None:
+                # Keep chunk planning anchored to the exact pose that produced
+                # this observation, so policy input and execution start share
+                # the same semantic state.
+                start_sim = np.asarray(submitted_observed_pose, dtype=np.float64).reshape(6).copy()
+            else:
+                start_sim = real_pose_to_sim(snapshot.tcp_pose)
 
             if snapshot.collision or not snapshot.within_safety_limits:
                 result = TrackChunkResult(

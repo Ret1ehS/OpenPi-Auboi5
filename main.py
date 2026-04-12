@@ -3,16 +3,16 @@
 Main entrypoint for the Jetson-side real-robot OpenPI workflow.
 
 Architecture:
-  - Main thread: asynchronous chunk inference (get_obs -> infer -> retime -> submit)
-  - Executor thread: runs a fixed-rate servo loop and fuses overlapping future pose targets
+  - Main thread: low-watermark asynchronous chunk inference (get_obs -> infer -> retime -> submit)
+  - Executor thread: runs a fixed-rate servo loop against a future action queue keyed by control tick
   - Gripper state change: flush future motion, execute TCP prefix, wait for gripper, re-infer
 
 Inference loop:
   get_obs -> infer -> extract TCP(6D) euler deltas + gripper
-    -> take the first 10 action intervals
+    -> take the first action intervals
     -> retime from the observation pose to servo-rate future targets
-    -> discard elapsed targets that are already stale by inference completion
-    -> fuse overlapping future targets with previously-submitted chunks
+    -> map each future target to a control tick relative to the observation tick
+    -> aggregate only overlapping same-tick targets with buffered future motion
     -> keep observing and inferring while execution continues
 """
 
@@ -39,9 +39,12 @@ GRIPPER_THRESHOLD = 0.6
 MAX_EXEC_ACTION_INTERVALS = 20
 NATIVE_INTERP_FACTOR = 5  # 20 intervals -> 100 actions in native mode
 STATE_MODE_YAW = "yaw"
-TEMPORAL_ENSEMBLE_DECAY = 0.6
 MAX_CANDIDATES_PER_TICK = 4
 EXECUTOR_IDLE_WAIT_S = 0.05
+ASYNC_AGGREGATE_OLD_WEIGHT = 0.3
+ASYNC_AGGREGATE_NEW_WEIGHT = 0.7
+ASYNC_QUEUE_REFILL_RATIO = 0.6
+ASYNC_MIN_REFILL_STEPS = 25
 
 
 @dataclass
@@ -55,7 +58,7 @@ class PoseCandidate:
 class ChunkSubmission:
     plan: Any
     snapshot: Any
-    elapsed_steps: int
+    observation_tick: int
     generation: int
     submit_ts: float
 
@@ -417,7 +420,7 @@ class TrajectoryExecutor:
 
 
 class ParallelTrajectoryExecutor:
-    """Background thread that executes fused future pose targets at a fixed control rate."""
+    """Background thread that executes a future TCP pose queue at a fixed control rate."""
 
     def __init__(
         self,
@@ -427,7 +430,7 @@ class ParallelTrajectoryExecutor:
     ):
         self._execute = execute
         self._max_speed_mps = max_speed_mps
-        self._queue: queue.Queue = queue.Queue(maxsize=8)
+        self._queue: queue.Queue = queue.Queue(maxsize=16)
         self._sentinel = object()
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -472,11 +475,28 @@ class ParallelTrajectoryExecutor:
     def is_idle(self) -> bool:
         return self._idle.is_set()
 
-    def submit(self, plan, snapshot, *, elapsed_steps: int, generation: int) -> None:
+    def get_progress(self) -> dict[str, int | float | bool]:
+        with self._lock:
+            current_tick = int(self._current_tick)
+            max_future_tick = max(self._future_candidates.keys(), default=current_tick)
+            buffered_steps = max(0, max_future_tick - current_tick)
+            control_dt_s = float(self._control_dt_s)
+        pending_submissions = max(0, self._queue.qsize())
+        return {
+            "current_tick": current_tick,
+            "max_future_tick": int(max_future_tick),
+            "buffered_steps": int(buffered_steps),
+            "buffered_time_s": float(buffered_steps * control_dt_s),
+            "control_dt_s": control_dt_s,
+            "pending_submissions": int(pending_submissions),
+            "idle": bool(self._idle.is_set()),
+        }
+
+    def submit(self, plan, snapshot, *, observation_tick: int, generation: int) -> None:
         item = ChunkSubmission(
             plan=plan,
             snapshot=snapshot,
-            elapsed_steps=max(0, int(elapsed_steps)),
+            observation_tick=max(0, int(observation_tick)),
             generation=int(generation),
             submit_ts=time.monotonic(),
         )
@@ -524,31 +544,33 @@ class ParallelTrajectoryExecutor:
             self._idle.set()
 
     @staticmethod
-    def _fuse_pose_candidates(candidates: list[PoseCandidate], fallback_pose: np.ndarray) -> np.ndarray:
+    def _aggregate_pose_candidates(candidates: list[PoseCandidate], fallback_pose: np.ndarray) -> np.ndarray:
         if not candidates:
             return np.asarray(fallback_pose, dtype=np.float64).reshape(6).copy()
 
         ordered = candidates[-MAX_CANDIDATES_PER_TICK:]
-        weights = np.array(
-            [TEMPORAL_ENSEMBLE_DECAY ** float(len(ordered) - 1 - idx) for idx in range(len(ordered))],
-            dtype=np.float64,
-        )
-        weights /= np.sum(weights)
-        poses = np.stack([np.asarray(item.pose_sim, dtype=np.float64).reshape(6) for item in ordered], axis=0)
-
-        fused = np.asarray(fallback_pose, dtype=np.float64).reshape(6).copy()
-        fused[:3] = np.sum(poses[:, :3] * weights[:, None], axis=0)
-        for axis in range(3, 6):
-            fused[axis] = float(
-                np.arctan2(
-                    np.sum(weights * np.sin(poses[:, axis])),
-                    np.sum(weights * np.cos(poses[:, axis])),
-                )
+        fused = np.asarray(ordered[0].pose_sim, dtype=np.float64).reshape(6).copy()
+        for item in ordered[1:]:
+            pose = np.asarray(item.pose_sim, dtype=np.float64).reshape(6)
+            fused[:3] = (
+                ASYNC_AGGREGATE_OLD_WEIGHT * fused[:3]
+                + ASYNC_AGGREGATE_NEW_WEIGHT * pose[:3]
             )
+            for axis in range(3, 6):
+                fused[axis] = float(
+                    np.arctan2(
+                        ASYNC_AGGREGATE_OLD_WEIGHT * np.sin(fused[axis])
+                        + ASYNC_AGGREGATE_NEW_WEIGHT * np.sin(pose[axis]),
+                        ASYNC_AGGREGATE_OLD_WEIGHT * np.cos(fused[axis])
+                        + ASYNC_AGGREGATE_NEW_WEIGHT * np.cos(pose[axis]),
+                    )
+                )
         return fused
 
-    def _ingest_submission(self, submission: ChunkSubmission) -> int:
+    def _ingest_submission(self, submission: ChunkSubmission) -> tuple[int, int]:
         plan = submission.plan
+        accepted = 0
+        stale = 0
         with self._lock:
             self._latest_snapshot = submission.snapshot
             self._control_dt_s = float(plan.control_dt_s)
@@ -556,11 +578,12 @@ class ParallelTrajectoryExecutor:
                 self._current_pose_sim = np.asarray(plan.start_pose, dtype=np.float64).reshape(6).copy()
                 self._expected_pose = self._current_pose_sim.copy()
 
-            start_idx = min(max(int(submission.elapsed_steps), 0), len(plan.steps))
-            start_tick = int(self._current_tick) + 1
-            remaining = plan.steps[start_idx:]
-            for offset, step in enumerate(remaining):
-                tick = start_tick + offset
+            base_tick = int(submission.observation_tick)
+            for offset, step in enumerate(plan.steps, start=1):
+                tick = base_tick + offset
+                if tick <= self._current_tick:
+                    stale += 1
+                    continue
                 bucket = self._future_candidates.setdefault(tick, [])
                 bucket.append(
                     PoseCandidate(
@@ -571,11 +594,12 @@ class ParallelTrajectoryExecutor:
                 )
                 if len(bucket) > MAX_CANDIDATES_PER_TICK:
                     del bucket[:-MAX_CANDIDATES_PER_TICK]
+                accepted += 1
 
             for stale_tick in [tick for tick in self._future_candidates.keys() if tick <= self._current_tick]:
                 self._future_candidates.pop(stale_tick, None)
 
-        return max(0, len(plan.steps) - start_idx)
+        return accepted, stale
 
     def _loop(self) -> None:
         from support.tcp_control import (
@@ -640,8 +664,8 @@ class ParallelTrajectoryExecutor:
                             _finish_servo()
                             return
                         assert isinstance(item, ChunkSubmission)
-                        remaining = self._ingest_submission(item)
-                        if remaining > 0:
+                        accepted, _stale = self._ingest_submission(item)
+                        if accepted > 0:
                             self._idle.clear()
                     if self._current_pose_sim is not None and time.monotonic() > next_send_ts + max(self._control_dt_s, 1e-6):
                         next_send_ts = time.monotonic()
@@ -663,7 +687,7 @@ class ParallelTrajectoryExecutor:
                     self._update_idle_flag()
                     continue
 
-                target_pose_sim = self._fuse_pose_candidates(candidates, current_pose_sim)
+                target_pose_sim = self._aggregate_pose_candidates(candidates, current_pose_sim)
                 target_pose_real = sim_pose_to_real(target_pose_sim)
 
                 if self._execute:
@@ -709,7 +733,7 @@ class ParallelTrajectoryExecutor:
                     _set_last_result(
                         TrackChunkResult(
                             ok=True,
-                            reason="streaming fused step",
+                            reason="streaming queued step" if candidates else "holding current pose",
                             snapshot=snapshot,
                             start_pose=current_pose_sim,
                             final_pose=target_pose_sim,
@@ -1050,6 +1074,7 @@ def main() -> int:
         obs_builder.set_gripper_open_scalar(1.0)
         step = 0
         last_gripper_state: int | None = None
+        last_submitted_step_budget = ASYNC_MIN_REFILL_STEPS
 
         # --- Optional video recording (background thread) ---
         _rec_stop = threading.Event()
@@ -1125,16 +1150,33 @@ def main() -> int:
 
         try:
             while True:
+                queue_state_before_obs = executor.get_progress()
+                if queue_state_before_obs["pending_submissions"] > 0:
+                    time.sleep(0.002)
+                    continue
+                refill_threshold_steps = max(
+                    ASYNC_MIN_REFILL_STEPS,
+                    int(round(float(last_submitted_step_budget) * ASYNC_QUEUE_REFILL_RATIO)),
+                )
+                if queue_state_before_obs["buffered_steps"] > refill_threshold_steps:
+                    time.sleep(
+                        min(
+                            max(float(queue_state_before_obs["control_dt_s"]), 0.002),
+                            0.01,
+                        )
+                    )
+                    continue
+
                 loop_start = time.monotonic()
                 step += 1
                 aligned_obs = obs_builder.build_observation(prompt)
                 obs = aligned_obs.obs
-                obs_ready_ts = time.monotonic()
+                obs_queue_state = executor.get_progress()
+                observation_tick = int(obs_queue_state["current_tick"])
 
                 t_infer = time.monotonic()
                 action_result = policy.infer(obs)
-                infer_done_ts = time.monotonic()
-                infer_time = infer_done_ts - t_infer
+                infer_time = time.monotonic() - t_infer
 
                 raw_actions = np.asarray(action_result["actions"], dtype=np.float64)
                 if raw_actions.ndim == 1:
@@ -1151,7 +1193,7 @@ def main() -> int:
                 tcp_deltas[:, 3:5] = exec_actions[:, 3:5]
                 tcp_deltas[:, 5] = exec_actions[:, 5]
 
-                # Native mode: linearly interpolate 10 intervals -> 50 actions
+                # Native mode: linearly interpolate 20 intervals -> 100 actions
                 if is_native_speed:
                     interp_deltas = np.repeat(
                         tcp_deltas / float(NATIVE_INTERP_FACTOR),
@@ -1185,11 +1227,10 @@ def main() -> int:
                     start_pose_sim=aligned_obs.aligned_tcp_pose_sim,
                     max_linear_speed_mps=effective_speed,
                 )
-                elapsed_steps = 0
-                if plan.steps:
-                    elapsed_steps = max(0, int((infer_done_ts - obs_ready_ts) / float(plan.control_dt_s)))
-                    elapsed_steps = min(elapsed_steps, len(plan.steps))
-                remaining_steps = max(0, len(plan.steps) - elapsed_steps)
+                submit_queue_state = executor.get_progress()
+                stale_steps = max(0, int(submit_queue_state["current_tick"]) - observation_tick)
+                stale_steps = min(stale_steps, len(plan.steps))
+                remaining_steps = max(0, len(plan.steps) - stale_steps)
                 _append_infer_log(
                     {
                         "event": "inference_chunk",
@@ -1203,8 +1244,13 @@ def main() -> int:
                         "prefix_integral": [float(v) for v in prefix_integral.tolist()],
                         "prefix_abs_integral": [float(v) for v in prefix_abs_integral.tolist()],
                         "retimed_step_count": int(len(plan.steps)),
-                        "discarded_elapsed_steps": int(elapsed_steps),
+                        "observation_tick": int(observation_tick),
+                        "stale_steps_before_submit": int(stale_steps),
                         "remaining_step_count": int(remaining_steps),
+                        "queue_refill_threshold_steps": int(refill_threshold_steps),
+                        "queue_buffered_steps_before_obs": int(queue_state_before_obs["buffered_steps"]),
+                        "queue_buffered_steps_at_obs": int(obs_queue_state["buffered_steps"]),
+                        "queue_buffered_steps_before_submit": int(submit_queue_state["buffered_steps"]),
                         "gripper_changed": bool(scheduled_gripper_state is not None),
                         "scheduled_gripper_idx": None if scheduled_gripper_idx is None else int(scheduled_gripper_idx),
                         "scheduled_gripper_state": None if scheduled_gripper_state is None else int(scheduled_gripper_state),
@@ -1215,7 +1261,7 @@ def main() -> int:
                 if remaining_steps <= 0:
                     print(
                         f"  [{step:4d}] Chunk expired before execution "
-                        f"(retimed={len(plan.steps)} discarded={elapsed_steps}), re-inferring..."
+                        f"(retimed={len(plan.steps)} stale={stale_steps}), re-inferring..."
                     )
                     continue
 
@@ -1227,8 +1273,22 @@ def main() -> int:
                 executor.submit(
                     plan,
                     aligned_obs.robot_snapshot,
-                    elapsed_steps=elapsed_steps,
+                    observation_tick=observation_tick,
                     generation=step,
+                )
+                last_submitted_step_budget = max(1, len(plan.steps))
+                post_submit_queue_state = executor.get_progress()
+                _append_infer_log(
+                    {
+                        "event": "chunk_submit",
+                        "step": int(step),
+                        "prompt": prompt,
+                        "observation_tick": int(observation_tick),
+                        "submitted_step_count": int(len(plan.steps)),
+                        "remaining_step_count": int(remaining_steps),
+                        "queue_buffered_steps_after_submit": int(post_submit_queue_state["buffered_steps"]),
+                        "queue_max_future_tick_after_submit": int(post_submit_queue_state["max_future_tick"]),
+                    }
                 )
 
                 if gripper_changed:
@@ -1236,7 +1296,7 @@ def main() -> int:
                     print(
                         f"  [{step:4d}] Gripper {state_name} scheduled at chunk index "
                         f"{scheduled_gripper_idx} within first {len(exec_actions)} intervals, "
-                        f"submitting {remaining_steps} fused servo steps and waiting for prefix completion..."
+                        f"submitting {remaining_steps} queued servo steps and waiting for prefix completion..."
                     )
                     executor.wait_until_idle()
                     last_res = executor.last_result
@@ -1247,8 +1307,9 @@ def main() -> int:
                         _apply_gripper_command(step, int(scheduled_gripper_state))
                 else:
                     print(
-                        f"  [{step:4d}] Async submit: {remaining_steps} fused servo steps "
-                        f"(discarded {elapsed_steps}), continuing to next observation..."
+                        f"  [{step:4d}] Async submit: {remaining_steps} queued servo steps "
+                        f"(stale {stale_steps}, buffered={post_submit_queue_state['buffered_steps']}), "
+                        f"continuing to next observation..."
                     )
 
                 loop_time = time.monotonic() - loop_start

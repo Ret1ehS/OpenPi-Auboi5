@@ -499,6 +499,8 @@ class ParallelTrajectoryExecutor:
             generation=int(generation),
             submit_ts=time.monotonic(),
         )
+        with self._lock:
+            self._last_result = None
         self._idle.clear()
         while True:
             try:
@@ -524,6 +526,11 @@ class ParallelTrajectoryExecutor:
         return self._idle.wait(timeout=timeout)
 
     def reset_state(self) -> None:
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
         with self._lock:
             self._expected_pose = None
             self._last_result = None
@@ -533,6 +540,7 @@ class ParallelTrajectoryExecutor:
             self._control_dt_s = 0.01
             self._latest_snapshot = None
             self._future_candidates.clear()
+        self._idle.set()
 
     def _update_idle_flag(self) -> None:
         with self._lock:
@@ -1148,6 +1156,14 @@ def main() -> int:
 
         try:
             while True:
+                last_res = executor.last_result
+                if last_res and not last_res.ok:
+                    print(f"    Track error: {last_res.reason}")
+                    executor.clear_pending()
+                    executor.reset_state()
+                    time.sleep(0.05)
+                    continue
+
                 queue_state_before_obs = executor.get_progress()
                 if queue_state_before_obs["buffered_steps"] > ASYNC_REFILL_THRESHOLD_STEPS:
                     time.sleep(
@@ -1316,10 +1332,6 @@ def main() -> int:
                     f"gripper={gripper_str}  "
                     f"loop={loop_time:.3f}s"
                 )
-
-                if last_res and not last_res.ok:
-                    print(f"    Track error: {last_res.reason}")
-                    executor.reset_state()
 
                 if gripper_changed:
                     continue

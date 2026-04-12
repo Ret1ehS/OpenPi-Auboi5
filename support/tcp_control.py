@@ -55,6 +55,8 @@ DEFAULT_SPEED_FRACTION = 1.0
 DEFAULT_TRACK_CONTROL_DT_S = 0.01
 DEFAULT_TCP_LINEAR_SPEED_MPS = 0.05
 DEFAULT_TCP_ANGULAR_SPEED_RADPS = 0.60
+CONSTANT_SPEED_CORNER_MIN_SCALE = 0.35
+CONSTANT_SPEED_CORNER_RAMP_STEPS = 8
 
 RESET_ERR_M = 0.10
 DEFAULT_Z_MIN_M = 0.180  # TCP minimum z height (180 mm), clip anything below
@@ -1154,6 +1156,7 @@ def retime_tcp_action_chunk(
             else float("inf")
         )
         carry_linear_dist = 0.0
+        prev_linear_dir: np.ndarray | None = None
 
         def _interp_pose(start_pose: np.ndarray, end_pose: np.ndarray, frac: float) -> np.ndarray:
             frac = float(np.clip(frac, 0.0, 1.0))
@@ -1186,16 +1189,43 @@ def retime_tcp_action_chunk(
                 dtype=np.float64,
             )
             segment_angular_dist = float(np.linalg.norm(angle_delta))
+            segment_linear_dir: np.ndarray | None = None
+            if segment_linear_dist > 1e-12:
+                segment_linear_dir = (segment_end[:3] - segment_start[:3]) / segment_linear_dist
+
+            start_speed_scale = 1.0
+            if prev_linear_dir is not None and segment_linear_dir is not None:
+                cos_turn = float(np.clip(np.dot(prev_linear_dir, segment_linear_dir), -1.0, 1.0))
+                turn_mag = float(np.sqrt(max(0.0, 0.5 * (1.0 - cos_turn))))
+                start_speed_scale = float(
+                    1.0 - turn_mag * (1.0 - float(CONSTANT_SPEED_CORNER_MIN_SCALE))
+                )
+                start_speed_scale = float(
+                    np.clip(start_speed_scale, float(CONSTANT_SPEED_CORNER_MIN_SCALE), 1.0)
+                )
 
             linear_fracs: list[float] = []
             if linear_step > 1e-9 and segment_linear_dist > 1e-12:
                 consumed = 0.0
-                needed = float(linear_step - carry_linear_dist) if carry_linear_dist > 1e-12 else float(linear_step)
-                while (segment_linear_dist - consumed) + 1e-12 >= needed:
+                emitted_in_segment = 0
+                while True:
+                    if emitted_in_segment < int(CONSTANT_SPEED_CORNER_RAMP_STEPS):
+                        ramp_alpha = float(
+                            emitted_in_segment / max(1, int(CONSTANT_SPEED_CORNER_RAMP_STEPS) - 1)
+                        )
+                        step_scale = float(
+                            start_speed_scale + (1.0 - start_speed_scale) * ramp_alpha
+                        )
+                    else:
+                        step_scale = 1.0
+                    target_step = float(linear_step * step_scale)
+                    needed = float(target_step - carry_linear_dist) if carry_linear_dist > 1e-12 else target_step
+                    if (segment_linear_dist - consumed) + 1e-12 < needed:
+                        break
                     consumed += needed
                     linear_fracs.append(float(consumed / segment_linear_dist))
-                    needed = float(linear_step)
                     carry_linear_dist = 0.0
+                    emitted_in_segment += 1
                 carry_linear_dist = float(max(0.0, carry_linear_dist + segment_linear_dist - consumed))
                 if carry_linear_dist >= linear_step:
                     carry_linear_dist = float(carry_linear_dist % linear_step)
@@ -1231,6 +1261,8 @@ def retime_tcp_action_chunk(
                 )
 
             current_sim = segment_end.copy()
+            if segment_linear_dir is not None:
+                prev_linear_dir = segment_linear_dir.copy()
 
         final_target_sim = np.asarray(start_pose_sim, dtype=np.float64).reshape(POSE_DIM).copy()
         for raw_delta in actions:

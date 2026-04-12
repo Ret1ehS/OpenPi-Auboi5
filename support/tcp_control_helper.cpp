@@ -635,6 +635,32 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
         return 0;
     };
 
+    auto servo_keepalive_until_input = [&](const char *source_event) {
+        if (!(servo_active && !hold_pose.empty())) {
+            return;
+        }
+        while (true) {
+            struct pollfd pfd;
+            pfd.fd = STDIN_FILENO;
+            pfd.events = POLLIN;
+            int wait_ms = std::max(1, (int)(servo_track_time_s * 1000));
+            int pr = poll(&pfd, 1, wait_ms);
+            if (pr > 0) {
+                break;
+            }
+            int keepalive_ret = servo_keepalive_once();
+            if (keepalive_ret != 0) {
+                log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
+                         ",\"event\":\"keepalive_fail\",\"source\":\"" + std::string(source_event) +
+                         "\",\"servo_ret\":" + std::to_string(keepalive_ret) +
+                         ",\"servo_ret_name\":\"" + servo_ret_name(keepalive_ret) +
+                         "\",\"hold_pose\":" + vec_to_json(hold_pose) + "}");
+                cleanup_servo();
+                break;
+            }
+        }
+    };
+
     std::string line;
     while (std::getline(std::cin, line)) {
         line = trim(line);
@@ -743,17 +769,7 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
 
             // Keepalive immediately after servo_start so the mode stays
             // alive while Python prepares the first chunk.
-            if (servo_active && !hold_pose.empty()) {
-                while (true) {
-                    struct pollfd pfd;
-                    pfd.fd = STDIN_FILENO;
-                    pfd.events = POLLIN;
-                    int wait_ms = std::max(1, (int)(servo_track_time_s * 1000));
-                    int pr = poll(&pfd, 1, wait_ms);
-                    if (pr > 0) break;
-                    servo_keepalive_once();
-                }
-            }
+            servo_keepalive_until_input("servo_start");
 
         } else if (line.rfind("servo_pose ", 0) == 0) {
             // servo_pose x y z rx ry rz
@@ -843,17 +859,7 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
 
             // Keepalive after servo_pose: hold last pose until next
             // command arrives, preventing servo timeout between calls.
-            if (servo_active && !hold_pose.empty()) {
-                while (true) {
-                    struct pollfd pfd;
-                    pfd.fd = STDIN_FILENO;
-                    pfd.events = POLLIN;
-                    int wait_ms = std::max(1, (int)(servo_track_time_s * 1000));
-                    int pr = poll(&pfd, 1, wait_ms);
-                    if (pr > 0) break;
-                    servo_keepalive_once();
-                }
-            }
+            servo_keepalive_until_input("servo_pose");
 
         } else if (line.rfind("servo_chunk ", 0) == 0) {
             // servo_chunk N
@@ -968,17 +974,7 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
             // ik_fail, servo_fail) because the servo mode itself is still
             // active and we don't want it to timeout.
             if (servo_active && chunk_error != "safety") {
-                while (true) {
-                    struct pollfd pfd;
-                    pfd.fd = STDIN_FILENO;
-                    pfd.events = POLLIN;
-                    int wait_ms = std::max(1, (int)(servo_track_time_s * 1000));
-                    int pr = poll(&pfd, 1, wait_ms);
-                    if (pr > 0) {
-                        break;
-                    }
-                    servo_keepalive_once();
-                }
+                servo_keepalive_until_input("servo_chunk");
             }
 
         } else if (line == "servo_stop") {

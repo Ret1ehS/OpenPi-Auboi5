@@ -816,6 +816,8 @@ class _DaemonHelper:
                 target_fz_n=self._servo_force_target_fz_n,
             )
         )
+        resp["requested_pose_real"] = requested.astype(np.float64).reshape(POSE_DIM).tolist()
+        resp["guarded_pose_real"] = guarded.astype(np.float64).reshape(POSE_DIM).tolist()
         self._last_servo_pose_real = guarded
         if force_z_n is not None or scale is not None:
             self._servo_force_guard_fz_n = force_z_n

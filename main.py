@@ -690,6 +690,7 @@ class ParallelTrajectoryExecutor:
         from support.tcp_control import (
             TrackChunkResult,
             _get_servo_daemon,
+            real_pose_to_sim,
             sim_pose_to_real,
         )
 
@@ -815,25 +816,34 @@ class ParallelTrajectoryExecutor:
                     resp = {"servo_pose_ret": 0, "simulated": True}
 
                 if pose_ret == 0:
+                    executed_pose_sim = target_pose_sim.copy()
+                    guarded_pose_real = resp.get("guarded_pose_real")
+                    if guarded_pose_real is not None:
+                        try:
+                            executed_pose_sim = real_pose_to_sim(
+                                np.asarray(guarded_pose_real, dtype=np.float64).reshape(6)
+                            )
+                        except Exception:
+                            executed_pose_sim = target_pose_sim.copy()
                     with self._lock:
                         self._current_tick = next_tick
-                        self._current_pose_sim = target_pose_sim.copy()
+                        self._current_pose_sim = executed_pose_sim.copy()
                         self._last_progress_ts = time.monotonic()
-                    _set_expected_pose(target_pose_sim)
+                    _set_expected_pose(executed_pose_sim)
                     _set_last_result(
                         TrackChunkResult(
                             ok=True,
                             reason="streaming queued step" if candidates else "holding current pose",
                             snapshot=snapshot,
                             start_pose=current_pose_sim,
-                            final_pose=target_pose_sim,
+                            final_pose=executed_pose_sim,
                             sample_count=int(next_tick),
                             control_dt_s=control_dt_s,
                             tracking_err=0.0,
                             exec_mode="streaming",
                             raw=resp,
                             start_pose_real=sim_pose_to_real(current_pose_sim),
-                            final_pose_real=target_pose_real,
+                            final_pose_real=sim_pose_to_real(executed_pose_sim),
                         )
                     )
                 else:

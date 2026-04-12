@@ -51,6 +51,7 @@ class PoseCandidate:
     pose_sim: np.ndarray
     generation: int
     submit_ts: float
+    merge_alpha: float
 
 
 @dataclass
@@ -578,9 +579,54 @@ class ParallelTrajectoryExecutor:
     def _aggregate_pose_candidates(candidates: list[PoseCandidate], fallback_pose: np.ndarray) -> np.ndarray:
         if not candidates:
             return np.asarray(fallback_pose, dtype=np.float64).reshape(6).copy()
+        if len(candidates) == 1:
+            return np.asarray(candidates[0].pose_sim, dtype=np.float64).reshape(6).copy()
 
-        latest = candidates[-1]
-        return np.asarray(latest.pose_sim, dtype=np.float64).reshape(6).copy()
+        base_pose = np.asarray(fallback_pose, dtype=np.float64).reshape(6).copy()
+        ordered = candidates[-MAX_CANDIDATES_PER_TICK:]
+        first_pose = np.asarray(ordered[0].pose_sim, dtype=np.float64).reshape(6)
+        fused_delta = np.zeros((6,), dtype=np.float64)
+        fused_delta[:3] = first_pose[:3] - base_pose[:3]
+        for axis in range(3, 6):
+            fused_delta[axis] = float(
+                np.arctan2(
+                    np.sin(first_pose[axis] - base_pose[axis]),
+                    np.cos(first_pose[axis] - base_pose[axis]),
+                )
+            )
+
+        for item in ordered[1:]:
+            pose = np.asarray(item.pose_sim, dtype=np.float64).reshape(6)
+            alpha = float(np.clip(item.merge_alpha, 0.0, 1.0))
+            delta = np.zeros((6,), dtype=np.float64)
+            delta[:3] = pose[:3] - base_pose[:3]
+            for axis in range(3, 6):
+                delta[axis] = float(
+                    np.arctan2(
+                        np.sin(pose[axis] - base_pose[axis]),
+                        np.cos(pose[axis] - base_pose[axis]),
+                    )
+                )
+
+            fused_delta[:3] = (1.0 - alpha) * fused_delta[:3] + alpha * delta[:3]
+            for axis in range(3, 6):
+                fused_delta[axis] = float(
+                    np.arctan2(
+                        (1.0 - alpha) * np.sin(fused_delta[axis]) + alpha * np.sin(delta[axis]),
+                        (1.0 - alpha) * np.cos(fused_delta[axis]) + alpha * np.cos(delta[axis]),
+                    )
+                )
+
+        fused_pose = base_pose.copy()
+        fused_pose[:3] = base_pose[:3] + fused_delta[:3]
+        for axis in range(3, 6):
+            fused_pose[axis] = float(
+                np.arctan2(
+                    np.sin(base_pose[axis] + fused_delta[axis]),
+                    np.cos(base_pose[axis] + fused_delta[axis]),
+                )
+            )
+        return fused_pose
 
     def _ingest_submission(self, submission: ChunkSubmission) -> tuple[int, int]:
         plan = submission.plan
@@ -599,6 +645,24 @@ class ParallelTrajectoryExecutor:
                 self._last_progress_ts = time.monotonic()
 
             base_tick = int(submission.observation_tick)
+            overlap_offsets: list[int] = []
+            for offset, _step in enumerate(plan.steps, start=1):
+                tick = base_tick + offset
+                if tick <= self._current_tick:
+                    continue
+                if self._future_candidates.get(tick):
+                    overlap_offsets.append(offset)
+
+            overlap_alpha_by_offset: dict[int, float] = {}
+            if overlap_offsets:
+                overlap_count = len(overlap_offsets)
+                if overlap_count == 1:
+                    overlap_alpha_by_offset[overlap_offsets[0]] = 0.5
+                else:
+                    denom = float(overlap_count - 1)
+                    for idx, offset in enumerate(overlap_offsets):
+                        overlap_alpha_by_offset[offset] = float(idx / denom)
+
             for offset, step in enumerate(plan.steps, start=1):
                 tick = base_tick + offset
                 if tick <= self._current_tick:
@@ -610,6 +674,7 @@ class ParallelTrajectoryExecutor:
                         pose_sim=np.asarray(step.pose_sim, dtype=np.float64).reshape(6).copy(),
                         generation=int(submission.generation),
                         submit_ts=float(submission.submit_ts),
+                        merge_alpha=float(overlap_alpha_by_offset.get(offset, 1.0)),
                     )
                 )
                 if len(bucket) > MAX_CANDIDATES_PER_TICK:

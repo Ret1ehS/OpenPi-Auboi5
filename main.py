@@ -58,6 +58,7 @@ class ChunkSubmission:
     plan: Any
     snapshot: Any
     observation_tick: int
+    planned_step_count: int
     generation: int
     submit_ts: float
 
@@ -442,6 +443,7 @@ class ParallelTrajectoryExecutor:
         self._control_dt_s = 0.01
         self._latest_snapshot = None
         self._future_candidates: dict[int, list[PoseCandidate]] = {}
+        self._pending_step_budget = 0
         self._idle = threading.Event()
         self._idle.set()
 
@@ -480,27 +482,35 @@ class ParallelTrajectoryExecutor:
             max_future_tick = max(self._future_candidates.keys(), default=current_tick)
             buffered_steps = max(0, max_future_tick - current_tick)
             control_dt_s = float(self._control_dt_s)
+            pending_step_budget = int(self._pending_step_budget)
+            effective_buffered_steps = int(buffered_steps + pending_step_budget)
         pending_submissions = max(0, self._queue.qsize())
         return {
             "current_tick": current_tick,
             "max_future_tick": int(max_future_tick),
             "buffered_steps": int(buffered_steps),
+            "pending_step_budget": int(pending_step_budget),
+            "effective_buffered_steps": int(effective_buffered_steps),
             "buffered_time_s": float(buffered_steps * control_dt_s),
+            "effective_buffered_time_s": float(effective_buffered_steps * control_dt_s),
             "control_dt_s": control_dt_s,
             "pending_submissions": int(pending_submissions),
             "idle": bool(self._idle.is_set()),
         }
 
     def submit(self, plan, snapshot, *, observation_tick: int, generation: int) -> None:
+        planned_step_count = int(len(plan.steps))
         item = ChunkSubmission(
             plan=plan,
             snapshot=snapshot,
             observation_tick=max(0, int(observation_tick)),
+            planned_step_count=planned_step_count,
             generation=int(generation),
             submit_ts=time.monotonic(),
         )
         with self._lock:
             self._last_result = None
+            self._pending_step_budget += planned_step_count
         self._idle.clear()
         while True:
             try:
@@ -508,7 +518,13 @@ class ParallelTrajectoryExecutor:
                 return
             except queue.Full:
                 try:
-                    self._queue.get_nowait()
+                    dropped = self._queue.get_nowait()
+                    if isinstance(dropped, ChunkSubmission):
+                        with self._lock:
+                            self._pending_step_budget = max(
+                                0,
+                                int(self._pending_step_budget) - int(dropped.planned_step_count),
+                            )
                 except queue.Empty:
                     pass
 
@@ -520,6 +536,7 @@ class ParallelTrajectoryExecutor:
                 break
         with self._lock:
             self._future_candidates.clear()
+            self._pending_step_budget = 0
         self._idle.set()
 
     def wait_until_idle(self, timeout: float | None = None) -> bool:
@@ -540,6 +557,7 @@ class ParallelTrajectoryExecutor:
             self._control_dt_s = 0.01
             self._latest_snapshot = None
             self._future_candidates.clear()
+            self._pending_step_budget = 0
         self._idle.set()
 
     def _update_idle_flag(self) -> None:
@@ -579,6 +597,10 @@ class ParallelTrajectoryExecutor:
         accepted = 0
         stale = 0
         with self._lock:
+            self._pending_step_budget = max(
+                0,
+                int(self._pending_step_budget) - int(submission.planned_step_count),
+            )
             self._latest_snapshot = submission.snapshot
             self._control_dt_s = float(plan.control_dt_s)
             if self._current_pose_sim is None:
@@ -1165,7 +1187,7 @@ def main() -> int:
                     continue
 
                 queue_state_before_obs = executor.get_progress()
-                if queue_state_before_obs["buffered_steps"] > ASYNC_REFILL_THRESHOLD_STEPS:
+                if queue_state_before_obs["effective_buffered_steps"] > ASYNC_REFILL_THRESHOLD_STEPS:
                     time.sleep(
                         min(
                             max(float(queue_state_before_obs["control_dt_s"]), 0.002),
@@ -1258,8 +1280,14 @@ def main() -> int:
                         "remaining_step_count": int(remaining_steps),
                         "queue_refill_threshold_steps": int(ASYNC_REFILL_THRESHOLD_STEPS),
                         "queue_buffered_steps_before_obs": int(queue_state_before_obs["buffered_steps"]),
+                        "queue_effective_buffered_steps_before_obs": int(queue_state_before_obs["effective_buffered_steps"]),
+                        "queue_pending_step_budget_before_obs": int(queue_state_before_obs["pending_step_budget"]),
                         "queue_buffered_steps_at_obs": int(obs_queue_state["buffered_steps"]),
+                        "queue_effective_buffered_steps_at_obs": int(obs_queue_state["effective_buffered_steps"]),
+                        "queue_pending_step_budget_at_obs": int(obs_queue_state["pending_step_budget"]),
                         "queue_buffered_steps_before_submit": int(submit_queue_state["buffered_steps"]),
+                        "queue_effective_buffered_steps_before_submit": int(submit_queue_state["effective_buffered_steps"]),
+                        "queue_pending_step_budget_before_submit": int(submit_queue_state["pending_step_budget"]),
                         "gripper_changed": bool(scheduled_gripper_state is not None),
                         "scheduled_gripper_idx": None if scheduled_gripper_idx is None else int(scheduled_gripper_idx),
                         "scheduled_gripper_state": None if scheduled_gripper_state is None else int(scheduled_gripper_state),
@@ -1295,6 +1323,8 @@ def main() -> int:
                         "submitted_step_count": int(len(plan.steps)),
                         "remaining_step_count": int(remaining_steps),
                         "queue_buffered_steps_after_submit": int(post_submit_queue_state["buffered_steps"]),
+                        "queue_effective_buffered_steps_after_submit": int(post_submit_queue_state["effective_buffered_steps"]),
+                        "queue_pending_step_budget_after_submit": int(post_submit_queue_state["pending_step_budget"]),
                         "queue_max_future_tick_after_submit": int(post_submit_queue_state["max_future_tick"]),
                     }
                 )
@@ -1316,7 +1346,8 @@ def main() -> int:
                 else:
                     print(
                         f"  [{step:4d}] Async submit: {remaining_steps} queued servo steps "
-                        f"(stale {stale_steps}, buffered={post_submit_queue_state['buffered_steps']}), "
+                        f"(stale {stale_steps}, buffered={post_submit_queue_state['effective_buffered_steps']}, "
+                        f"pending={post_submit_queue_state['pending_submissions']}), "
                         f"continuing to next observation..."
                     )
 

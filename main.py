@@ -43,11 +43,7 @@ MAX_CANDIDATES_PER_TICK = 4
 EXECUTOR_IDLE_WAIT_S = 0.05
 ASYNC_AGGREGATE_OLD_WEIGHT = 0.3
 ASYNC_AGGREGATE_NEW_WEIGHT = 0.7
-ASYNC_QUEUE_REFILL_RATIO = 0.8
-ASYNC_MIN_REFILL_STEPS = 40
-ASYNC_REFILL_GUARD_S = 0.2
-ASYNC_PLAN_LATENCY_EMA_ALPHA = 0.25
-ASYNC_INITIAL_PLAN_LATENCY_S = 0.45
+ASYNC_REFILL_THRESHOLD_STEPS = 80
 
 
 @dataclass
@@ -1077,8 +1073,6 @@ def main() -> int:
         obs_builder.set_gripper_open_scalar(1.0)
         step = 0
         last_gripper_state: int | None = None
-        last_submitted_step_budget = ASYNC_MIN_REFILL_STEPS
-        planning_latency_ema_s = ASYNC_INITIAL_PLAN_LATENCY_S
 
         # --- Optional video recording (background thread) ---
         _rec_stop = threading.Event()
@@ -1155,20 +1149,7 @@ def main() -> int:
         try:
             while True:
                 queue_state_before_obs = executor.get_progress()
-                latency_refill_steps = max(
-                    ASYNC_MIN_REFILL_STEPS,
-                    int(
-                        np.ceil(
-                            (float(planning_latency_ema_s) + ASYNC_REFILL_GUARD_S)
-                            / max(float(queue_state_before_obs["control_dt_s"]), 1e-3)
-                        )
-                    ),
-                )
-                refill_threshold_steps = max(
-                    latency_refill_steps,
-                    int(round(float(last_submitted_step_budget) * ASYNC_QUEUE_REFILL_RATIO)),
-                )
-                if queue_state_before_obs["buffered_steps"] > refill_threshold_steps:
+                if queue_state_before_obs["buffered_steps"] > ASYNC_REFILL_THRESHOLD_STEPS:
                     time.sleep(
                         min(
                             max(float(queue_state_before_obs["control_dt_s"]), 0.002),
@@ -1238,10 +1219,6 @@ def main() -> int:
                     max_linear_speed_mps=effective_speed,
                 )
                 planning_latency_s = time.monotonic() - loop_start
-                planning_latency_ema_s = (
-                    (1.0 - ASYNC_PLAN_LATENCY_EMA_ALPHA) * float(planning_latency_ema_s)
-                    + ASYNC_PLAN_LATENCY_EMA_ALPHA * float(planning_latency_s)
-                )
                 submit_queue_state = executor.get_progress()
                 stale_steps = max(0, int(submit_queue_state["current_tick"]) - observation_tick)
                 stale_steps = min(stale_steps, len(plan.steps))
@@ -1253,7 +1230,6 @@ def main() -> int:
                         "prompt": prompt,
                         "infer_time_s": float(infer_time),
                         "planning_latency_s": float(planning_latency_s),
-                        "planning_latency_ema_s": float(planning_latency_ema_s),
                         "raw_action_count": int(len(raw_actions)),
                         "exec_action_count": int(len(exec_actions)),
                         "prefix_action_count": int(len(tcp_prefix)),
@@ -1264,8 +1240,7 @@ def main() -> int:
                         "observation_tick": int(observation_tick),
                         "stale_steps_before_submit": int(stale_steps),
                         "remaining_step_count": int(remaining_steps),
-                        "latency_refill_steps": int(latency_refill_steps),
-                        "queue_refill_threshold_steps": int(refill_threshold_steps),
+                        "queue_refill_threshold_steps": int(ASYNC_REFILL_THRESHOLD_STEPS),
                         "queue_buffered_steps_before_obs": int(queue_state_before_obs["buffered_steps"]),
                         "queue_buffered_steps_at_obs": int(obs_queue_state["buffered_steps"]),
                         "queue_buffered_steps_before_submit": int(submit_queue_state["buffered_steps"]),
@@ -1294,7 +1269,6 @@ def main() -> int:
                     observation_tick=observation_tick,
                     generation=step,
                 )
-                last_submitted_step_budget = max(1, len(plan.steps))
                 post_submit_queue_state = executor.get_progress()
                 _append_infer_log(
                     {

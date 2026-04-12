@@ -42,6 +42,8 @@ STATE_MODE_YAW = "yaw"
 MAX_CANDIDATES_PER_TICK = 4
 EXECUTOR_IDLE_WAIT_S = 0.05
 ASYNC_REFILL_THRESHOLD_STEPS = 80
+EXECUTOR_STALL_WARN_S = 0.5
+EXECUTOR_STALL_RESET_S = 1.0
 
 
 @dataclass
@@ -442,6 +444,8 @@ class ParallelTrajectoryExecutor:
         self._latest_snapshot = None
         self._future_candidates: dict[int, list[PoseCandidate]] = {}
         self._pending_step_budget = 0
+        self._last_progress_ts = time.monotonic()
+        self._servo_active = False
         self._idle = threading.Event()
         self._idle.set()
 
@@ -482,6 +486,8 @@ class ParallelTrajectoryExecutor:
             control_dt_s = float(self._control_dt_s)
             pending_step_budget = int(self._pending_step_budget)
             effective_buffered_steps = int(buffered_steps + pending_step_budget)
+            last_progress_age_s = float(max(0.0, time.monotonic() - float(self._last_progress_ts)))
+            servo_active = bool(self._servo_active)
         pending_submissions = max(0, self._queue.qsize())
         return {
             "current_tick": current_tick,
@@ -491,8 +497,10 @@ class ParallelTrajectoryExecutor:
             "effective_buffered_steps": int(effective_buffered_steps),
             "buffered_time_s": float(buffered_steps * control_dt_s),
             "effective_buffered_time_s": float(effective_buffered_steps * control_dt_s),
+            "last_progress_age_s": float(last_progress_age_s),
             "control_dt_s": control_dt_s,
             "pending_submissions": int(pending_submissions),
+            "servo_active": bool(servo_active),
             "idle": bool(self._idle.is_set()),
         }
 
@@ -588,6 +596,7 @@ class ParallelTrajectoryExecutor:
             if self._current_pose_sim is None:
                 self._current_pose_sim = np.asarray(plan.start_pose, dtype=np.float64).reshape(6).copy()
                 self._expected_pose = self._current_pose_sim.copy()
+                self._last_progress_ts = time.monotonic()
 
             base_tick = int(submission.observation_tick)
             for offset, step in enumerate(plan.steps, start=1):
@@ -631,6 +640,8 @@ class ParallelTrajectoryExecutor:
                 except Exception:
                     pass
                 servo_active = False
+                with self._lock:
+                    self._servo_active = False
 
         def _drain_pending(*, timeout: float | None = None) -> list[object]:
             items: list[object] = []
@@ -727,6 +738,8 @@ class ParallelTrajectoryExecutor:
                             continue
                         daemon.servo_begin_chunk(sim_pose_to_real(current_pose_sim))
                         servo_active = True
+                        with self._lock:
+                            self._servo_active = True
 
                     resp = daemon.servo_pose(target_pose_real)
                     pose_ret = int(resp.get("servo_pose_ret", -1))
@@ -740,6 +753,7 @@ class ParallelTrajectoryExecutor:
                     with self._lock:
                         self._current_tick = next_tick
                         self._current_pose_sim = target_pose_sim.copy()
+                        self._last_progress_ts = time.monotonic()
                     _set_expected_pose(target_pose_sim)
                     _set_last_result(
                         TrackChunkResult(
@@ -1169,6 +1183,60 @@ def main() -> int:
                     continue
 
                 queue_state_before_obs = executor.get_progress()
+                if (
+                    queue_state_before_obs["effective_buffered_steps"] > 0
+                    and queue_state_before_obs["last_progress_age_s"] >= EXECUTOR_STALL_WARN_S
+                ):
+                    print(
+                        "    [executor] stall warning: "
+                        f"tick={queue_state_before_obs['current_tick']} "
+                        f"buffered={queue_state_before_obs['effective_buffered_steps']} "
+                        f"pending={queue_state_before_obs['pending_submissions']} "
+                        f"servo_active={queue_state_before_obs['servo_active']} "
+                        f"idle={queue_state_before_obs['idle']} "
+                        f"age={queue_state_before_obs['last_progress_age_s']:.3f}s"
+                    )
+                    _append_infer_log(
+                        {
+                            "event": "executor_stall_warning",
+                            "prompt": prompt,
+                            "step": int(step),
+                            "current_tick": int(queue_state_before_obs["current_tick"]),
+                            "effective_buffered_steps": int(queue_state_before_obs["effective_buffered_steps"]),
+                            "pending_submissions": int(queue_state_before_obs["pending_submissions"]),
+                            "servo_active": bool(queue_state_before_obs["servo_active"]),
+                            "idle": bool(queue_state_before_obs["idle"]),
+                            "last_progress_age_s": float(queue_state_before_obs["last_progress_age_s"]),
+                        }
+                    )
+                if (
+                    queue_state_before_obs["effective_buffered_steps"] > 0
+                    and queue_state_before_obs["last_progress_age_s"] >= EXECUTOR_STALL_RESET_S
+                ):
+                    print(
+                        "    [executor] stall reset: "
+                        f"tick={queue_state_before_obs['current_tick']} "
+                        f"buffered={queue_state_before_obs['effective_buffered_steps']} "
+                        f"pending={queue_state_before_obs['pending_submissions']} "
+                        f"age={queue_state_before_obs['last_progress_age_s']:.3f}s"
+                    )
+                    _append_infer_log(
+                        {
+                            "event": "executor_stall_reset",
+                            "prompt": prompt,
+                            "step": int(step),
+                            "current_tick": int(queue_state_before_obs["current_tick"]),
+                            "effective_buffered_steps": int(queue_state_before_obs["effective_buffered_steps"]),
+                            "pending_submissions": int(queue_state_before_obs["pending_submissions"]),
+                            "servo_active": bool(queue_state_before_obs["servo_active"]),
+                            "idle": bool(queue_state_before_obs["idle"]),
+                            "last_progress_age_s": float(queue_state_before_obs["last_progress_age_s"]),
+                        }
+                    )
+                    executor.clear_pending()
+                    executor.reset_state()
+                    time.sleep(0.05)
+                    continue
                 if queue_state_before_obs["effective_buffered_steps"] > ASYNC_REFILL_THRESHOLD_STEPS:
                     time.sleep(
                         min(

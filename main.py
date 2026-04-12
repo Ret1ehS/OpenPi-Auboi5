@@ -842,7 +842,15 @@ def main() -> int:
         is_alignment_ready,
         set_alignment_mode,
     )
-    from support.tcp_control import build_helper as build_tcp_helper, get_robot_snapshot, retime_tcp_action_chunk
+    from support.tcp_control import (
+        RetimedTcpChunk,
+        RetimedTcpStep,
+        build_helper as build_tcp_helper,
+        get_robot_snapshot,
+        integrate_delta_tcp_pose,
+        retime_tcp_action_chunk,
+        sim_pose_to_real,
+    )
     from support.tui_config import TUIConfig, run_tui_config
 
     initial_qpos_rad = REAL_INIT_QPOS_RAD.copy()
@@ -1172,6 +1180,59 @@ def main() -> int:
             else:
                 print(f"  [{step_id:4d}] Gripper cache unchanged after failed command")
 
+        def _wrap_angle(angle: float) -> float:
+            return float(np.arctan2(np.sin(angle), np.cos(angle)))
+
+        def _rebase_retimed_plan(plan: RetimedTcpChunk, *, stale_steps: int, rebase_pose_sim: np.ndarray) -> RetimedTcpChunk:
+            remaining_source_steps = plan.steps[int(stale_steps):]
+            if not remaining_source_steps:
+                return RetimedTcpChunk(
+                    start_pose=np.asarray(rebase_pose_sim, dtype=np.float64).reshape(6).copy(),
+                    final_pose=np.asarray(rebase_pose_sim, dtype=np.float64).reshape(6).copy(),
+                    steps=[],
+                    control_dt_s=float(plan.control_dt_s),
+                    max_linear_speed_mps=float(plan.max_linear_speed_mps),
+                    max_angular_speed_radps=float(plan.max_angular_speed_radps),
+                    start_pose_real=sim_pose_to_real(rebase_pose_sim),
+                    final_pose_real=sim_pose_to_real(rebase_pose_sim),
+                )
+
+            previous_pose = (
+                np.asarray(plan.start_pose, dtype=np.float64).reshape(6).copy()
+                if int(stale_steps) <= 0
+                else np.asarray(plan.steps[int(stale_steps) - 1].pose_sim, dtype=np.float64).reshape(6).copy()
+            )
+            rebased_current = np.asarray(rebase_pose_sim, dtype=np.float64).reshape(6).copy()
+            rebased_steps: list[RetimedTcpStep] = []
+
+            for src_step in remaining_source_steps:
+                src_pose = np.asarray(src_step.pose_sim, dtype=np.float64).reshape(6)
+                delta = np.zeros((6,), dtype=np.float64)
+                delta[:3] = src_pose[:3] - previous_pose[:3]
+                for axis in range(3, 6):
+                    delta[axis] = _wrap_angle(float(src_pose[axis] - previous_pose[axis]))
+                rebased_current = integrate_delta_tcp_pose(rebased_current, delta)
+                rebased_steps.append(
+                    RetimedTcpStep(
+                        pose_real=sim_pose_to_real(rebased_current),
+                        pose_sim=rebased_current.copy(),
+                        source_action_index=int(src_step.source_action_index),
+                    )
+                )
+                previous_pose = src_pose.copy()
+
+            start_pose = np.asarray(rebase_pose_sim, dtype=np.float64).reshape(6).copy()
+            return RetimedTcpChunk(
+                start_pose=start_pose,
+                final_pose=rebased_current.copy(),
+                steps=rebased_steps,
+                control_dt_s=float(plan.control_dt_s),
+                max_linear_speed_mps=float(plan.max_linear_speed_mps),
+                max_angular_speed_radps=float(plan.max_angular_speed_radps),
+                start_pose_real=sim_pose_to_real(start_pose),
+                final_pose_real=sim_pose_to_real(rebased_current),
+            )
+
         try:
             while True:
                 last_res = executor.last_result
@@ -1310,7 +1371,18 @@ def main() -> int:
                 submit_queue_state = executor.get_progress()
                 stale_steps = max(0, int(submit_queue_state["current_tick"]) - observation_tick)
                 stale_steps = min(stale_steps, len(plan.steps))
-                remaining_steps = max(0, len(plan.steps) - stale_steps)
+                rebased_plan = plan
+                rebased_from_executor = False
+                if stale_steps > 0:
+                    rebase_pose_sim = executor.expected_pose
+                    if rebase_pose_sim is not None:
+                        rebased_plan = _rebase_retimed_plan(
+                            plan,
+                            stale_steps=stale_steps,
+                            rebase_pose_sim=np.asarray(rebase_pose_sim, dtype=np.float64).reshape(6).copy(),
+                        )
+                        rebased_from_executor = True
+                remaining_steps = max(0, len(rebased_plan.steps))
                 _append_infer_log(
                     {
                         "event": "inference_chunk",
@@ -1328,6 +1400,7 @@ def main() -> int:
                         "observation_tick": int(observation_tick),
                         "stale_steps_before_submit": int(stale_steps),
                         "remaining_step_count": int(remaining_steps),
+                        "rebased_from_executor": bool(rebased_from_executor),
                         "queue_refill_threshold_steps": int(ASYNC_REFILL_THRESHOLD_STEPS),
                         "queue_buffered_steps_before_obs": int(queue_state_before_obs["buffered_steps"]),
                         "queue_effective_buffered_steps_before_obs": int(queue_state_before_obs["effective_buffered_steps"]),
@@ -1358,7 +1431,7 @@ def main() -> int:
                     executor.clear_pending()
 
                 executor.submit(
-                    plan,
+                    rebased_plan,
                     aligned_obs.robot_snapshot,
                     observation_tick=observation_tick,
                     generation=step,
@@ -1370,8 +1443,9 @@ def main() -> int:
                         "step": int(step),
                         "prompt": prompt,
                         "observation_tick": int(observation_tick),
-                        "submitted_step_count": int(len(plan.steps)),
+                        "submitted_step_count": int(len(rebased_plan.steps)),
                         "remaining_step_count": int(remaining_steps),
+                        "rebased_from_executor": bool(rebased_from_executor),
                         "queue_buffered_steps_after_submit": int(post_submit_queue_state["buffered_steps"]),
                         "queue_effective_buffered_steps_after_submit": int(post_submit_queue_state["effective_buffered_steps"]),
                         "queue_pending_step_budget_after_submit": int(post_submit_queue_state["pending_step_budget"]),
@@ -1397,7 +1471,8 @@ def main() -> int:
                     print(
                         f"  [{step:4d}] Async submit: {remaining_steps} queued servo steps "
                         f"(stale {stale_steps}, buffered={post_submit_queue_state['effective_buffered_steps']}, "
-                        f"pending={post_submit_queue_state['pending_submissions']}), "
+                        f"pending={post_submit_queue_state['pending_submissions']}, "
+                        f"rebased={rebased_from_executor}), "
                         f"continuing to next observation..."
                     )
 

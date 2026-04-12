@@ -574,23 +574,55 @@ class ParallelTrajectoryExecutor:
             return np.asarray(fallback_pose, dtype=np.float64).reshape(6).copy()
 
         ordered = candidates[-MAX_CANDIDATES_PER_TICK:]
-        fused = np.asarray(ordered[0].pose_sim, dtype=np.float64).reshape(6).copy()
+        base_pose = np.asarray(fallback_pose, dtype=np.float64).reshape(6).copy()
+
+        first_pose = np.asarray(ordered[0].pose_sim, dtype=np.float64).reshape(6)
+        fused_delta = np.zeros((6,), dtype=np.float64)
+        fused_delta[:3] = first_pose[:3] - base_pose[:3]
+        for axis in range(3, 6):
+            fused_delta[axis] = float(
+                np.arctan2(
+                    np.sin(first_pose[axis] - base_pose[axis]),
+                    np.cos(first_pose[axis] - base_pose[axis]),
+                )
+            )
+
         for item in ordered[1:]:
             pose = np.asarray(item.pose_sim, dtype=np.float64).reshape(6)
-            fused[:3] = (
-                ASYNC_AGGREGATE_OLD_WEIGHT * fused[:3]
-                + ASYNC_AGGREGATE_NEW_WEIGHT * pose[:3]
-            )
+            delta = np.zeros((6,), dtype=np.float64)
+            delta[:3] = pose[:3] - base_pose[:3]
             for axis in range(3, 6):
-                fused[axis] = float(
+                delta[axis] = float(
                     np.arctan2(
-                        ASYNC_AGGREGATE_OLD_WEIGHT * np.sin(fused[axis])
-                        + ASYNC_AGGREGATE_NEW_WEIGHT * np.sin(pose[axis]),
-                        ASYNC_AGGREGATE_OLD_WEIGHT * np.cos(fused[axis])
-                        + ASYNC_AGGREGATE_NEW_WEIGHT * np.cos(pose[axis]),
+                        np.sin(pose[axis] - base_pose[axis]),
+                        np.cos(pose[axis] - base_pose[axis]),
                     )
                 )
-        return fused
+
+            fused_delta[:3] = (
+                ASYNC_AGGREGATE_OLD_WEIGHT * fused_delta[:3]
+                + ASYNC_AGGREGATE_NEW_WEIGHT * delta[:3]
+            )
+            for axis in range(3, 6):
+                fused_delta[axis] = float(
+                    np.arctan2(
+                        ASYNC_AGGREGATE_OLD_WEIGHT * np.sin(fused_delta[axis])
+                        + ASYNC_AGGREGATE_NEW_WEIGHT * np.sin(delta[axis]),
+                        ASYNC_AGGREGATE_OLD_WEIGHT * np.cos(fused_delta[axis])
+                        + ASYNC_AGGREGATE_NEW_WEIGHT * np.cos(delta[axis]),
+                    )
+                )
+
+        fused_pose = base_pose.copy()
+        fused_pose[:3] = base_pose[:3] + fused_delta[:3]
+        for axis in range(3, 6):
+            fused_pose[axis] = float(
+                np.arctan2(
+                    np.sin(base_pose[axis] + fused_delta[axis]),
+                    np.cos(base_pose[axis] + fused_delta[axis]),
+                )
+            )
+        return fused_pose
 
     def _ingest_submission(self, submission: ChunkSubmission) -> tuple[int, int]:
         plan = submission.plan

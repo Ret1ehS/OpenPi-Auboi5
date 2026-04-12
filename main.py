@@ -246,6 +246,7 @@ class TrajectoryExecutor:
                 tcp_deltas,
                 start_pose_sim=start_sim,
                 max_linear_speed_mps=self._max_speed_mps,
+                constant_linear_speed=bool(np.isfinite(self._max_speed_mps)),
             )
 
             if not plan.steps:
@@ -1441,6 +1442,7 @@ def main() -> int:
                     tcp_prefix,
                     start_pose_sim=aligned_obs.aligned_tcp_pose_sim,
                     max_linear_speed_mps=effective_speed,
+                    constant_linear_speed=not is_native_speed,
                 )
                 planning_latency_s = time.monotonic() - loop_start
                 submit_queue_state = executor.get_progress()

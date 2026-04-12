@@ -1125,6 +1125,7 @@ def retime_tcp_action_chunk(
     max_linear_speed_mps: float = DEFAULT_TCP_LINEAR_SPEED_MPS,
     max_angular_speed_radps: float = DEFAULT_TCP_ANGULAR_SPEED_RADPS,
     z_min: float = DEFAULT_Z_MIN_M,
+    constant_linear_speed: bool = False,
 ) -> RetimedTcpChunk:
     """Retime a chunk of TCP delta actions into fine-grained servo steps.
 
@@ -1144,6 +1145,125 @@ def retime_tcp_action_chunk(
     start_real = sim_pose_to_real(start_sim)
     current_real = start_real.copy()
     steps: list[RetimedTcpStep] = []
+
+    if constant_linear_speed and np.isfinite(max_linear_speed_mps) and max_linear_speed_mps > 0.0:
+        linear_step = float(max_linear_speed_mps) * float(control_dt_s)
+        angular_step = (
+            float(max_angular_speed_radps) * float(control_dt_s)
+            if np.isfinite(max_angular_speed_radps) and max_angular_speed_radps > 0.0
+            else float("inf")
+        )
+        carry_linear_dist = 0.0
+
+        def _interp_pose(start_pose: np.ndarray, end_pose: np.ndarray, frac: float) -> np.ndarray:
+            frac = float(np.clip(frac, 0.0, 1.0))
+            out = np.asarray(start_pose, dtype=np.float64).reshape(POSE_DIM).copy()
+            end_pose = np.asarray(end_pose, dtype=np.float64).reshape(POSE_DIM)
+            out[:3] = out[:3] + (end_pose[:3] - out[:3]) * frac
+            angle_delta = np.array(
+                [
+                    math.atan2(math.sin(end_pose[axis] - out[axis]), math.cos(end_pose[axis] - out[axis]))
+                    for axis in range(3, 6)
+                ],
+                dtype=np.float64,
+            )
+            out[3:] = wrap_euler_zyx(out[3:] + angle_delta * frac)
+            return out
+
+        last_emitted_sim = current_sim.copy()
+        for idx, raw_delta in enumerate(actions):
+            segment_start = current_sim.copy()
+            segment_end = integrate_delta_tcp_pose(segment_start, raw_delta)
+            segment_linear_dist = float(np.linalg.norm(segment_end[:3] - segment_start[:3]))
+            angle_delta = np.array(
+                [
+                    math.atan2(
+                        math.sin(segment_end[axis] - segment_start[axis]),
+                        math.cos(segment_end[axis] - segment_start[axis]),
+                    )
+                    for axis in range(3, 6)
+                ],
+                dtype=np.float64,
+            )
+            segment_angular_dist = float(np.linalg.norm(angle_delta))
+
+            linear_fracs: list[float] = []
+            if linear_step > 1e-9 and segment_linear_dist > 1e-12:
+                consumed = 0.0
+                needed = float(linear_step - carry_linear_dist) if carry_linear_dist > 1e-12 else float(linear_step)
+                while (segment_linear_dist - consumed) + 1e-12 >= needed:
+                    consumed += needed
+                    linear_fracs.append(float(consumed / segment_linear_dist))
+                    needed = float(linear_step)
+                    carry_linear_dist = 0.0
+                carry_linear_dist = float(max(0.0, carry_linear_dist + segment_linear_dist - consumed))
+                if carry_linear_dist >= linear_step:
+                    carry_linear_dist = float(carry_linear_dist % linear_step)
+            elif segment_linear_dist <= 1e-12:
+                linear_fracs = []
+            else:
+                linear_fracs = [1.0]
+                carry_linear_dist = 0.0
+
+            angular_fracs: list[float] = []
+            if np.isfinite(angular_step) and angular_step > 1e-9 and segment_angular_dist > 1e-12:
+                angular_count = max(1, int(math.ceil(segment_angular_dist / angular_step)))
+                angular_fracs = [float(i / angular_count) for i in range(1, angular_count + 1)]
+
+            fracs = sorted({float(f) for f in (linear_fracs + angular_fracs) if 0.0 < float(f) <= 1.0})
+            if not fracs:
+                current_sim = segment_end.copy()
+                continue
+
+            for frac in fracs:
+                current_sim = _interp_pose(segment_start, segment_end, frac)
+                current_real = sim_pose_to_real(current_sim)
+                if current_real[2] < z_min:
+                    current_real[2] = z_min
+                current_sim = real_pose_to_sim(current_real)
+                last_emitted_sim = current_sim.copy()
+                steps.append(
+                    RetimedTcpStep(
+                        pose_real=current_real.copy(),
+                        pose_sim=current_sim.copy(),
+                        source_action_index=int(idx),
+                    )
+                )
+
+            current_sim = segment_end.copy()
+
+        final_target_sim = np.asarray(start_pose_sim, dtype=np.float64).reshape(POSE_DIM).copy()
+        for raw_delta in actions:
+            final_target_sim = integrate_delta_tcp_pose(final_target_sim, raw_delta)
+        final_target_real = sim_pose_to_real(final_target_sim)
+        if final_target_real[2] < z_min:
+            final_target_real[2] = z_min
+        final_target_sim = real_pose_to_sim(final_target_real)
+
+        if not steps or not np.allclose(steps[-1].pose_sim, final_target_sim, atol=1e-9, rtol=0.0):
+            current_sim = final_target_sim.copy()
+            current_real = final_target_real.copy()
+            steps.append(
+                RetimedTcpStep(
+                    pose_real=current_real.copy(),
+                    pose_sim=current_sim.copy(),
+                    source_action_index=int(max(0, len(actions) - 1)),
+                )
+            )
+        else:
+            current_sim = steps[-1].pose_sim.copy()
+            current_real = steps[-1].pose_real.copy()
+
+        return RetimedTcpChunk(
+            start_pose=start_sim,
+            final_pose=current_sim.copy(),
+            steps=steps,
+            control_dt_s=float(control_dt_s),
+            max_linear_speed_mps=float(max_linear_speed_mps),
+            max_angular_speed_radps=float(max_angular_speed_radps),
+            start_pose_real=start_real,
+            final_pose_real=current_real.copy(),
+        )
 
     for idx, raw_delta in enumerate(actions):
         delta = np.asarray(raw_delta, dtype=np.float64).reshape(OPENPI_DELTA_DIM).copy()

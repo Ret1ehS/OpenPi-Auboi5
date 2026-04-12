@@ -3,20 +3,22 @@
 Main entrypoint for the Jetson-side real-robot OpenPI workflow.
 
 Architecture:
-  - Main thread: serial chunk inference (get_obs -> infer -> execute 10 intervals)
-  - Executor thread: executes one 10-interval servo segment at a time
-  - Gripper state change: execute TCP prefix, wait for gripper, re-infer
+  - Main thread: asynchronous chunk inference (get_obs -> infer -> retime -> submit)
+  - Executor thread: runs a fixed-rate servo loop and fuses overlapping future pose targets
+  - Gripper state change: flush future motion, execute TCP prefix, wait for gripper, re-infer
 
 Inference loop:
   get_obs -> infer -> extract TCP(6D) euler deltas + gripper
     -> take the first 10 action intervals
-    -> execute the segment to completion
-    -> return immediately after the segment finishes
-    -> re-observe from the real robot pose and infer again
+    -> retime from the observation pose to servo-rate future targets
+    -> discard elapsed targets that are already stale by inference completion
+    -> fuse overlapping future targets with previously-submitted chunks
+    -> keep observing and inferring while execution continues
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import os
 import queue
@@ -24,6 +26,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -36,6 +39,25 @@ GRIPPER_THRESHOLD = 0.6
 MAX_EXEC_ACTION_INTERVALS = 10
 NATIVE_INTERP_FACTOR = 5  # 10 intervals -> 50 actions in native mode
 STATE_MODE_YAW = "yaw"
+TEMPORAL_ENSEMBLE_DECAY = 0.6
+MAX_CANDIDATES_PER_TICK = 4
+EXECUTOR_IDLE_WAIT_S = 0.05
+
+
+@dataclass
+class PoseCandidate:
+    pose_sim: np.ndarray
+    generation: int
+    submit_ts: float
+
+
+@dataclass
+class ChunkSubmission:
+    plan: Any
+    snapshot: Any
+    elapsed_steps: int
+    generation: int
+    submit_ts: float
 
 
 def _maybe_reexec_into_repo_venv() -> None:
@@ -394,6 +416,349 @@ class TrajectoryExecutor:
                 self._idle.set()
 
 
+class ParallelTrajectoryExecutor:
+    """Background thread that executes fused future pose targets at a fixed control rate."""
+
+    def __init__(
+        self,
+        *,
+        execute: bool,
+        max_speed_mps: float = 0.05,
+    ):
+        self._execute = execute
+        self._max_speed_mps = max_speed_mps
+        self._queue: queue.Queue = queue.Queue(maxsize=8)
+        self._sentinel = object()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._expected_pose = None
+        self._last_result = None
+        self._reset_servo = False
+        self._current_pose_sim: np.ndarray | None = None
+        self._current_tick = 0
+        self._control_dt_s = 0.01
+        self._latest_snapshot = None
+        self._future_candidates: dict[int, list[PoseCandidate]] = {}
+        self._idle = threading.Event()
+        self._idle.set()
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._queue.put_nowait(self._sentinel)
+        except queue.Full:
+            pass
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    @property
+    def expected_pose(self):
+        with self._lock:
+            if self._expected_pose is not None:
+                return self._expected_pose.copy()
+            return None
+
+    @property
+    def last_result(self):
+        with self._lock:
+            return self._last_result
+
+    @property
+    def is_idle(self) -> bool:
+        return self._idle.is_set()
+
+    def submit(self, plan, snapshot, *, elapsed_steps: int, generation: int) -> None:
+        item = ChunkSubmission(
+            plan=plan,
+            snapshot=snapshot,
+            elapsed_steps=max(0, int(elapsed_steps)),
+            generation=int(generation),
+            submit_ts=time.monotonic(),
+        )
+        self._idle.clear()
+        while True:
+            try:
+                self._queue.put_nowait(item)
+                return
+            except queue.Full:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    pass
+
+    def clear_pending(self) -> None:
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        with self._lock:
+            self._future_candidates.clear()
+        self._idle.set()
+
+    def wait_until_idle(self, timeout: float | None = None) -> bool:
+        return self._idle.wait(timeout=timeout)
+
+    def reset_state(self) -> None:
+        with self._lock:
+            self._expected_pose = None
+            self._last_result = None
+            self._reset_servo = True
+            self._current_pose_sim = None
+            self._current_tick = 0
+            self._control_dt_s = 0.01
+            self._latest_snapshot = None
+            self._future_candidates.clear()
+
+    def _update_idle_flag(self) -> None:
+        with self._lock:
+            has_future = bool(self._future_candidates)
+        if has_future or not self._queue.empty():
+            self._idle.clear()
+        else:
+            self._idle.set()
+
+    @staticmethod
+    def _fuse_pose_candidates(candidates: list[PoseCandidate], fallback_pose: np.ndarray) -> np.ndarray:
+        if not candidates:
+            return np.asarray(fallback_pose, dtype=np.float64).reshape(6).copy()
+
+        ordered = candidates[-MAX_CANDIDATES_PER_TICK:]
+        weights = np.array(
+            [TEMPORAL_ENSEMBLE_DECAY ** float(len(ordered) - 1 - idx) for idx in range(len(ordered))],
+            dtype=np.float64,
+        )
+        weights /= np.sum(weights)
+        poses = np.stack([np.asarray(item.pose_sim, dtype=np.float64).reshape(6) for item in ordered], axis=0)
+
+        fused = np.asarray(fallback_pose, dtype=np.float64).reshape(6).copy()
+        fused[:3] = np.sum(poses[:, :3] * weights[:, None], axis=0)
+        for axis in range(3, 6):
+            fused[axis] = float(
+                np.arctan2(
+                    np.sum(weights * np.sin(poses[:, axis])),
+                    np.sum(weights * np.cos(poses[:, axis])),
+                )
+            )
+        return fused
+
+    def _ingest_submission(self, submission: ChunkSubmission) -> int:
+        plan = submission.plan
+        with self._lock:
+            self._latest_snapshot = submission.snapshot
+            self._control_dt_s = float(plan.control_dt_s)
+            if self._current_pose_sim is None:
+                self._current_pose_sim = np.asarray(plan.start_pose, dtype=np.float64).reshape(6).copy()
+                self._expected_pose = self._current_pose_sim.copy()
+
+            start_idx = min(max(int(submission.elapsed_steps), 0), len(plan.steps))
+            start_tick = int(self._current_tick) + 1
+            remaining = plan.steps[start_idx:]
+            for offset, step in enumerate(remaining):
+                tick = start_tick + offset
+                bucket = self._future_candidates.setdefault(tick, [])
+                bucket.append(
+                    PoseCandidate(
+                        pose_sim=np.asarray(step.pose_sim, dtype=np.float64).reshape(6).copy(),
+                        generation=int(submission.generation),
+                        submit_ts=float(submission.submit_ts),
+                    )
+                )
+                if len(bucket) > MAX_CANDIDATES_PER_TICK:
+                    del bucket[:-MAX_CANDIDATES_PER_TICK]
+
+            for stale_tick in [tick for tick in self._future_candidates.keys() if tick <= self._current_tick]:
+                self._future_candidates.pop(stale_tick, None)
+
+        return max(0, len(plan.steps) - start_idx)
+
+    def _loop(self) -> None:
+        from support.tcp_control import (
+            TrackChunkResult,
+            _get_servo_daemon,
+            sim_pose_to_real,
+        )
+
+        daemon = _get_servo_daemon()
+        servo_active = False
+        next_send_ts = time.monotonic()
+
+        def _finish_servo() -> None:
+            nonlocal servo_active
+            if servo_active:
+                try:
+                    daemon.servo_stop()
+                except Exception:
+                    pass
+                servo_active = False
+
+        def _drain_pending(*, timeout: float | None = None) -> list[object]:
+            items: list[object] = []
+            try:
+                if timeout is None:
+                    items.append(self._queue.get_nowait())
+                else:
+                    items.append(self._queue.get(timeout=timeout))
+            except queue.Empty:
+                return []
+
+            while True:
+                try:
+                    items.append(self._queue.get_nowait())
+                except queue.Empty:
+                    break
+            return items
+
+        def _set_last_result(result) -> None:
+            with self._lock:
+                self._last_result = result
+
+        def _set_expected_pose(pose) -> None:
+            with self._lock:
+                self._expected_pose = None if pose is None else pose.copy()
+
+        while not self._stop.is_set():
+            try:
+                with self._lock:
+                    need_reset = self._reset_servo
+                    if need_reset:
+                        self._reset_servo = False
+                if need_reset:
+                    _finish_servo()
+                    next_send_ts = time.monotonic()
+
+                timeout = 0.0 if self._current_pose_sim is not None else EXECUTOR_IDLE_WAIT_S
+                items = _drain_pending(timeout=timeout)
+                if items:
+                    for item in items:
+                        if item is self._sentinel:
+                            _finish_servo()
+                            return
+                        assert isinstance(item, ChunkSubmission)
+                        remaining = self._ingest_submission(item)
+                        if remaining > 0:
+                            self._idle.clear()
+                    if self._current_pose_sim is not None and time.monotonic() > next_send_ts + max(self._control_dt_s, 1e-6):
+                        next_send_ts = time.monotonic()
+
+                with self._lock:
+                    current_pose_sim = None if self._current_pose_sim is None else self._current_pose_sim.copy()
+                    next_tick = int(self._current_tick) + 1
+                    candidates = list(self._future_candidates.pop(next_tick, []))
+                    snapshot = self._latest_snapshot
+                    control_dt_s = float(self._control_dt_s)
+
+                if current_pose_sim is None:
+                    self._idle.set()
+                    continue
+
+                now = time.monotonic()
+                if next_send_ts > now:
+                    time.sleep(min(next_send_ts - now, 0.002))
+                    self._update_idle_flag()
+                    continue
+
+                target_pose_sim = self._fuse_pose_candidates(candidates, current_pose_sim)
+                target_pose_real = sim_pose_to_real(target_pose_sim)
+
+                if self._execute:
+                    if not servo_active:
+                        resp = daemon.servo_start(control_dt_s)
+                        if int(resp.get("servo_start_ret", -1)) != 0:
+                            _set_last_result(
+                                TrackChunkResult(
+                                    ok=False,
+                                    reason=f"servo_start failed: {resp.get('error', 'unknown')}",
+                                    snapshot=snapshot,
+                                    start_pose=current_pose_sim,
+                                    final_pose=current_pose_sim,
+                                    sample_count=int(next_tick) - 1,
+                                    control_dt_s=control_dt_s,
+                                    tracking_err=0.0,
+                                    exec_mode="streaming",
+                                    raw=resp,
+                                    start_pose_real=sim_pose_to_real(current_pose_sim),
+                                    final_pose_real=sim_pose_to_real(current_pose_sim),
+                                )
+                            )
+                            _set_expected_pose(None)
+                            self._idle.set()
+                            time.sleep(control_dt_s)
+                            continue
+                        daemon.servo_begin_chunk(sim_pose_to_real(current_pose_sim))
+                        servo_active = True
+
+                    resp = daemon.servo_pose(target_pose_real)
+                    pose_ret = int(resp.get("servo_pose_ret", -1))
+                    error = str(resp.get("error", ""))
+                else:
+                    pose_ret = 0
+                    error = ""
+                    resp = {"servo_pose_ret": 0, "simulated": True}
+
+                if pose_ret == 0:
+                    with self._lock:
+                        self._current_tick = next_tick
+                        self._current_pose_sim = target_pose_sim.copy()
+                    _set_expected_pose(target_pose_sim)
+                    _set_last_result(
+                        TrackChunkResult(
+                            ok=True,
+                            reason="streaming fused step",
+                            snapshot=snapshot,
+                            start_pose=current_pose_sim,
+                            final_pose=target_pose_sim,
+                            sample_count=int(next_tick),
+                            control_dt_s=control_dt_s,
+                            tracking_err=0.0,
+                            exec_mode="streaming",
+                            raw=resp,
+                            start_pose_real=sim_pose_to_real(current_pose_sim),
+                            final_pose_real=target_pose_real,
+                        )
+                    )
+                else:
+                    _set_last_result(
+                        TrackChunkResult(
+                            ok=False,
+                            reason=f"servo_pose failed: {error}",
+                            snapshot=snapshot,
+                            start_pose=current_pose_sim,
+                            final_pose=current_pose_sim,
+                            sample_count=int(next_tick) - 1,
+                            control_dt_s=control_dt_s,
+                            tracking_err=0.0,
+                            exec_mode="streaming",
+                            raw=resp,
+                            start_pose_real=sim_pose_to_real(current_pose_sim),
+                            final_pose_real=sim_pose_to_real(current_pose_sim),
+                        )
+                    )
+                    _set_expected_pose(None)
+                    with self._lock:
+                        self._future_candidates.clear()
+                    if error == "safety":
+                        _finish_servo()
+
+            except Exception as exc:
+                _set_last_result(None)
+                _set_expected_pose(None)
+                with self._lock:
+                    self._future_candidates.clear()
+                print(f"  [executor] Error: {exc}")
+                _finish_servo()
+
+            next_send_ts += max(self._control_dt_s, 1e-6)
+            if next_send_ts < time.monotonic() - max(self._control_dt_s, 1e-6):
+                next_send_ts = time.monotonic()
+            self._update_idle_flag()
+
+
 def _calibrate_alignment(prefix: str = "", *, pose_frame: str = "sim") -> None:
     import numpy as np
 
@@ -428,7 +793,7 @@ def main() -> int:
         is_alignment_ready,
         set_alignment_mode,
     )
-    from support.tcp_control import build_helper as build_tcp_helper, get_robot_snapshot
+    from support.tcp_control import build_helper as build_tcp_helper, get_robot_snapshot, retime_tcp_action_chunk
     from support.tui_config import TUIConfig, run_tui_config
 
     initial_qpos_rad = REAL_INIT_QPOS_RAD.copy()
@@ -549,7 +914,7 @@ def main() -> int:
 
     effective_speed = float('inf') if cfg.speed_mode == "native" else cfg.exec_speed_mps
     is_native_speed = cfg.speed_mode == "native"
-    executor = TrajectoryExecutor(
+    executor = ParallelTrajectoryExecutor(
         execute=execute,
         max_speed_mps=effective_speed,
     )
@@ -764,10 +1129,12 @@ def main() -> int:
                 step += 1
                 aligned_obs = obs_builder.build_observation(prompt)
                 obs = aligned_obs.obs
+                obs_ready_ts = time.monotonic()
 
                 t_infer = time.monotonic()
                 action_result = policy.infer(obs)
-                infer_time = time.monotonic() - t_infer
+                infer_done_ts = time.monotonic()
+                infer_time = infer_done_ts - t_infer
 
                 raw_actions = np.asarray(action_result["actions"], dtype=np.float64)
                 if raw_actions.ndim == 1:
@@ -813,6 +1180,16 @@ def main() -> int:
                 prefix_integral = np.sum(tcp_prefix, axis=0, dtype=np.float64) if len(tcp_prefix) else np.zeros((6,), dtype=np.float64)
                 prefix_abs_integral = np.sum(np.abs(tcp_prefix), axis=0, dtype=np.float64) if len(tcp_prefix) else np.zeros((6,), dtype=np.float64)
                 full_integral = np.sum(tcp_deltas, axis=0, dtype=np.float64) if len(tcp_deltas) else np.zeros((6,), dtype=np.float64)
+                plan = retime_tcp_action_chunk(
+                    tcp_prefix,
+                    start_pose_sim=aligned_obs.aligned_tcp_pose_sim,
+                    max_linear_speed_mps=effective_speed,
+                )
+                elapsed_steps = 0
+                if plan.steps:
+                    elapsed_steps = max(0, int((infer_done_ts - obs_ready_ts) / float(plan.control_dt_s)))
+                    elapsed_steps = min(elapsed_steps, len(plan.steps))
+                remaining_steps = max(0, len(plan.steps) - elapsed_steps)
                 _append_infer_log(
                     {
                         "event": "inference_chunk",
@@ -825,24 +1202,41 @@ def main() -> int:
                         "full_integral": [float(v) for v in full_integral.tolist()],
                         "prefix_integral": [float(v) for v in prefix_integral.tolist()],
                         "prefix_abs_integral": [float(v) for v in prefix_abs_integral.tolist()],
+                        "retimed_step_count": int(len(plan.steps)),
+                        "discarded_elapsed_steps": int(elapsed_steps),
+                        "remaining_step_count": int(remaining_steps),
                         "gripper_changed": bool(scheduled_gripper_state is not None),
                         "scheduled_gripper_idx": None if scheduled_gripper_idx is None else int(scheduled_gripper_idx),
                         "scheduled_gripper_state": None if scheduled_gripper_state is None else int(scheduled_gripper_state),
                     }
                 )
 
+                gripper_changed = scheduled_gripper_state is not None
+                if remaining_steps <= 0:
+                    print(
+                        f"  [{step:4d}] Chunk expired before execution "
+                        f"(retimed={len(plan.steps)} discarded={elapsed_steps}), re-inferring..."
+                    )
+                    continue
+
+                if gripper_changed:
+                    # A discrete gripper edge should take precedence over any
+                    # previously buffered future motion.
+                    executor.clear_pending()
+
                 executor.submit(
-                    tcp_prefix,
-                    aligned_obs.aligned_tcp_pose_sim,
+                    plan,
+                    aligned_obs.robot_snapshot,
+                    elapsed_steps=elapsed_steps,
+                    generation=step,
                 )
 
-                gripper_changed = scheduled_gripper_state is not None
                 if gripper_changed:
                     state_name = "open" if scheduled_gripper_state == 1 else "close"
                     print(
                         f"  [{step:4d}] Gripper {state_name} scheduled at chunk index "
                         f"{scheduled_gripper_idx} within first {len(exec_actions)} intervals, "
-                        f"executing TCP prefix ({len(tcp_prefix)} intervals)..."
+                        f"submitting {remaining_steps} fused servo steps and waiting for prefix completion..."
                     )
                     executor.wait_until_idle()
                     last_res = executor.last_result
@@ -853,13 +1247,9 @@ def main() -> int:
                         _apply_gripper_command(step, int(scheduled_gripper_state))
                 else:
                     print(
-                        f"  [{step:4d}] Executing first {len(tcp_prefix)} intervals, then re-infer..."
+                        f"  [{step:4d}] Async submit: {remaining_steps} fused servo steps "
+                        f"(discarded {elapsed_steps}), continuing to next observation..."
                     )
-                    executor.wait_until_idle()
-                    last_res = executor.last_result
-                    if last_res and not last_res.ok:
-                        print(f"    Track error: {last_res.reason}")
-                        executor.reset_state()
 
                 loop_time = time.monotonic() - loop_start
                 last_res = executor.last_result

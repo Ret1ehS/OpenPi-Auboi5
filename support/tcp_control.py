@@ -29,6 +29,7 @@ if __package__ in (None, ""):
     if str(_PARENT) not in sys.path:
         sys.path.insert(0, str(_PARENT))
 
+from support.path_utils import get_build_dir, get_sdk_root
 from support.pose_align import (
     POSE_DIM,
     get_alignment_mode,
@@ -39,8 +40,8 @@ from support.pose_align import (
 )
 
 
-DEFAULT_SDK_ROOT = "/home/orin/openpi/aubo_sdk/aubo_sdk-0.24.1-rc.3-Linux_aarch64+318754d"
-DEFAULT_HELPER_BIN = "/home/orin/openpi/scripts/.build/tcp_control_helper"
+DEFAULT_SDK_ROOT = str(get_sdk_root())
+DEFAULT_HELPER_BIN = str(get_build_dir() / "tcp_control_helper")
 DEFAULT_HELPER_LOG_DIR = Path(__file__).resolve().parent.parent / "log"
 DEFAULT_HELPER_LOG_FILE = DEFAULT_HELPER_LOG_DIR / "tcp_control_helper.log"
 
@@ -55,8 +56,8 @@ DEFAULT_SPEED_FRACTION = 1.0
 DEFAULT_TRACK_CONTROL_DT_S = 0.01
 DEFAULT_TCP_LINEAR_SPEED_MPS = 0.05
 DEFAULT_TCP_ANGULAR_SPEED_RADPS = 0.60
-CONSTANT_SPEED_CORNER_MIN_SCALE = 0.25
-CONSTANT_SPEED_CORNER_RAMP_STEPS = 12
+CONSTANT_SPEED_CORNER_MIN_SCALE = 0.35
+CONSTANT_SPEED_CORNER_RAMP_STEPS = 8
 
 RESET_ERR_M = 0.10
 DEFAULT_Z_MIN_M = 0.180  # TCP minimum z height (180 mm), clip anything below

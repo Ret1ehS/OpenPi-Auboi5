@@ -14,19 +14,27 @@ from __future__ import annotations
 import argparse
 import os
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import serial
 
+if __package__ in (None, ""):
+    _PARENT = Path(__file__).resolve().parent.parent
+    if str(_PARENT) not in sys.path:
+        sys.path.insert(0, str(_PARENT))
+
+from support.path_utils import get_build_dir, get_sdk_root
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SUPPORT_DIR = SCRIPT_DIR
 
-DEFAULT_SDK_ROOT = "/home/orin/openpi/aubo_sdk/aubo_sdk-0.24.1-rc.3-Linux_aarch64+318754d"
+DEFAULT_SDK_ROOT = str(get_sdk_root())
 DEFAULT_TOOL_IO_HELPER_CPP = str(SUPPORT_DIR / "tool_io_helper.cpp")
-DEFAULT_TOOL_IO_HELPER_BIN = "/home/orin/openpi/scripts/.build/tool_io_helper"
+DEFAULT_TOOL_IO_HELPER_BIN = str(get_build_dir() / "tool_io_helper")
 
 DEFAULT_ROBOT_IP = "192.168.1.100"
 DEFAULT_PORT_RPC = 30004
@@ -35,7 +43,7 @@ DEFAULT_PASSWORD = "123456"
 DEFAULT_TOOL_POWER_VOLTAGE = 24
 
 DEFAULT_PORT = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AB0LIYTU-if00-port0"
-FALLBACK_PORT = "/dev/ttyUSB0"
+FALLBACK_PORT = "/dev/ttyUSB3"
 DEFAULT_BAUDRATE = 115200
 DEFAULT_TIMEOUT_S = 0.2
 

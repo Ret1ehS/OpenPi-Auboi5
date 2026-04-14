@@ -14,7 +14,7 @@
 ### 运行推理
 
 ```bash
-cd /home/orin/openpi/scripts
+cd /home/niic/openpi/scripts
 
 python main.py
 ```
@@ -93,7 +93,7 @@ uv run scripts/train.py --config pi05_aubo_agv_lora
 
 ```bash
 scp -r checkpoints/pi05_aubo_agv_lora/my_first_run/9999 \
-    orin@172.18.10.44:/home/orin/openpi/repo/checkpoints/pi05_aubo_agv_lora/my_first_run/
+    niic@172.18.7.202:/home/niic/openpi/repo/checkpoints/pi05_aubo_agv_lora/my_first_run/
 
 python main.py
 ```

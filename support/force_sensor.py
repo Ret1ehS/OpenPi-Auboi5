@@ -36,7 +36,7 @@ import serial
 # ---------------------------------------------------------------------------
 
 DEFAULT_PORT = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A10PHIEG-if00-port0"
-FALLBACK_PORT = "/dev/ttyUSB1"
+FALLBACK_PORT = "/dev/ttyUSB4"
 BAUDRATE = 460800
 TIMEOUT_S = 0.5
 

@@ -35,7 +35,9 @@ if __package__ in (None, ""):
     if str(_PARENT) not in sys.path:
         sys.path.insert(0, str(_PARENT))
 
+from support.path_utils import get_repo_root
 from support.pose_align import real_pose_to_sim
+from support.pyorbbec_utils import frame_to_bgr_image
 from support.tcp_control import RobotSnapshot, get_robot_snapshot
 
 
@@ -101,7 +103,7 @@ def _apply_camera_profile_to_device(role: str, dev) -> None:
 
 
 def _ensure_openpi_client_path() -> None:
-    repo_root = Path("/home/orin/openpi/repo")
+    repo_root = get_repo_root()
     candidate = repo_root / "packages" / "openpi-client" / "src"
     if str(candidate) not in sys.path:
         sys.path.insert(0, str(candidate))
@@ -109,8 +111,6 @@ def _ensure_openpi_client_path() -> None:
 
 _ensure_openpi_client_path()
 from openpi_client import image_tools  # noqa: E402
-sys.path.append("/home/orin/.local/lib/python3.10/site-packages/pyorbbecsdk/examples")
-from utils import frame_to_bgr_image  # noqa: E402
 
 
 @dataclass

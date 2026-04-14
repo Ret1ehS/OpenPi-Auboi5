@@ -20,9 +20,7 @@ scripts/
 │   ├── doctor.py
 │   ├── build_helpers.sh
 │   ├── setup_runtime.sh
-│   ├── setup_observer_env.sh
-│   ├── run_main.sh
-│   └── run_collect.sh
+│   └── setup_observer_env.sh
 ├── utils/
 │   ├── env_utils.py
 │   ├── path_utils.py
@@ -102,13 +100,13 @@ bash tools/setup_observer_env.sh
 启动在线推理：
 
 ```bash
-bash tools/run_main.sh
+python3 main.py
 ```
 
 启动数据采集：
 
 ```bash
-bash tools/run_collect.sh
+python3 collect_data.py
 ```
 
 ## 说明

@@ -30,13 +30,26 @@ from typing import Optional
 
 import serial
 
+if __package__ in (None, ""):
+    from pathlib import Path
+    import sys
+
+    _PARENT = Path(__file__).resolve().parent.parent
+    if str(_PARENT) not in sys.path:
+        sys.path.insert(0, str(_PARENT))
+
+from utils.runtime_config import (
+    DEFAULT_FORCE_SENSOR_FALLBACK_PORT,
+    DEFAULT_FORCE_SENSOR_PORT,
+)
+
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_PORT = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A10PHIEG-if00-port0"
-FALLBACK_PORT = "/dev/ttyUSB4"
+DEFAULT_PORT = DEFAULT_FORCE_SENSOR_PORT
+FALLBACK_PORT = DEFAULT_FORCE_SENSOR_FALLBACK_PORT
 BAUDRATE = 460800
 TIMEOUT_S = 0.5
 

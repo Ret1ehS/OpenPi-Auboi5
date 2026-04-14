@@ -18,11 +18,14 @@ if __package__ in (None, ''):
 
 import numpy as np
 
-from support.path_utils import SCRIPTS_ROOT, get_captures_dir
+from utils.env_utils import load_default_env
+from utils.path_utils import SCRIPTS_ROOT, get_captures_dir, get_log_dir
+from utils.runtime_config import DEFAULT_OBSERVER_MODEL, DEFAULT_OBSERVER_PYTHON
 
+load_default_env()
 
-_DEFAULT_PYTHON = Path('/home/niic/venvs/vllm-jp62-clean/bin/python')
-_DEFAULT_MODEL = Path('/home/niic/modelscope_models/google/gemma-4-E2B-it')
+_DEFAULT_PYTHON = DEFAULT_OBSERVER_PYTHON
+_DEFAULT_MODEL = DEFAULT_OBSERVER_MODEL
 _WORKER_SCRIPT = Path(__file__).resolve()
 
 
@@ -34,7 +37,7 @@ class TaskObserverConfig:
     model_path: Path = _DEFAULT_MODEL
     worker_script: Path = _WORKER_SCRIPT
     captures_dir: Path = get_captures_dir() / 'task_observer'
-    log_path: Path = SCRIPTS_ROOT / 'log' / 'task_observer.log'
+    log_path: Path = get_log_dir() / 'task_observer.log'
     max_new_tokens: int = 96
     task_spec: str = ''
 

@@ -18,18 +18,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+if __package__ in (None, ""):
+    _PARENT = Path(__file__).resolve().parent.parent
+    if str(_PARENT) not in sys.path:
+        sys.path.insert(0, str(_PARENT))
+
+from utils.env_utils import load_default_env
+from utils.path_utils import get_openpi_root, get_repo_root
+from utils.runtime_config import (
+    DEFAULT_CHECKPOINT_DIR,
+    DEFAULT_CONFIG_NAME,
+    DEFAULT_LOCAL_PORT,
+    DEFAULT_NAMESPACE,
+    DEFAULT_REMOTE_PORT,
+    KUBECONFIG_PATH,
+)
+
+load_default_env()
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-OPENPI_ROOT = SCRIPT_DIR.parent.parent
-
-DEFAULT_REPO_ROOT = OPENPI_ROOT / "repo"
-DEFAULT_CONFIG_NAME = "pi05_aubo_agv_lora"
-DEFAULT_CHECKPOINT_DIR = DEFAULT_REPO_ROOT / "checkpoints" / "pi05_aubo_agv_lora" / "my_eighth_run" / "29999"
-
-KUBECONFIG_PATH = SCRIPT_DIR / "kubeconfig.yaml"
-DEFAULT_NAMESPACE = "wangrui"
-DEFAULT_LOCAL_PORT = 8000
-DEFAULT_REMOTE_PORT = 8000
+OPENPI_ROOT = get_openpi_root()
+DEFAULT_REPO_ROOT = get_repo_root()
 
 
 def _ensure_openpi_repo_paths(repo_root: Path = DEFAULT_REPO_ROOT) -> None:

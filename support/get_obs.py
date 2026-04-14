@@ -35,10 +35,10 @@ if __package__ in (None, ""):
     if str(_PARENT) not in sys.path:
         sys.path.insert(0, str(_PARENT))
 
-from support.path_utils import get_repo_root
 from support.pose_align import real_pose_to_sim
-from support.pyorbbec_utils import frame_to_bgr_image
 from support.tcp_control import RobotSnapshot, get_robot_snapshot
+from utils.path_utils import get_repo_root
+from utils.pyorbbec_utils import frame_to_bgr_image
 
 
 OPENPI_IMAGE_SIZE = 224

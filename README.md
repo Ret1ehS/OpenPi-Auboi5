@@ -26,8 +26,6 @@ scripts/
 │   └── niic.env.example
 ├── tools/
 │   ├── doctor.py
-│   ├── setup_runtime.sh
-│   └── setup_observer_env.sh
 ├── utils/
 │   ├── env_utils.py
 │   ├── path_utils.py
@@ -67,6 +65,18 @@ cp config/niic.env.example config/local.env
 
 ```bash
 python3 tools/doctor.py
+```
+
+只检查主运行环境：
+
+```bash
+python3 tools/doctor.py --section runtime
+```
+
+只检查 observer 环境：
+
+```bash
+python3 tools/doctor.py --section observer
 ```
 
 4. 启动在线推理：

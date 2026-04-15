@@ -107,6 +107,20 @@ def _apply_local_jax_runtime_defaults(env: dict[str, str] | None = None) -> dict
     return target
 
 
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _checkpoint_has_safetensors_weights(checkpoint_dir: Path) -> bool:
+    """Return True if the checkpoint dir already contains exported safetensors weights."""
+    if not checkpoint_dir.is_dir():
+        return False
+    if (checkpoint_dir / "model.safetensors").exists():
+        return True
+    # LoRA / alternate exports often use other *.safetensors names at the checkpoint root.
+    return any(checkpoint_dir.glob("*.safetensors"))
+
+
 def _choose_local_jax_platform(checkpoint_dir: Path) -> str | None:
     requested = os.environ.get("OPENPI_JAX_PLATFORM")
     if requested:
@@ -115,8 +129,12 @@ def _choose_local_jax_platform(checkpoint_dir: Path) -> str | None:
             return None
         return requested
 
-    weight_path = checkpoint_dir / "model.safetensors"
-    if weight_path.exists():
+    # Skip the subprocess probe (matmul + cuDNN conv). Use when OPENPI_JAX_PLATFORM=gpu is not set
+    # but the machine is known-good on GPU (e.g. same env as run_niic_jax_gpu.sh).
+    if _env_truthy("OPENPI_SKIP_JAX_GPU_PROBE"):
+        return None
+
+    if _checkpoint_has_safetensors_weights(checkpoint_dir):
         return None
 
     probe_env = dict(os.environ)

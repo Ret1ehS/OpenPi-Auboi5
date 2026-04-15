@@ -136,5 +136,4 @@ Gemma observer 单独使用一套环境，避免和 OpenPI / JAX 依赖互相污
 
 ## 兼容说明
 
-- `support/path_utils.py` 和 `support/pyorbbec_utils.py` 目前是兼容层，新代码应直接从 `utils/` 导入
 - `support/kubeconfig.yaml` 按敏感文件处理，默认不纳入 git

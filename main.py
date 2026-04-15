@@ -29,10 +29,14 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from utils.env_utils import load_default_env
+from utils.path_utils import get_openpi_root, get_repo_root
+
+load_default_env()
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-OPENPI_ROOT = SCRIPT_DIR.parent
-REPO_ROOT = OPENPI_ROOT / "repo"
+OPENPI_ROOT = get_openpi_root()
+REPO_ROOT = get_repo_root()
 REPO_VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
 
 GRIPPER_THRESHOLD = 0.6
@@ -911,6 +915,7 @@ def main() -> int:
     )
     from support.joint_control import build_joint_helper, move_to_joint_positions
     from support.load_policy import PolicyLoadSpec, load_policy
+    from support.task_observer import TaskObserverConfig, TaskCompletionObserver
     from support.pose_align import (
         REAL_INIT_QPOS_RAD,
         clear_runtime_alignment,
@@ -1010,6 +1015,11 @@ def main() -> int:
     else:
         print(f"  Exec Speed: native (no retime)")
     print(f"  Record:     {cfg.record}")
+    print(f"  Observer:   {'enabled' if cfg.task_observer_enabled else 'disabled'}")
+    if cfg.task_observer_enabled:
+        print(f"  Observer Interval: {cfg.task_observer_interval_s} s")
+        if cfg.task_observer_spec_file:
+            print(f"  Observer Spec File: {cfg.task_observer_spec_file}")
     if cfg.dry_run:
         print(f"  Debug Dry Run: {cfg.dry_run}")
 
@@ -1028,6 +1038,38 @@ def main() -> int:
     policy_load_s = time.monotonic() - t0
     print(f"POLICY_READY={type(policy).__name__}  load_time={policy_load_s:.3f}s")
     print(f"POSE_FRAME={get_alignment_mode()}")
+
+    task_observer_env_cfg = TaskObserverConfig.from_env()
+    task_observer_spec = task_observer_env_cfg.task_spec
+    if cfg.task_observer_spec_file:
+        observer_spec_path = Path(cfg.task_observer_spec_file).expanduser()
+        if observer_spec_path.exists():
+            task_observer_spec = observer_spec_path.read_text(encoding='utf-8').strip()
+        else:
+            print(f"TASK_OBSERVER_SPEC_FILE missing: {observer_spec_path}")
+    task_observer_cfg = TaskObserverConfig(
+        enabled=cfg.task_observer_enabled,
+        interval_s=max(0.5, float(cfg.task_observer_interval_s)),
+        python_bin=task_observer_env_cfg.python_bin,
+        model_path=task_observer_env_cfg.model_path,
+        worker_script=task_observer_env_cfg.worker_script,
+        captures_dir=task_observer_env_cfg.captures_dir,
+        log_path=task_observer_env_cfg.log_path,
+        max_new_tokens=task_observer_env_cfg.max_new_tokens,
+        task_spec=task_observer_spec,
+    )
+    task_observer = TaskCompletionObserver(task_observer_cfg)
+    task_observer.start()
+    if task_observer.enabled:
+        print(
+            "TASK_OBSERVER=enabled  "
+            f"interval={task_observer_cfg.interval_s:.1f}s  "
+            f"model={task_observer_cfg.model_path}"
+        )
+        if task_observer_cfg.task_spec:
+            print("TASK_OBSERVER_SPEC loaded.")
+        else:
+            print("TASK_OBSERVER_SPEC empty: observer will rely on the task prompt.")
 
     obs_state_mode = STATE_MODE_YAW
     if str(cfg.obs_state_mode).strip().lower() != STATE_MODE_YAW:
@@ -1097,6 +1139,8 @@ def main() -> int:
                 print(f"  Collision: {snap.collision}")
                 print(f"  Safety limits OK: {snap.within_safety_limits}")
                 print(f"  Executor idle: {executor.is_idle}")
+                if task_observer.enabled:
+                    print(f"  Task Observer: {task_observer.status_text()}")
             except Exception as exc:
                 print(f"  Error: {exc}")
             continue
@@ -1141,6 +1185,7 @@ def main() -> int:
             executor.reset_state()
             obs_builder.reset_pose_filter()
             policy.reset()
+            task_observer.end_session()
             print("Policy state reset. Executor state cleared.")
             continue
 
@@ -1162,6 +1207,7 @@ def main() -> int:
 
         policy.reset()
         executor.reset_state()
+        task_observer.begin_session(prompt)
 
         if execute:
             print("Auto-init: aligning joints...")
@@ -1190,7 +1236,7 @@ def main() -> int:
         video_path = None
         if cfg.record:
             import cv2
-            captures_dir = Path("/home/orin/openpi/captures")
+            captures_dir = OPENPI_ROOT / "captures"
             captures_dir.mkdir(parents=True, exist_ok=True)
             timestamp_str = time.strftime("%Y%m%d_%H%M%S")
             video_path = captures_dir / f"inference_{timestamp_str}.mp4"
@@ -1311,6 +1357,35 @@ def main() -> int:
 
         try:
             while True:
+                observer_result = task_observer.pop_completion()
+                if observer_result is not None and observer_result.complete:
+                    executor.clear_pending()
+                    print(
+                        "\n  Task observer marked the task as complete. "
+                        f"confidence={observer_result.confidence:.2f} reason={observer_result.reason}"
+                    )
+                    print("  Waiting for in-flight trajectory to finish...")
+                    executor.wait_until_idle()
+                    executor.reset_state()
+                    task_observer.end_session()
+                    _append_infer_log(
+                        {
+                            "event": "session_stop",
+                            "prompt": prompt,
+                            "steps": int(step),
+                            "reason": "task_observer_complete",
+                            "observer_confidence": float(observer_result.confidence),
+                            "observer_reason": str(observer_result.reason),
+                        }
+                    )
+                    if _rec_thread is not None:
+                        _rec_stop.set()
+                        _rec_thread.join(timeout=3)
+                        print(f"  Video saved: {video_path}")
+                        _rec_thread = None
+                    print(f"\n  Inference stopped after {step} steps.")
+                    break
+
                 last_res = executor.last_result
                 if last_res and not last_res.ok:
                     print(f"    Track error: {last_res.reason}")
@@ -1386,6 +1461,7 @@ def main() -> int:
                 loop_start = time.monotonic()
                 step += 1
                 aligned_obs = obs_builder.build_observation(prompt)
+                task_observer.update_observation(step=step, aligned_obs=aligned_obs)
                 obs = aligned_obs.obs
                 obs_queue_state = executor.get_progress()
                 observation_tick = int(obs_queue_state["current_tick"])
@@ -1572,6 +1648,7 @@ def main() -> int:
 
         except KeyboardInterrupt:
             executor.clear_pending()
+            task_observer.end_session()
             print("\n  Waiting for in-flight trajectory to finish...")
             executor.wait_until_idle()
             executor.reset_state()
@@ -1590,6 +1667,7 @@ def main() -> int:
                 _rec_thread = None
             print(f"\n  Inference stopped after {step} steps.")
 
+    task_observer.stop()
     executor.stop()
     obs_builder.stop()
     print("Shutdown complete. Bye.")

@@ -31,11 +31,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from utils.env_utils import load_default_env
+from utils.path_utils import get_openpi_root, get_repo_root
 
+load_default_env()
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-OPENPI_ROOT = SCRIPT_DIR.parent
-REPO_ROOT = OPENPI_ROOT / "repo"
+OPENPI_ROOT = get_openpi_root()
+REPO_ROOT = get_repo_root()
 REPO_VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
 
 

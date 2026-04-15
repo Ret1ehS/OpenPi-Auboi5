@@ -12,20 +12,33 @@ from __future__ import annotations
 import argparse
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
+if __package__ in (None, ""):
+    _PARENT = Path(__file__).resolve().parent.parent
+    if str(_PARENT) not in sys.path:
+        sys.path.insert(0, str(_PARENT))
 
-DEFAULT_SDK_ROOT = "/home/orin/openpi/aubo_sdk/aubo_sdk-0.24.1-rc.3-Linux_aarch64+318754d"
+from utils.path_utils import get_build_dir, get_sdk_root
+from utils.runtime_config import (
+    DEFAULT_AUBO_PASSWORD,
+    DEFAULT_AUBO_RPC_PORT,
+    DEFAULT_AUBO_USER,
+    DEFAULT_ROBOT_IP,
+)
+
+
+DEFAULT_SDK_ROOT = str(get_sdk_root())
 DEFAULT_HELPER_CPP = "joint_control_helper.cpp"
-DEFAULT_HELPER_BIN = "/home/orin/openpi/scripts/.build/joint_control_helper"
+DEFAULT_HELPER_BIN = str(get_build_dir() / "joint_control_helper")
 
-DEFAULT_ROBOT_IP = "192.168.1.100"
-DEFAULT_PORT = 30004
-DEFAULT_USER = "aubo"
-DEFAULT_PASSWORD = "123456"
+DEFAULT_PORT = DEFAULT_AUBO_RPC_PORT
+DEFAULT_USER = DEFAULT_AUBO_USER
+DEFAULT_PASSWORD = DEFAULT_AUBO_PASSWORD
 DEFAULT_SPEED_DEG = 10.0
 DEFAULT_ACC_DEG = 20.0
 DEFAULT_SPEED_FRACTION = 1.0
@@ -261,4 +274,3 @@ __all__ = [
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

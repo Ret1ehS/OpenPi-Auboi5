@@ -9,6 +9,8 @@ Remote mode starts kubectl port-forward and forwards inference over WebSocket.
 from __future__ import annotations
 
 import atexit
+import os
+import shlex
 import subprocess
 import sys
 import time
@@ -16,18 +18,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+if __package__ in (None, ""):
+    _PARENT = Path(__file__).resolve().parent.parent
+    if str(_PARENT) not in sys.path:
+        sys.path.insert(0, str(_PARENT))
+
+from utils.env_utils import load_default_env
+from utils.path_utils import get_openpi_root, get_repo_root
+from utils.runtime_config import (
+    DEFAULT_CHECKPOINT_DIR,
+    DEFAULT_CONFIG_NAME,
+    DEFAULT_LOCAL_PORT,
+    DEFAULT_NAMESPACE,
+    DEFAULT_REMOTE_PORT,
+    KUBECONFIG_PATH,
+)
+
+load_default_env()
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-OPENPI_ROOT = SCRIPT_DIR.parent.parent
-
-DEFAULT_REPO_ROOT = OPENPI_ROOT / "repo"
-DEFAULT_CONFIG_NAME = "pi05_aubo_agv_lora"
-DEFAULT_CHECKPOINT_DIR = DEFAULT_REPO_ROOT / "checkpoints" / "pi05_aubo_agv_lora" / "my_first_run" / "9999"
-
-KUBECONFIG_PATH = SCRIPT_DIR / "kubeconfig.yaml"
-DEFAULT_NAMESPACE = "wangrui"
-DEFAULT_LOCAL_PORT = 8000
-DEFAULT_REMOTE_PORT = 8000
+OPENPI_ROOT = get_openpi_root()
+DEFAULT_REPO_ROOT = get_repo_root()
 
 
 def _ensure_openpi_repo_paths(repo_root: Path = DEFAULT_REPO_ROOT) -> None:
@@ -42,6 +53,102 @@ def _ensure_openpi_repo_paths(repo_root: Path = DEFAULT_REPO_ROOT) -> None:
 
 
 _ensure_openpi_repo_paths()
+
+
+_JAX_GPU_PROBE = r"""
+import jax
+import jax.numpy as jnp
+from jax import lax
+
+print("devices", jax.devices())
+if jax.default_backend() != "gpu":
+    raise SystemExit("default backend is not gpu")
+x = jnp.arange(1024 * 1024, dtype=jnp.float32).reshape(1024, 1024)
+y = x.T @ x
+z = jnp.repeat(y[:8, :8], 2, axis=0)
+_ = z.block_until_ready()
+# Exercise a tiny conv so cuDNN failures are detected before policy load.
+image = jnp.ones((1, 32, 32, 3), dtype=jnp.float32)
+kernel = jnp.ones((3, 3, 3, 8), dtype=jnp.float32)
+conv = lax.conv_general_dilated(
+    image,
+    kernel,
+    window_strides=(1, 1),
+    padding="SAME",
+    dimension_numbers=("NHWC", "HWIO", "NHWC"),
+)
+_ = conv.block_until_ready()
+print("gpu probe ok", z.shape)
+"""
+
+_SAFE_GPU_XLA_FLAGS = (
+    "--xla_gpu_autotune_level=0",
+)
+
+
+def _merge_xla_flags(value: str | None, flags: tuple[str, ...] = _SAFE_GPU_XLA_FLAGS) -> str:
+    parts = shlex.split(value or "")
+    for flag in flags:
+        if flag not in parts:
+            parts.append(flag)
+    return " ".join(parts).strip()
+
+
+def _apply_local_jax_runtime_defaults(env: dict[str, str] | None = None) -> dict[str, str] | None:
+    target = os.environ if env is None else env
+
+    if os.environ.get("OPENPI_DISABLE_JAX_GPU_FIX", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        merged_flags = _merge_xla_flags(target.get("XLA_FLAGS"))
+        if merged_flags:
+            target["XLA_FLAGS"] = merged_flags
+
+    target.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    return target
+
+
+def _choose_local_jax_platform(checkpoint_dir: Path) -> str | None:
+    requested = os.environ.get("OPENPI_JAX_PLATFORM")
+    if requested:
+        requested = requested.strip().lower()
+        if requested == "gpu":
+            return None
+        return requested
+
+    weight_path = checkpoint_dir / "model.safetensors"
+    if weight_path.exists():
+        return None
+
+    probe_env = dict(os.environ)
+    probe_env["JAX_PLATFORMS"] = ""
+    probe_env["JAX_PLATFORM_NAME"] = ""
+    _apply_local_jax_runtime_defaults(probe_env)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _JAX_GPU_PROBE],
+            capture_output=True,
+            text=True,
+            timeout=90,
+            env=probe_env,
+        )
+    except Exception as exc:
+        print(f"  [local] JAX GPU probe error ({type(exc).__name__}: {exc}), forcing CPU backend.")
+        return "cpu"
+
+    if result.returncode == 0:
+        return None
+
+    stderr = (result.stderr or "").strip()
+    stdout = (result.stdout or "").strip()
+    detail = stderr or stdout or f"rc={result.returncode}"
+    print(f"  [local] JAX GPU probe failed ({detail}), forcing CPU backend.")
+    return "cpu"
+
+
+def _apply_jax_platform(platform: str | None) -> None:
+    if not platform:
+        return
+    os.environ["JAX_PLATFORMS"] = platform
+    os.environ["JAX_PLATFORM_NAME"] = platform
 
 
 @dataclass(frozen=True)
@@ -211,6 +318,9 @@ def create_local_policy(spec: PolicyLoadSpec | None = None) -> LocalPolicyRunner
     checkpoint_dir = Path(spec.checkpoint_dir).resolve()
     if not checkpoint_dir.exists():
         raise FileNotFoundError(f"checkpoint directory not found: {checkpoint_dir}")
+
+    _apply_local_jax_runtime_defaults()
+    _apply_jax_platform(_choose_local_jax_platform(checkpoint_dir))
 
     try:
         from openpi.training.config import get_config

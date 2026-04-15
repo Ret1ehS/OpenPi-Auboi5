@@ -108,6 +108,9 @@ class TUIConfig:
     exec_speed_mps: float  # max TCP linear speed (m/s) for servo execution
     speed_mode: str = "limited"  # "limited" | "native"
     record: bool = False   # True to record video of inference session
+    task_observer_enabled: bool = False
+    task_observer_interval_s: float = 5.0
+    task_observer_spec_file: str = ""
     quit: bool = False     # True if user pressed q
 
 
@@ -262,8 +265,11 @@ def run_tui_config(
         ToggleItem("Policy", ["remote", "local"], selected=0),
         ToggleItem("Frame", ["sim", "real"], selected=0),
         ToggleItem("Record", ["false", "true"], selected=0),
+        ToggleItem("Task Observer", ["false", "true"], selected=0),
         ToggleItem("Speed Mode", ["limited", "native"], selected=0),
         TextItem("Exec Speed (m/s)", "0.05"),
+        TextItem("Observer Interval (s)", "5.0"),
+        TextItem("Observer Spec File", ""),
         SeparatorItem(),
         ActionItem("Align Joints", "align"),
         ActionItem("Open Gripper", "grip_open"),
@@ -437,10 +443,13 @@ def _get_env_bool(name: str, default: bool = False) -> bool:
 
 
 def _infer_nonselectable_labels(rows: list[MenuRow]) -> set[str]:
-    """When Speed Mode is 'native', hide the Exec Speed text input."""
+    """Hide inputs that are not relevant to the current config selection."""
     labels: set[str] = set()
     if _get_toggle(rows, "Speed Mode") == "native":
         labels.add("Exec Speed (m/s)")
+    if _get_toggle(rows, "Task Observer") != "true":
+        labels.add("Observer Interval (s)")
+        labels.add("Observer Spec File")
     return labels
 
 
@@ -459,6 +468,9 @@ def _snapshot_config(rows: list[MenuRow]) -> TUIConfig:
         exec_speed_mps=_get_float(rows, "Exec Speed (m/s)", 0.05),
         speed_mode=speed_mode,
         record=_get_toggle(rows, "Record") == "true",
+        task_observer_enabled=_get_toggle(rows, "Task Observer") == "true",
+        task_observer_interval_s=_get_float(rows, "Observer Interval (s)", 5.0),
+        task_observer_spec_file=_get_text(rows, "Observer Spec File").strip(),
     )
 
 

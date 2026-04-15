@@ -26,7 +26,6 @@ scripts/
 │   └── niic.env.example
 ├── tools/
 │   ├── doctor.py
-│   ├── build_helpers.sh
 │   ├── setup_runtime.sh
 │   └── setup_observer_env.sh
 ├── utils/
@@ -70,19 +69,13 @@ cp config/niic.env.example config/local.env
 python3 tools/doctor.py
 ```
 
-4. 构建 helper：
-
-```bash
-bash tools/build_helpers.sh
-```
-
-5. 启动在线推理：
+4. 启动在线推理：
 
 ```bash
 python3 main.py
 ```
 
-6. 启动数据采集：
+5. 启动数据采集：
 
 ```bash
 python3 collect_data.py

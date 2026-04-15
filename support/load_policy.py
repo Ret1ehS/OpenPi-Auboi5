@@ -11,6 +11,7 @@ from __future__ import annotations
 import atexit
 import os
 import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -297,12 +298,16 @@ class RemotePolicyRunner:
         self._port_forward_proc = None
 
     def _connect_ws(self, timeout: float = 30.0) -> None:
-        del timeout  # reserved for future use
         from openpi_client.websocket_client_policy import WebsocketClientPolicy
 
         print(f"  Connecting to ws://localhost:{self._local_port} ...")
-        self._client = WebsocketClientPolicy(host="localhost", port=self._local_port)
-        self._metadata = self._client.get_server_metadata()
+        previous_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(timeout)
+        try:
+            self._client = WebsocketClientPolicy(host="localhost", port=self._local_port)
+            self._metadata = self._client.get_server_metadata()
+        finally:
+            socket.setdefaulttimeout(previous_timeout)
         print(f"  Connected. Server metadata keys: {list(self._metadata.keys())}")
 
     def _reconnect_ws(self) -> None:

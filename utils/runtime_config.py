@@ -37,6 +37,11 @@ def _env_path(name: str, default: Path, *, base: Path | None = None) -> Path:
     return path.resolve()
 
 
+def _env_is_set(name: str) -> bool:
+    raw = os.environ.get(name)
+    return raw is not None and raw.strip() != ""
+
+
 DEFAULT_CONFIG_NAME = _env_str("OPENPI_POLICY_CONFIG_NAME", "pi05_aubo_agv_lora")
 DEFAULT_CHECKPOINT_DIR = _env_path(
     "OPENPI_CHECKPOINT_DIR",
@@ -56,6 +61,8 @@ DEFAULT_AUBO_RPC_PORT = _env_int("OPENPI_ROBOT_PORT", 30004)
 DEFAULT_AUBO_USER = _env_str("OPENPI_ROBOT_USER", "aubo")
 DEFAULT_AUBO_PASSWORD = _env_str("OPENPI_ROBOT_PASSWORD", "123456")
 DEFAULT_ROBOT_IP = _env_str("OPENPI_ROBOT_IP", "192.168.1.100")
+ROBOT_PASSWORD_FROM_ENV = _env_is_set("OPENPI_ROBOT_PASSWORD")
+ROBOT_IP_FROM_ENV = _env_is_set("OPENPI_ROBOT_IP")
 
 DEFAULT_GRIPPER_PORT = _env_str(
     "OPENPI_GRIPPER_PORT",
@@ -84,6 +91,19 @@ DEFAULT_OBSERVER_MODEL = _env_path(
 )
 
 
+def get_robot_config_warnings() -> tuple[str, ...]:
+    warnings: list[str] = []
+    if not ROBOT_IP_FROM_ENV:
+        warnings.append(
+            "OPENPI_ROBOT_IP is not set; using the built-in default robot address."
+        )
+    if not ROBOT_PASSWORD_FROM_ENV:
+        warnings.append(
+            "OPENPI_ROBOT_PASSWORD is not set; using the built-in default robot password."
+        )
+    return tuple(warnings)
+
+
 __all__ = [
     "DEFAULT_AUBO_PASSWORD",
     "DEFAULT_AUBO_RPC_PORT",
@@ -101,4 +121,7 @@ __all__ = [
     "DEFAULT_REMOTE_PORT",
     "DEFAULT_ROBOT_IP",
     "KUBECONFIG_PATH",
+    "ROBOT_IP_FROM_ENV",
+    "ROBOT_PASSWORD_FROM_ENV",
+    "get_robot_config_warnings",
 ]

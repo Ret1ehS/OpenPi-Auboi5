@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import queue
 import math
 import re
 import subprocess
@@ -84,6 +85,11 @@ FORCE_ADMITTANCE_MIN_DT_S = 0.001
 FORCE_ADMITTANCE_MAX_DT_S = 0.05
 FORCE_ADMITTANCE_FORCE_DEADBAND_N = 1.5
 _FORCE_GUARD_UNSET = object()
+DAEMON_STARTUP_TIMEOUT_S = 10.0
+DAEMON_COMMAND_TIMEOUT_S = 10.0
+DAEMON_STOP_TIMEOUT_S = 3.0
+HELPER_RUN_TIMEOUT_S = 20.0
+_DAEMON_SENTINEL = object()
 
 JOINT_NAMES = [
     "base_link",
@@ -553,7 +559,7 @@ def _run_helper(
     if execute:
         cmd.append("--execute")
 
-    completed = subprocess.run(cmd, capture_output=True, text=True)
+    completed = subprocess.run(cmd, capture_output=True, text=True, timeout=HELPER_RUN_TIMEOUT_S)
     parsed = _parse_helper_output(completed.stdout)
     parsed["_returncode"] = completed.returncode
     parsed["_stdout"] = completed.stdout
@@ -587,6 +593,11 @@ class _DaemonHelper:
         ]
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
+        self._stdout_queue: queue.Queue[str | object] | None = None
+        self._stderr_lines: list[str] = []
+        self._stderr_lock = threading.Lock()
+        self._stdout_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
         self._last_servo_pose_real: np.ndarray | None = None
         self._servo_force_guard_fz_n: float | None = None
         self._servo_force_guard_scale: float | None = None
@@ -597,6 +608,104 @@ class _DaemonHelper:
         self._servo_force_guard_block_v_mps = 0.0
         self._servo_force_guard_last_apply_ts_s: float | None = None
         self._servo_force_target_fz_n: float | None = None
+
+    def _collect_stderr_summary(self) -> str:
+        with self._stderr_lock:
+            if not self._stderr_lines:
+                return ""
+            return "".join(self._stderr_lines[-20:]).strip()
+
+    def _start_reader_threads(self, proc: subprocess.Popen) -> None:
+        self._stdout_queue = queue.Queue()
+        with self._stderr_lock:
+            self._stderr_lines.clear()
+
+        def _pump_stdout() -> None:
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    self._stdout_queue.put(line)
+            finally:
+                self._stdout_queue.put(_DAEMON_SENTINEL)
+
+        def _pump_stderr() -> None:
+            try:
+                assert proc.stderr is not None
+                for line in proc.stderr:
+                    with self._stderr_lock:
+                        self._stderr_lines.append(line)
+                        if len(self._stderr_lines) > 200:
+                            del self._stderr_lines[:-200]
+            except Exception:
+                return
+
+        self._stdout_thread = threading.Thread(
+            target=_pump_stdout,
+            name="tcp-control-helper-stdout",
+            daemon=True,
+        )
+        self._stderr_thread = threading.Thread(
+            target=_pump_stderr,
+            name="tcp-control-helper-stderr",
+            daemon=True,
+        )
+        self._stdout_thread.start()
+        self._stderr_thread.start()
+
+    def _reset_proc_state(self, proc: subprocess.Popen | None = None) -> None:
+        if proc is not None:
+            try:
+                if proc.stdout is not None:
+                    proc.stdout.close()
+            except Exception:
+                pass
+            try:
+                if proc.stderr is not None:
+                    proc.stderr.close()
+            except Exception:
+                pass
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except Exception:
+                pass
+        self._proc = None
+        self._stdout_queue = None
+        self._stdout_thread = None
+        self._stderr_thread = None
+
+    def _readline(self, *, timeout_s: float, context: str) -> str:
+        if self._stdout_queue is None:
+            raise RuntimeError(f"daemon helper is not ready during {context}")
+        try:
+            item = self._stdout_queue.get(timeout=timeout_s)
+        except queue.Empty as exc:
+            raise TimeoutError(f"daemon helper timed out during {context} after {timeout_s:.1f}s") from exc
+        if item is _DAEMON_SENTINEL:
+            proc = self._proc
+            rc = proc.poll() if proc is not None else None
+            stderr_summary = self._collect_stderr_summary()
+            self._reset_proc_state(proc)
+            detail = f"daemon helper exited during {context}"
+            if rc is not None:
+                detail += f" (rc={rc})"
+            if stderr_summary:
+                detail += f": {stderr_summary}"
+            raise RuntimeError(detail)
+        return str(item)
+
+    def _read_until_end(self, *, timeout_s: float, context: str) -> list[str]:
+        deadline = time.monotonic() + timeout_s
+        lines: list[str] = []
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise TimeoutError(f"daemon helper timed out waiting for END during {context}")
+            line = self._readline(timeout_s=remaining, context=context)
+            stripped = line.strip()
+            if stripped == "END":
+                return lines
+            lines.append(line)
 
     def _ensure_started(self) -> subprocess.Popen:
         if self._proc is not None and self._proc.poll() is None:
@@ -610,12 +719,23 @@ class _DaemonHelper:
             text=True,
             bufsize=1,  # line-buffered
         )
+        self._start_reader_threads(self._proc)
         # Wait for DAEMON_READY
+        deadline = time.monotonic() + DAEMON_STARTUP_TIMEOUT_S
         while True:
-            line = self._proc.stdout.readline()
-            if not line:
-                rc = self._proc.wait()
-                raise RuntimeError(f"daemon helper exited during startup (rc={rc})")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                proc = self._proc
+                stderr_summary = self._collect_stderr_summary()
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=DAEMON_STOP_TIMEOUT_S)
+                self._reset_proc_state(proc)
+                detail = "daemon helper startup timed out waiting for DAEMON_READY"
+                if stderr_summary:
+                    detail += f": {stderr_summary}"
+                raise TimeoutError(detail)
+            line = self._readline(timeout_s=remaining, context="startup")
             if "DAEMON_READY" in line:
                 break
         return self._proc
@@ -623,36 +743,28 @@ class _DaemonHelper:
     def _send_cmd(self, cmd: str) -> dict[str, object]:
         """Send a command, read lines until 'END', return parsed dict."""
         proc = self._ensure_started()
-        proc.stdin.write(cmd + "\n")
-        proc.stdin.flush()
-        lines = []
-        while True:
-            line = proc.stdout.readline()
-            if not line:
-                self._proc = None
-                raise RuntimeError(f"daemon helper died during '{cmd.split()[0]}'")
-            stripped = line.strip()
-            if stripped == "END":
-                break
-            lines.append(line)
+        try:
+            assert proc.stdin is not None
+            proc.stdin.write(cmd + "\n")
+            proc.stdin.flush()
+        except Exception:
+            self._reset_proc_state(proc)
+            raise
+        lines = self._read_until_end(timeout_s=DAEMON_COMMAND_TIMEOUT_S, context=cmd.split()[0])
         return _parse_helper_output("\n".join(lines))
 
     def snapshot_raw(self) -> str:
         """Send 'snapshot' command and return all output lines until 'END'."""
         with self._lock:
             proc = self._ensure_started()
-            proc.stdin.write("snapshot\n")
-            proc.stdin.flush()
-            lines = []
-            while True:
-                line = proc.stdout.readline()
-                if not line:
-                    self._proc = None
-                    raise RuntimeError("daemon helper died during snapshot")
-                stripped = line.strip()
-                if stripped == "END":
-                    break
-                lines.append(line)
+            try:
+                assert proc.stdin is not None
+                proc.stdin.write("snapshot\n")
+                proc.stdin.flush()
+            except Exception:
+                self._reset_proc_state(proc)
+                raise
+            lines = self._read_until_end(timeout_s=DAEMON_COMMAND_TIMEOUT_S, context="snapshot")
             return "\n".join(lines)
 
     def servo_start(self, track_time_s: float = DEFAULT_TRACK_CONTROL_DT_S) -> dict[str, object]:
@@ -859,23 +971,18 @@ class _DaemonHelper:
         with self._lock:
             proc = self._ensure_started()
             # Header: servo_chunk N
-            proc.stdin.write(f"servo_chunk {len(guarded_poses)}\n")
-            # Body: one pose per line
-            for p in guarded_poses:
-                vals = np.asarray(p, dtype=np.float64).reshape(POSE_DIM)
-                proc.stdin.write(" ".join(f"{v:.12g}" for v in vals) + "\n")
-            proc.stdin.flush()
-            # Read response until END
-            lines = []
-            while True:
-                line = proc.stdout.readline()
-                if not line:
-                    self._proc = None
-                    raise RuntimeError("daemon helper died during servo_chunk")
-                stripped = line.strip()
-                if stripped == "END":
-                    break
-                lines.append(line)
+            try:
+                assert proc.stdin is not None
+                proc.stdin.write(f"servo_chunk {len(guarded_poses)}\n")
+                # Body: one pose per line
+                for p in guarded_poses:
+                    vals = np.asarray(p, dtype=np.float64).reshape(POSE_DIM)
+                    proc.stdin.write(" ".join(f"{v:.12g}" for v in vals) + "\n")
+                proc.stdin.flush()
+            except Exception:
+                self._reset_proc_state(proc)
+                raise
+            lines = self._read_until_end(timeout_s=DAEMON_COMMAND_TIMEOUT_S, context="servo_chunk")
         resp = _parse_helper_output("\n".join(lines))
         resp.update(
             _force_guard_meta(
@@ -924,14 +1031,20 @@ class _DaemonHelper:
 
     def stop(self) -> None:
         with self._lock:
-            if self._proc is not None and self._proc.poll() is None:
+            proc = self._proc
+            if proc is not None and proc.poll() is None:
                 try:
-                    self._proc.stdin.write("quit\n")
-                    self._proc.stdin.flush()
-                    self._proc.wait(timeout=3)
+                    if proc.stdin is not None:
+                        proc.stdin.write("quit\n")
+                        proc.stdin.flush()
+                    proc.wait(timeout=DAEMON_STOP_TIMEOUT_S)
                 except Exception:
-                    self._proc.kill()
-                self._proc = None
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=DAEMON_STOP_TIMEOUT_S)
+                    except Exception:
+                        pass
+            self._reset_proc_state(proc)
 
 
 # Two independent daemon instances:
@@ -963,6 +1076,23 @@ def _get_motion_daemon() -> _DaemonHelper:
 def _get_servo_daemon() -> _DaemonHelper:
     """Backward-compatible alias for older call sites."""
     return _get_motion_daemon()
+
+
+def _stop_all_daemons() -> None:
+    global _snapshot_daemon, _motion_daemon
+    with _daemon_lock:
+        daemons = (_snapshot_daemon, _motion_daemon)
+        _snapshot_daemon = None
+        _motion_daemon = None
+    for daemon in daemons:
+        if daemon is not None:
+            try:
+                daemon.stop()
+            except Exception:
+                pass
+
+
+atexit.register(_stop_all_daemons)
 
 
 def get_robot_snapshot(

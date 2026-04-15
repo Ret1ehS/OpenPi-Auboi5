@@ -75,6 +75,7 @@ DEFAULT_POLL_INTERVAL_S = 0.05
 DEFAULT_WAIT_TIMEOUT_S = 2.5
 DEFAULT_STABLE_READS = 3
 DEFAULT_POSITION_TOL = 5
+TOOL_IO_HELPER_TIMEOUT_S = 15.0
 
 
 def _env_int(name: str, default: int) -> int:
@@ -146,7 +147,7 @@ def _run_tool_io_helper(
         cmd.extend(["--set-voltage", str(int(set_voltage))])
     if status:
         cmd.append("--status")
-    return subprocess.run(cmd, capture_output=True, text=True)
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=TOOL_IO_HELPER_TIMEOUT_S)
 
 
 def ensure_tool_power_enabled(

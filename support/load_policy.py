@@ -85,6 +85,12 @@ print("gpu probe ok", z.shape)
 _SAFE_GPU_XLA_FLAGS = (
     "--xla_gpu_autotune_level=0",
 )
+_SYSTEM_CUDA_LIBRARY_PATHS = (
+    "/usr/lib/aarch64-linux-gnu",
+    "/lib/aarch64-linux-gnu",
+    "/usr/local/cuda/targets/aarch64-linux/lib",
+    "/usr/local/cuda/lib64",
+)
 
 
 def _merge_xla_flags(value: str | None, flags: tuple[str, ...] = _SAFE_GPU_XLA_FLAGS) -> str:
@@ -95,6 +101,15 @@ def _merge_xla_flags(value: str | None, flags: tuple[str, ...] = _SAFE_GPU_XLA_F
     return " ".join(parts).strip()
 
 
+def _prepend_library_paths(value: str | None, paths: tuple[str, ...] = _SYSTEM_CUDA_LIBRARY_PATHS) -> str:
+    parts = [part for part in (value or "").split(":") if part]
+    merged: list[str] = []
+    for part in (*paths, *parts):
+        if part and part not in merged:
+            merged.append(part)
+    return ":".join(merged)
+
+
 def _apply_local_jax_runtime_defaults(env: dict[str, str] | None = None) -> dict[str, str] | None:
     target = os.environ if env is None else env
 
@@ -102,7 +117,12 @@ def _apply_local_jax_runtime_defaults(env: dict[str, str] | None = None) -> dict
         merged_flags = _merge_xla_flags(target.get("XLA_FLAGS"))
         if merged_flags:
             target["XLA_FLAGS"] = merged_flags
+        merged_library_path = _prepend_library_paths(target.get("LD_LIBRARY_PATH"))
+        if merged_library_path:
+            target["LD_LIBRARY_PATH"] = merged_library_path
 
+    if not target.get("JAX_PLATFORMS"):
+        target["JAX_PLATFORMS"] = "cuda"
     target.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     return target
 

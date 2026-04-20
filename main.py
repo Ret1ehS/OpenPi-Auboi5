@@ -38,6 +38,17 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 OPENPI_ROOT = get_openpi_root()
 REPO_ROOT = get_repo_root()
 REPO_VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
+OPENPI_CONDA_PYTHON = OPENPI_ROOT / "miniforge3" / "envs" / "openpi-py311" / "bin" / "python"
+
+_NIIC_SYSTEM_CUDA_LIBS = (
+    "/usr/lib/aarch64-linux-gnu",
+    "/lib/aarch64-linux-gnu",
+    "/usr/local/cuda/targets/aarch64-linux/lib",
+    "/usr/local/cuda/lib64",
+)
+_SAFE_GPU_XLA_FLAGS = (
+    "--xla_gpu_autotune_level=0",
+)
 
 GRIPPER_THRESHOLD = 0.6
 MAX_EXEC_ACTION_INTERVALS = 20
@@ -68,8 +79,49 @@ class ChunkSubmission:
     submit_ts: float
 
 
+def _prepend_env_path(name: str, paths: tuple[str, ...]) -> None:
+    current = [part for part in os.environ.get(name, "").split(":") if part]
+    merged: list[str] = []
+    for part in (*paths, *current):
+        if part and part not in merged:
+            merged.append(part)
+    if merged:
+        os.environ[name] = ":".join(merged)
+
+
+def _merge_env_flags(name: str, flags: tuple[str, ...]) -> None:
+    current = [part for part in os.environ.get(name, "").split() if part]
+    for flag in flags:
+        if flag not in current:
+            current.append(flag)
+    if current:
+        os.environ[name] = " ".join(current)
+
+
+def _apply_niic_jax_gpu_process_env() -> None:
+    if os.environ.get("OPENPI_DISABLE_JAX_GPU_FIX", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return
+    os.environ.setdefault("JAX_PLATFORMS", "cuda")
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    _merge_env_flags("XLA_FLAGS", _SAFE_GPU_XLA_FLAGS)
+    _prepend_env_path("LD_LIBRARY_PATH", _NIIC_SYSTEM_CUDA_LIBS)
+    # The policy loader already has a GPU probe. On niic the runtime is known-good only
+    # with the process-start library path above, so avoid a redundant cold probe.
+    os.environ.setdefault("OPENPI_SKIP_JAX_GPU_PROBE", "1")
+
+
+def _select_runtime_python() -> Path:
+    explicit = os.environ.get("OPENPI_RUNTIME_PYTHON", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    if OPENPI_CONDA_PYTHON.exists():
+        return OPENPI_CONDA_PYTHON
+    return REPO_VENV_PYTHON
+
+
 def _maybe_reexec_into_repo_venv() -> None:
-    target = REPO_VENV_PYTHON
+    _apply_niic_jax_gpu_process_env()
+    target = _select_runtime_python()
     if not target.exists():
         return
     try:

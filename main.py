@@ -41,6 +41,9 @@ REPO_VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
 OPENPI_CONDA_PYTHON = OPENPI_ROOT / "miniforge3" / "envs" / "openpi-py311" / "bin" / "python"
 
 _NIIC_SYSTEM_CUDA_LIBS = (
+    # NVML (nvidia-smi) lives here on many aarch64 installs; stubs under cuda are not enough.
+    "/usr/lib/aarch64-linux-gnu/nvidia",
+    "/usr/lib/x86_64-linux-gnu/nvidia",
     "/usr/lib/aarch64-linux-gnu",
     "/lib/aarch64-linux-gnu",
     "/usr/local/cuda/targets/aarch64-linux/lib",
@@ -102,7 +105,17 @@ def _apply_niic_jax_gpu_process_env() -> None:
     if os.environ.get("OPENPI_DISABLE_JAX_GPU_FIX", "").strip().lower() in {"1", "true", "yes", "on"}:
         return
     os.environ.setdefault("JAX_PLATFORMS", "cuda")
-    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    # Default: grow GPU memory on demand (often looks like "low %" in monitors). Optional: set
+    # OPENPI_JAX_PREALLOCATE=1 and OPENPI_JAX_MEM_FRACTION=0.5 to reserve a pool (does not by
+    # itself speed up inference; can reduce allocator jitter).
+    _pre = os.environ.get("OPENPI_JAX_PREALLOCATE", "").strip().lower()
+    if _pre in {"1", "true", "yes", "on"}:
+        os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
+    else:
+        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    _frac = os.environ.get("OPENPI_JAX_MEM_FRACTION", "").strip()
+    if _frac:
+        os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = _frac
     _merge_env_flags("XLA_FLAGS", _SAFE_GPU_XLA_FLAGS)
     _prepend_env_path("LD_LIBRARY_PATH", _NIIC_SYSTEM_CUDA_LIBS)
     # The policy loader already has a GPU probe. On niic the runtime is known-good only
@@ -117,6 +130,41 @@ def _select_runtime_python() -> Path:
     if OPENPI_CONDA_PYTHON.exists():
         return OPENPI_CONDA_PYTHON
     return REPO_VENV_PYTHON
+
+
+_cached_jax_infer_backend: str | None = None
+
+
+def _jax_infer_backend_label() -> str:
+    """Short label for logs (gpu/cpu/tpu); cached after first successful import."""
+    global _cached_jax_infer_backend
+    if _cached_jax_infer_backend is not None:
+        return _cached_jax_infer_backend
+    try:
+        import jax
+
+        _cached_jax_infer_backend = str(jax.default_backend())
+    except Exception as exc:
+        _cached_jax_infer_backend = f"err:{type(exc).__name__}"
+    return _cached_jax_infer_backend
+
+
+def _print_local_policy_jax_diagnostics() -> None:
+    """One-shot JAX / device summary after local policy load (for niic GPU verification)."""
+    try:
+        import jax
+
+        devs = [str(d) for d in jax.devices()]
+        print(
+            "JAX_RUNTIME "
+            f"backend={jax.default_backend()} "
+            f"devices={devs} "
+            f"jax={jax.__version__} "
+            f"jaxlib={__import__('jaxlib').__version__}"
+        )
+        _jax_infer_backend_label()  # prime cache for per-step infer logs
+    except Exception as exc:
+        print(f"JAX_RUNTIME diagnose failed: {type(exc).__name__}: {exc}")
 
 
 def _maybe_reexec_into_repo_venv() -> None:
@@ -1090,6 +1138,8 @@ def main() -> int:
     policy_load_s = time.monotonic() - t0
     print(f"POLICY_READY={type(policy).__name__}  load_time={policy_load_s:.3f}s")
     print(f"POSE_FRAME={get_alignment_mode()}")
+    if not policy_spec.remote:
+        _print_local_policy_jax_diagnostics()
 
     task_observer_env_cfg = TaskObserverConfig.from_env()
     task_observer_spec = task_observer_env_cfg.task_spec
@@ -1594,6 +1644,7 @@ def main() -> int:
                         "step": int(step),
                         "prompt": prompt,
                         "infer_time_s": float(infer_time),
+                        "jax_backend": _jax_infer_backend_label(),
                         "planning_latency_s": float(planning_latency_s),
                         "raw_action_count": int(len(raw_actions)),
                         "exec_action_count": int(len(exec_actions)),
@@ -1688,6 +1739,7 @@ def main() -> int:
                 gripper_str = f"{gripper_action:.2f}" if gripper_action is not None else "N/A"
                 print(
                     f"  [{step:4d}] infer={infer_time:.3f}s  "
+                    f"jax={_jax_infer_backend_label()}  "
                     f"track={track_status}  "
                     f"samples={samples}  "
                     f"gripper={gripper_str}  "

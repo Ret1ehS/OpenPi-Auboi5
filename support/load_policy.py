@@ -198,11 +198,25 @@ class PolicyLoadSpec:
     default_prompt: str | None = None
     action_horizon: int | None = None
     pytorch_device: str | None = None
+    #: Passed to OpenPI `create_trained_policy(..., sample_kwargs=...)`, e.g. `{"num_steps": 5}` for
+    #: JAX Pi0 flow-matching (upstream default `num_steps` is 10 in `Pi0.sample_actions`).
+    sample_kwargs: dict[str, Any] | None = None
     kubeconfig: Path = KUBECONFIG_PATH
     namespace: str = DEFAULT_NAMESPACE
     pod_label: str = "app=openpi"
     local_port: int = DEFAULT_LOCAL_PORT
     remote_port: int = DEFAULT_REMOTE_PORT
+
+
+def _effective_sample_kwargs(spec: PolicyLoadSpec) -> dict[str, Any] | None:
+    """Merge PolicyLoadSpec.sample_kwargs with OPENPI_SAMPLE_NUM_STEPS (env overrides num_steps)."""
+    merged: dict[str, Any] = {}
+    if spec.sample_kwargs:
+        merged.update(spec.sample_kwargs)
+    env_steps = os.environ.get("OPENPI_SAMPLE_NUM_STEPS", "").strip()
+    if env_steps:
+        merged["num_steps"] = int(env_steps)
+    return merged if merged else None
 
 
 class LocalPolicyRunner:
@@ -376,11 +390,15 @@ def create_local_policy(spec: PolicyLoadSpec | None = None) -> LocalPolicyRunner
         ) from exc
 
     train_cfg = get_config(spec.config_name)
+    sample_kwargs = _effective_sample_kwargs(spec)
+    if sample_kwargs:
+        print(f"  [local] OpenPI sample_kwargs: {sample_kwargs}")
     policy = create_trained_policy(
         train_cfg,
         checkpoint_dir,
         default_prompt=spec.default_prompt,
         pytorch_device=spec.pytorch_device,
+        sample_kwargs=sample_kwargs,
     )
     if spec.action_horizon is not None:
         policy = ActionChunkBroker(policy, action_horizon=int(spec.action_horizon))

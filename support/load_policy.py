@@ -31,6 +31,9 @@ from utils.runtime_config import (
     DEFAULT_CONFIG_NAME,
     DEFAULT_LOCAL_PORT,
     DEFAULT_NAMESPACE,
+    DEFAULT_POLICY_BACKEND,
+    DEFAULT_PYTORCH_CHECKPOINT_DIR,
+    DEFAULT_PYTORCH_DEVICE,
     DEFAULT_REMOTE_PORT,
     KUBECONFIG_PATH,
 )
@@ -195,9 +198,11 @@ class PolicyLoadSpec:
     remote: bool = False
     config_name: str = DEFAULT_CONFIG_NAME
     checkpoint_dir: Path = DEFAULT_CHECKPOINT_DIR
+    backend: str = DEFAULT_POLICY_BACKEND  # "auto" | "jax" | "pytorch"
+    pytorch_checkpoint_dir: Path = DEFAULT_PYTORCH_CHECKPOINT_DIR
     default_prompt: str | None = None
     action_horizon: int | None = None
-    pytorch_device: str | None = None
+    pytorch_device: str | None = DEFAULT_PYTORCH_DEVICE
     #: Passed to OpenPI `create_trained_policy(..., sample_kwargs=...)`, e.g. `{"num_steps": 5}` for
     #: JAX Pi0 flow-matching (upstream default `num_steps` is 10 in `Pi0.sample_actions`).
     sample_kwargs: dict[str, Any] | None = None
@@ -217,6 +222,24 @@ def _effective_sample_kwargs(spec: PolicyLoadSpec) -> dict[str, Any] | None:
     if env_steps:
         merged["num_steps"] = int(env_steps)
     return merged if merged else None
+
+
+def _resolve_local_backend_and_checkpoint(spec: PolicyLoadSpec) -> tuple[str, Path]:
+    backend = (spec.backend or "auto").strip().lower()
+    if backend not in {"auto", "jax", "pytorch"}:
+        raise ValueError(f"Unsupported OPENPI_POLICY_BACKEND={spec.backend!r}; expected auto|jax|pytorch")
+
+    jax_checkpoint_dir = Path(spec.checkpoint_dir).resolve()
+    pytorch_checkpoint_dir = Path(spec.pytorch_checkpoint_dir).resolve()
+
+    if backend == "jax":
+        return "jax", jax_checkpoint_dir
+    if backend == "pytorch":
+        return "pytorch", pytorch_checkpoint_dir
+
+    if _checkpoint_has_safetensors_weights(pytorch_checkpoint_dir):
+        return "pytorch", pytorch_checkpoint_dir
+    return "jax", jax_checkpoint_dir
 
 
 class LocalPolicyRunner:
@@ -372,12 +395,13 @@ class RemotePolicyRunner:
 
 def create_local_policy(spec: PolicyLoadSpec | None = None) -> LocalPolicyRunner:
     spec = spec or PolicyLoadSpec()
-    checkpoint_dir = Path(spec.checkpoint_dir).resolve()
+    backend, checkpoint_dir = _resolve_local_backend_and_checkpoint(spec)
     if not checkpoint_dir.exists():
         raise FileNotFoundError(f"checkpoint directory not found: {checkpoint_dir}")
 
-    _apply_local_jax_runtime_defaults()
-    _apply_jax_platform(_choose_local_jax_platform(checkpoint_dir))
+    if backend == "jax":
+        _apply_local_jax_runtime_defaults()
+        _apply_jax_platform(_choose_local_jax_platform(checkpoint_dir))
 
     try:
         from openpi.training.config import get_config
@@ -393,6 +417,11 @@ def create_local_policy(spec: PolicyLoadSpec | None = None) -> LocalPolicyRunner
     sample_kwargs = _effective_sample_kwargs(spec)
     if sample_kwargs:
         print(f"  [local] OpenPI sample_kwargs: {sample_kwargs}")
+    print(
+        "  [local] OpenPI backend="
+        f"{backend} checkpoint={checkpoint_dir} "
+        f"pytorch_device={spec.pytorch_device if backend == 'pytorch' else 'n/a'}"
+    )
     policy = create_trained_policy(
         train_cfg,
         checkpoint_dir,
@@ -402,7 +431,11 @@ def create_local_policy(spec: PolicyLoadSpec | None = None) -> LocalPolicyRunner
     )
     if spec.action_horizon is not None:
         policy = ActionChunkBroker(policy, action_horizon=int(spec.action_horizon))
-    metadata = getattr(policy, "metadata", {})
+    metadata = dict(getattr(policy, "metadata", {}) or {})
+    metadata.setdefault("policy_backend", backend)
+    metadata.setdefault("checkpoint_dir", str(checkpoint_dir))
+    if backend == "pytorch" and spec.pytorch_device:
+        metadata.setdefault("pytorch_device", str(spec.pytorch_device))
     return LocalPolicyRunner(policy, metadata=metadata)
 
 

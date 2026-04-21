@@ -43,11 +43,18 @@ def _env_is_set(name: str) -> bool:
 
 
 DEFAULT_CONFIG_NAME = _env_str("OPENPI_POLICY_CONFIG_NAME", "pi05_aubo_agv_lora")
+DEFAULT_POLICY_BACKEND = _env_str("OPENPI_POLICY_BACKEND", "auto").lower()
 DEFAULT_CHECKPOINT_DIR = _env_path(
     "OPENPI_CHECKPOINT_DIR",
     Path("checkpoints") / DEFAULT_CONFIG_NAME / "my_eighth_run" / "29999",
     base=get_repo_root(),
 )
+DEFAULT_PYTORCH_CHECKPOINT_DIR = _env_path(
+    "OPENPI_PYTORCH_CHECKPOINT_DIR",
+    DEFAULT_CHECKPOINT_DIR,
+    base=get_repo_root(),
+)
+DEFAULT_PYTORCH_DEVICE = _env_str("OPENPI_PYTORCH_DEVICE", "cuda")
 KUBECONFIG_PATH = _env_path(
     "OPENPI_KUBECONFIG",
     get_support_dir() / "kubeconfig.yaml",
@@ -110,6 +117,9 @@ __all__ = [
     "DEFAULT_AUBO_USER",
     "DEFAULT_CHECKPOINT_DIR",
     "DEFAULT_CONFIG_NAME",
+    "DEFAULT_POLICY_BACKEND",
+    "DEFAULT_PYTORCH_CHECKPOINT_DIR",
+    "DEFAULT_PYTORCH_DEVICE",
     "DEFAULT_FORCE_SENSOR_FALLBACK_PORT",
     "DEFAULT_FORCE_SENSOR_PORT",
     "DEFAULT_GRIPPER_FALLBACK_PORT",

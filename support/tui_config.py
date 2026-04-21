@@ -102,10 +102,10 @@ MenuRow = ToggleItem | TextItem | ActionItem | SeparatorItem | StartItem
 @dataclass
 class TUIConfig:
     policy_location: str  # "remote" | "local"
-    pose_frame: str       # "real" | "sim"
     obs_state_mode: str   # "yaw"
     dry_run: bool
     exec_speed_mps: float  # max TCP linear speed (m/s) for servo execution
+    pose_frame: str = "sim"
     speed_mode: str = "limited"  # "limited" | "native"
     record: bool = False   # True to record video of inference session
     task_observer_enabled: bool = False
@@ -263,7 +263,6 @@ def run_tui_config(
     """
     rows: list[MenuRow] = [
         ToggleItem("Policy", ["remote", "local"], selected=0),
-        ToggleItem("Frame", ["sim", "real"], selected=0),
         ToggleItem("Record", ["false", "true"], selected=0),
         ToggleItem("Task Observer", ["false", "true"], selected=0),
         ToggleItem("Speed Mode", ["limited", "native"], selected=0),
@@ -462,7 +461,6 @@ def _snapshot_config(rows: list[MenuRow]) -> TUIConfig:
     speed_mode = _get_toggle(rows, "Speed Mode")
     return TUIConfig(
         policy_location=_get_toggle(rows, "Policy"),
-        pose_frame=_get_toggle(rows, "Frame"),
         obs_state_mode="yaw",
         dry_run=_get_env_bool("OPENPI_DEBUG_DRY_RUN", False),
         exec_speed_mps=_get_float(rows, "Exec Speed (m/s)", 0.05),

@@ -1045,7 +1045,6 @@ def main() -> int:
     def _tui_action(key: str, current_cfg: TUIConfig | None = None) -> str:
         cfg_now = current_cfg or TUIConfig(
             policy_location="remote",
-            pose_frame="real",
             obs_state_mode=STATE_MODE_YAW,
             dry_run=False,
             exec_speed_mps=0.05,
@@ -1107,7 +1106,6 @@ def main() -> int:
 
     print(f"\nConfiguration:")
     print(f"  Policy:     {cfg.policy_location}")
-    print(f"  Frame:      {cfg.pose_frame}")
     print(f"  State Mode: {cfg.obs_state_mode}")
     print(f"  Speed Mode: {cfg.speed_mode}")
     if cfg.speed_mode == "limited":

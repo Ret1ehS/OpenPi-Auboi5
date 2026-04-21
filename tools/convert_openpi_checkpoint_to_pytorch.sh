@@ -12,7 +12,9 @@ config_name="$2"
 jax_checkpoint_dir="$3"
 output_dir="${4:-${jax_checkpoint_dir}_pytorch}"
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../repo" && pwd)"
+scripts_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+openpi_root="$(cd "${scripts_root}/.." && pwd)"
+repo_root="${openpi_root}/repo"
 
 echo "repo_python=${repo_python}"
 echo "config_name=${config_name}"

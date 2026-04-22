@@ -108,6 +108,7 @@ class TUIConfig:
     pose_frame: str = "sim"
     speed_mode: str = "limited"  # "limited" | "native"
     record: bool = False   # True to record video of inference session
+    trt_denoise: bool = False
     task_observer_enabled: bool = False
     task_observer_interval_s: float = 5.0
     task_observer_spec_file: str = ""
@@ -264,6 +265,7 @@ def run_tui_config(
     rows: list[MenuRow] = [
         ToggleItem("Policy", ["remote", "local"], selected=0),
         ToggleItem("Record", ["false", "true"], selected=0),
+        ToggleItem("TRT Denoise", ["false", "true"], selected=1 if _get_env_bool("OPENPI_PYTORCH_TRT_DENOISE", False) else 0),
         ToggleItem("Task Observer", ["false", "true"], selected=0),
         ToggleItem("Speed Mode", ["limited", "native"], selected=0),
         TextItem("Exec Speed (m/s)", "0.05"),
@@ -444,6 +446,8 @@ def _get_env_bool(name: str, default: bool = False) -> bool:
 def _infer_nonselectable_labels(rows: list[MenuRow]) -> set[str]:
     """Hide inputs that are not relevant to the current config selection."""
     labels: set[str] = set()
+    if _get_toggle(rows, "Policy") != "local":
+        labels.add("TRT Denoise")
     if _get_toggle(rows, "Speed Mode") == "native":
         labels.add("Exec Speed (m/s)")
     if _get_toggle(rows, "Task Observer") != "true":
@@ -466,6 +470,7 @@ def _snapshot_config(rows: list[MenuRow]) -> TUIConfig:
         exec_speed_mps=_get_float(rows, "Exec Speed (m/s)", 0.05),
         speed_mode=speed_mode,
         record=_get_toggle(rows, "Record") == "true",
+        trt_denoise=_get_toggle(rows, "TRT Denoise") == "true",
         task_observer_enabled=_get_toggle(rows, "Task Observer") == "true",
         task_observer_interval_s=_get_float(rows, "Observer Interval (s)", 5.0),
         task_observer_spec_file=_get_text(rows, "Observer Spec File").strip(),

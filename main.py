@@ -1136,6 +1136,7 @@ def main() -> int:
     else:
         print(f"  Exec Speed: native (no retime)")
     print(f"  Record:     {cfg.record}")
+    print(f"  TRT Denoise:{'enabled' if cfg.trt_denoise else 'disabled'}")
     print(f"  Observer:   {'enabled' if cfg.task_observer_enabled else 'disabled'}")
     if cfg.task_observer_enabled:
         print(f"  Observer Interval: {cfg.task_observer_interval_s} s")
@@ -1145,6 +1146,7 @@ def main() -> int:
         print(f"  Debug Dry Run: {cfg.dry_run}")
 
     # --- Load policy ---
+    os.environ["OPENPI_PYTORCH_TRT_DENOISE"] = "1" if (cfg.policy_location == "local" and cfg.trt_denoise) else "0"
     t0 = time.monotonic()
     policy_spec = PolicyLoadSpec(
         remote=(cfg.policy_location == "remote"),

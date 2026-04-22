@@ -253,6 +253,113 @@ def _maybe_build_trt_image_embedder(model: torch.nn.Module, example_input: torch
     )
 
 
+class _TrtDenoiseWrapper(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module) -> None:
+        super().__init__()
+        self._model = model
+
+    def forward(
+        self,
+        state: torch.Tensor,
+        prefix_pad_masks: torch.Tensor,
+        x_t: torch.Tensor,
+        timestep: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        from transformers.cache_utils import DynamicCache
+
+        legacy = tuple(
+            (k, v)
+            for k, v in zip(
+                torch.unbind(key_cache, dim=0),
+                torch.unbind(value_cache, dim=0),
+                strict=True,
+            )
+        )
+        past_key_values = DynamicCache.from_legacy_cache(legacy)
+        return self._model.denoise_step(state, prefix_pad_masks, past_key_values, x_t, timestep)
+
+
+def _maybe_build_trt_denoise_engine(policy: "OpenPIPyTorchPolicy", model: torch.nn.Module) -> torch.nn.Module | None:
+    if not _env_truthy("OPENPI_PYTORCH_TRT_DENOISE"):
+        return None
+
+    _add_system_tensorrt_python_paths()
+    import torch_tensorrt
+    from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
+    from transformers.cache_utils import DynamicCache
+
+    cache_dir = Path(
+        os.environ.get(
+            "OPENPI_PYTORCH_TRT_DENOISE_CACHE_DIR",
+            "~/.cache/openpi/torch_tensorrt/denoise_step",
+        )
+    ).expanduser()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    sample_obs = build_synthetic_observation()
+    sample_prompt = _resolve_prompt(sample_obs.get("prompt"), policy._default_prompt)
+    sample_state_np = np.asarray(sample_obs["observation/state"], dtype=np.float32).reshape(-1)
+    sample_state_np = _normalize_quantile(sample_state_np, policy._norm_stats["state"])
+    sample_padded_state = _pad_to_dim(sample_state_np[None, :], policy._config.action_dim)
+    tokenized_prompt, tokenized_prompt_mask = policy._tokenizer.tokenize(sample_prompt, sample_state_np)
+    sample_observation = SimpleObservation(
+        images={
+            "base_0_rgb": _image_to_model_tensor(sample_obs["observation/image"], policy._device),
+            "left_wrist_0_rgb": _image_to_model_tensor(sample_obs["observation/wrist_image"], policy._device),
+            "right_wrist_0_rgb": policy._masked_right_wrist_image,
+        },
+        image_masks={
+            "base_0_rgb": torch.tensor([True], dtype=torch.bool, device=policy._device),
+            "left_wrist_0_rgb": torch.tensor([True], dtype=torch.bool, device=policy._device),
+            "right_wrist_0_rgb": torch.tensor([False], dtype=torch.bool, device=policy._device),
+        },
+        state=torch.from_numpy(sample_padded_state).to(device=policy._device),
+        tokenized_prompt=torch.from_numpy(tokenized_prompt[None, ...]).to(device=policy._device, dtype=torch.long),
+        tokenized_prompt_mask=torch.from_numpy(tokenized_prompt_mask[None, ...]).to(
+            device=policy._device, dtype=torch.bool
+        ),
+    )
+
+    images, img_masks, lang_tokens, lang_masks, state = model._preprocess_observation(sample_observation, train=False)
+    prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+    prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+    prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+    prefix_att_2d_masks_4d = model._prepare_attention_masks_4d(prefix_att_2d_masks)
+    model.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+    _, sample_past_key_values = model.paligemma_with_expert.forward(
+        attention_mask=prefix_att_2d_masks_4d,
+        position_ids=prefix_position_ids,
+        past_key_values=None,
+        inputs_embeds=[prefix_embs, None],
+        use_cache=True,
+    )
+
+    legacy_cache = sample_past_key_values.to_legacy_cache()
+    key_cache = torch.stack([key for key, _ in legacy_cache], dim=0)
+    value_cache = torch.stack([value for _, value in legacy_cache], dim=0)
+    sample_x_t = torch.randn(
+        (1, model.config.action_horizon, model.config.action_dim),
+        device=policy._device,
+        dtype=torch.float32,
+    )
+    sample_timestep = torch.tensor([1.0], device=policy._device, dtype=torch.float32)
+
+    wrapper = _TrtDenoiseWrapper(model).eval().to(device=policy._device)
+    return torch_tensorrt.compile(
+        wrapper,
+        ir="dynamo",
+        inputs=[state, prefix_pad_masks, sample_x_t, sample_timestep, key_cache, value_cache],
+        enabled_precisions={torch.float32, torch.bfloat16},
+        min_block_size=1,
+        truncate_double=True,
+        cache_built_engines=True,
+        reuse_cached_engines=True,
+        engine_cache_dir=str(cache_dir),
+    )
+
+
 def _install_mask_aware_prefix_fastpath(model: torch.nn.Module) -> None:
     original = getattr(model, "embed_prefix")
 
@@ -380,6 +487,20 @@ def _install_sdpa_attention_fastpath(model: torch.nn.Module) -> None:
     setattr(model, "_openpi_original_denoise_step", model.denoise_step)
     model.sample_actions = types.MethodType(sample_actions_sdpa, model)
     model.denoise_step = types.MethodType(denoise_step_sdpa, model)
+
+
+def _install_trt_denoise_fastpath(model: torch.nn.Module, trt_denoise: torch.nn.Module) -> None:
+    original = getattr(model, "denoise_step")
+
+    def denoise_step_trt(self, state, prefix_pad_masks, past_key_values, x_t, timestep):
+        legacy = past_key_values.to_legacy_cache()
+        key_cache = torch.stack([key for key, _ in legacy], dim=0)
+        value_cache = torch.stack([value for _, value in legacy], dim=0)
+        return trt_denoise(state, prefix_pad_masks, x_t, timestep, key_cache, value_cache)
+
+    setattr(model, "_openpi_original_denoise_step", original)
+    setattr(model, "_openpi_trt_denoise", trt_denoise)
+    model.denoise_step = types.MethodType(denoise_step_trt, model)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -600,6 +721,7 @@ class OpenPIPyTorchPolicy:
         self._compile_mode = _resolve_compile_mode(compile_mode)
         self._checkpoint_dir = checkpoint_dir
         self._attention_backend = _resolve_attention_backend()
+        self._trt_denoise_requested = _env_truthy("OPENPI_PYTORCH_TRT_DENOISE")
 
         tokenizer_path = Path(
             os.environ.get("OPENPI_PYTORCH_TOKENIZER_MODEL", str(tokenizer_model or DEFAULT_TOKENIZER_MODEL))
@@ -630,7 +752,7 @@ class OpenPIPyTorchPolicy:
         model.paligemma_with_expert.to_bfloat16_for_selected_params(config.dtype)
         model = model.to(self._device)
         _install_mask_aware_prefix_fastpath(model)
-        if self._attention_backend == "sdpa":
+        if self._attention_backend == "sdpa" and not self._trt_denoise_requested:
             _install_sdpa_attention_fastpath(model)
         model.eval()
         self._model = model
@@ -646,6 +768,9 @@ class OpenPIPyTorchPolicy:
         trt_image_embedder = None
         trt_vision_enabled = False
         trt_vision_error: str | None = None
+        trt_denoise = None
+        trt_denoise_enabled = False
+        trt_denoise_error: str | None = None
         if self._device.type == "cuda":
             try:
                 trt_image_embedder = _maybe_build_trt_image_embedder(model, self._masked_right_wrist_image)
@@ -654,9 +779,17 @@ class OpenPIPyTorchPolicy:
                     trt_vision_enabled = True
             except Exception as exc:
                 trt_vision_error = f"{type(exc).__name__}: {exc}"
+            try:
+                trt_denoise = _maybe_build_trt_denoise_engine(self, model)
+                if trt_denoise is not None:
+                    _install_trt_denoise_fastpath(model, trt_denoise)
+                    trt_denoise_enabled = True
+            except Exception as exc:
+                trt_denoise_error = f"{type(exc).__name__}: {exc}"
         if self._device.type == "cuda":
             torch.cuda.synchronize(self._device)
         load_s = time.perf_counter() - load_t0
+        effective_attention_backend = "eager" if trt_denoise_enabled else self._attention_backend
         self._metadata = {
             "policy_backend": "pytorch",
             "checkpoint_dir": str(checkpoint_dir),
@@ -664,16 +797,20 @@ class OpenPIPyTorchPolicy:
             "torch_version": str(torch.__version__),
             "cuda_available": bool(torch.cuda.is_available()),
             "compile_mode": self._compile_mode or "none",
-            "attention_backend": self._attention_backend,
+            "attention_backend": effective_attention_backend,
+            "requested_attention_backend": self._attention_backend,
             "sample_num_steps": self._num_steps,
             "tokenizer_model": str(tokenizer_path.resolve()),
             "runtime_python": sys.executable,
             "load_s": float(load_s),
             "mask_aware_prefix_fastpath": True,
             "trt_vision_enabled": trt_vision_enabled,
+            "trt_denoise_enabled": trt_denoise_enabled,
         }
         if trt_vision_error is not None:
             self._metadata["trt_vision_error"] = trt_vision_error
+        if trt_denoise_error is not None:
+            self._metadata["trt_denoise_error"] = trt_denoise_error
 
     @property
     def metadata(self) -> dict[str, Any]:

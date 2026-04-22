@@ -5,6 +5,7 @@ import dataclasses
 import importlib
 import importlib.machinery
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -21,6 +22,10 @@ import torch.nn.functional as F  # noqa: N812
 
 DEFAULT_TOKENIZER_MODEL = Path("~/.cache/openpi/big_vision/paligemma_tokenizer.model").expanduser()
 IMAGE_SIZE = 224
+_SYSTEM_TENSORRT_PYTHON_PATHS = (
+    "/usr/lib/python3/dist-packages",
+    "/usr/lib/python3.10/dist-packages",
+)
 
 
 def _install_pytest_stub() -> None:
@@ -142,6 +147,108 @@ def prepare_openpi_pytorch_imports(repo_root: Path) -> None:
     _install_pytest_stub()
     _install_gemma_stub()
     _install_image_tools_stub()
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _add_system_tensorrt_python_paths() -> None:
+    for raw_path in _SYSTEM_TENSORRT_PYTHON_PATHS:
+        path = Path(raw_path)
+        if path.exists():
+            path_str = str(path)
+            if path_str not in sys.path:
+                sys.path.append(path_str)
+
+
+class _TrtImageEmbedWrapper(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module) -> None:
+        super().__init__()
+        self._model = model
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        return self._model.paligemma_with_expert.embed_image(image)
+
+
+def _maybe_build_trt_image_embedder(model: torch.nn.Module, example_input: torch.Tensor) -> torch.nn.Module | None:
+    if not _env_truthy("OPENPI_PYTORCH_TRT_VISION"):
+        return None
+
+    _add_system_tensorrt_python_paths()
+    import torch_tensorrt
+
+    cache_dir = Path(
+        os.environ.get(
+            "OPENPI_PYTORCH_TRT_CACHE_DIR",
+            "~/.cache/openpi/torch_tensorrt/vision_embed",
+        )
+    ).expanduser()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    wrapper = _TrtImageEmbedWrapper(model).eval().to(device=example_input.device)
+    return torch_tensorrt.compile(
+        wrapper,
+        ir="dynamo",
+        inputs=[example_input],
+        enabled_precisions={torch.float32, torch.bfloat16},
+        cache_built_engines=True,
+        reuse_cached_engines=True,
+        engine_cache_dir=str(cache_dir),
+    )
+
+
+def _install_mask_aware_prefix_fastpath(model: torch.nn.Module) -> None:
+    original = getattr(model, "embed_prefix")
+
+    def embed_prefix_mask_aware(self, images, img_masks, lang_tokens, lang_masks):
+        embs = []
+        pad_masks = []
+        att_masks = []
+        cached_img_shape: tuple[int, int] | None = None
+        cached_img_dtype: torch.dtype | None = None
+
+        for img, img_mask in zip(images, img_masks, strict=True):
+
+            def image_embed_func(image_tensor: torch.Tensor) -> torch.Tensor:
+                return self.paligemma_with_expert.embed_image(image_tensor)
+
+            batch_size = img.shape[0]
+            all_masked = bool((~img_mask).all().item())
+            if all_masked and cached_img_shape is not None and cached_img_dtype is not None:
+                num_img_embs, emb_dim = cached_img_shape
+                img_emb = torch.zeros((batch_size, num_img_embs, emb_dim), dtype=cached_img_dtype, device=img.device)
+            else:
+                trt_image_embedder = getattr(self, "_openpi_trt_image_embedder", None)
+                if trt_image_embedder is not None:
+                    img_emb = trt_image_embedder(img)
+                else:
+                    img_emb = self._apply_checkpoint(image_embed_func, img)
+                cached_img_shape = (img_emb.shape[1], img_emb.shape[2])
+                cached_img_dtype = img_emb.dtype
+
+            batch_size, num_img_embs = img_emb.shape[:2]
+            embs.append(img_emb)
+            pad_masks.append(img_mask[:, None].expand(batch_size, num_img_embs))
+            att_masks += [0] * num_img_embs
+
+        def lang_embed_func(lang_token_tensor: torch.Tensor) -> torch.Tensor:
+            lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_token_tensor)
+            return lang_emb * math.sqrt(lang_emb.shape[-1])
+
+        lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
+        embs.append(lang_emb)
+        pad_masks.append(lang_masks)
+        att_masks += [0] * lang_emb.shape[1]
+
+        embs = torch.cat(embs, dim=1)
+        pad_masks = torch.cat(pad_masks, dim=1)
+        att_masks_tensor = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
+        att_masks_tensor = att_masks_tensor[None, :].expand(pad_masks.shape[0], len(att_masks))
+        return embs, pad_masks, att_masks_tensor
+
+    setattr(model, "_openpi_original_embed_prefix", original)
+    model.embed_prefix = types.MethodType(embed_prefix_mask_aware, model)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -390,15 +497,32 @@ class OpenPIPyTorchPolicy:
         safetensors.torch.load_model(model, str(weight_path))
         model.paligemma_with_expert.to_bfloat16_for_selected_params(config.dtype)
         model = model.to(self._device)
+        _install_mask_aware_prefix_fastpath(model)
         model.eval()
-        if self._device.type == "cuda":
-            torch.cuda.synchronize(self._device)
-        load_s = time.perf_counter() - load_t0
-
         self._model = model
         self._config = config
         self._tokenizer = PaligemmaTokenizerLite(tokenizer_path.resolve(), config.max_token_len)
         self._norm_stats = norm_stats
+        self._masked_right_wrist_image = torch.full(
+            (1, 3, IMAGE_SIZE, IMAGE_SIZE),
+            -1.0,
+            device=self._device,
+            dtype=torch.float32,
+        )
+        trt_image_embedder = None
+        trt_vision_enabled = False
+        trt_vision_error: str | None = None
+        if self._device.type == "cuda":
+            try:
+                trt_image_embedder = _maybe_build_trt_image_embedder(model, self._masked_right_wrist_image)
+                if trt_image_embedder is not None:
+                    setattr(model, "_openpi_trt_image_embedder", trt_image_embedder)
+                    trt_vision_enabled = True
+            except Exception as exc:
+                trt_vision_error = f"{type(exc).__name__}: {exc}"
+        if self._device.type == "cuda":
+            torch.cuda.synchronize(self._device)
+        load_s = time.perf_counter() - load_t0
         self._metadata = {
             "policy_backend": "pytorch",
             "checkpoint_dir": str(checkpoint_dir),
@@ -410,7 +534,11 @@ class OpenPIPyTorchPolicy:
             "tokenizer_model": str(tokenizer_path.resolve()),
             "runtime_python": sys.executable,
             "load_s": float(load_s),
+            "mask_aware_prefix_fastpath": True,
+            "trt_vision_enabled": trt_vision_enabled,
         }
+        if trt_vision_error is not None:
+            self._metadata["trt_vision_error"] = trt_vision_error
 
     @property
     def metadata(self) -> dict[str, Any]:
@@ -429,14 +557,13 @@ class OpenPIPyTorchPolicy:
         tokenized_prompt, tokenized_prompt_mask = self._tokenizer.tokenize(prompt, state)
         padded_state = _pad_to_dim(state[None, :], self._config.action_dim)
 
-        base_image = _parse_image(obs["observation/image"])
-        wrist_image = _parse_image(obs["observation/wrist_image"])
-        right_wrist_image = np.zeros_like(base_image)
+        base_image = _image_to_model_tensor(obs["observation/image"], self._device)
+        wrist_image = _image_to_model_tensor(obs["observation/wrist_image"], self._device)
         observation = SimpleObservation(
             images={
-                "base_0_rgb": _image_to_model_tensor(base_image, self._device),
-                "left_wrist_0_rgb": _image_to_model_tensor(wrist_image, self._device),
-                "right_wrist_0_rgb": _image_to_model_tensor(right_wrist_image, self._device),
+                "base_0_rgb": base_image,
+                "left_wrist_0_rgb": wrist_image,
+                "right_wrist_0_rgb": self._masked_right_wrist_image,
             },
             image_masks={
                 "base_0_rgb": torch.tensor([True], dtype=torch.bool, device=self._device),

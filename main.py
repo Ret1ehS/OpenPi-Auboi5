@@ -167,6 +167,29 @@ def _print_local_policy_jax_diagnostics() -> None:
         print(f"JAX_RUNTIME diagnose failed: {type(exc).__name__}: {exc}")
 
 
+def _local_policy_backend_label(metadata: dict[str, Any] | None = None) -> str:
+    meta = metadata or {}
+    backend = str(meta.get("policy_backend", "")).strip().lower()
+    if backend == "pytorch":
+        device = str(meta.get("pytorch_device", "")).strip()
+        return f"pytorch:{device}" if device else "pytorch"
+    if backend == "jax":
+        return f"jax:{_jax_infer_backend_label()}"
+    return backend or f"jax:{_jax_infer_backend_label()}"
+
+
+def _print_local_policy_pytorch_diagnostics(metadata: dict[str, Any] | None = None) -> None:
+    meta = metadata or {}
+    print(
+        "PYTORCH_RUNTIME "
+        f"device={meta.get('pytorch_device', 'unknown')} "
+        f"torch={meta.get('torch_version', 'unknown')} "
+        f"compile_mode={meta.get('compile_mode', 'unknown')} "
+        f"num_steps={meta.get('sample_num_steps', 'unknown')} "
+        f"runtime_python={meta.get('runtime_python', 'unknown')}"
+    )
+
+
 def _maybe_reexec_into_repo_venv() -> None:
     _apply_niic_jax_gpu_process_env()
     target = _select_runtime_python()
@@ -1134,10 +1157,15 @@ def main() -> int:
         print("Loading policy from checkpoint...")
     policy = load_policy(policy_spec)
     policy_load_s = time.monotonic() - t0
+    infer_backend_label = "remote" if policy_spec.remote else _local_policy_backend_label(policy.metadata)
     print(f"POLICY_READY={type(policy).__name__}  load_time={policy_load_s:.3f}s")
+    print(f"POLICY_BACKEND={infer_backend_label}")
     print(f"POSE_FRAME={get_alignment_mode()}")
     if not policy_spec.remote:
-        _print_local_policy_jax_diagnostics()
+        if str(policy.metadata.get("policy_backend", "")).strip().lower() == "pytorch":
+            _print_local_policy_pytorch_diagnostics(policy.metadata)
+        else:
+            _print_local_policy_jax_diagnostics()
 
     task_observer_env_cfg = TaskObserverConfig.from_env()
     task_observer_spec = task_observer_env_cfg.task_spec
@@ -1569,6 +1597,8 @@ def main() -> int:
                 t_infer = time.monotonic()
                 action_result = policy.infer(obs)
                 infer_time = time.monotonic() - t_infer
+                policy_timing = action_result.get("policy_timing", {}) if isinstance(action_result, dict) else {}
+                policy_infer_ms = policy_timing.get("infer_ms") if isinstance(policy_timing, dict) else None
 
                 raw_actions = np.asarray(action_result["actions"], dtype=np.float64)
                 if raw_actions.ndim == 1:
@@ -1642,7 +1672,8 @@ def main() -> int:
                         "step": int(step),
                         "prompt": prompt,
                         "infer_time_s": float(infer_time),
-                        "jax_backend": _jax_infer_backend_label(),
+                        "policy_backend": infer_backend_label,
+                        "policy_infer_ms": None if policy_infer_ms is None else float(policy_infer_ms),
                         "planning_latency_s": float(planning_latency_s),
                         "raw_action_count": int(len(raw_actions)),
                         "exec_action_count": int(len(exec_actions)),
@@ -1737,7 +1768,7 @@ def main() -> int:
                 gripper_str = f"{gripper_action:.2f}" if gripper_action is not None else "N/A"
                 print(
                     f"  [{step:4d}] infer={infer_time:.3f}s  "
-                    f"jax={_jax_infer_backend_label()}  "
+                    f"backend={infer_backend_label}  "
                     f"track={track_status}  "
                     f"samples={samples}  "
                     f"gripper={gripper_str}  "

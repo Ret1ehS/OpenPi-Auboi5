@@ -134,6 +134,22 @@ Gemma observer 单独使用一套环境，避免和 OpenPI / JAX 依赖互相污
 - `support/get_obs.py`: 双相机与机器人状态观测构建
 - `support/task_observer.py`: 多模态任务完成判定
 
+## PyTorch Local Backend
+
+本地 PyTorch 推理现已支持通过独立 worker 进程运行：
+
+- 主进程继续使用当前脚本环境执行相机、机器人与主控制逻辑
+- PyTorch policy worker 单独运行在 `OPENPI_PYTORCH_RUNTIME_PYTHON` 指向的环境中
+- worker 环境需要能加载 CUDA Torch、`transformers_replace` 和转换后的 `model.safetensors`
+
+常用环境变量：
+
+- `OPENPI_POLICY_BACKEND=pytorch`
+- `OPENPI_PYTORCH_CHECKPOINT_DIR=.../model.safetensors 所在目录`
+- `OPENPI_PYTORCH_RUNTIME_PYTHON=/home/niic/openpi/miniforge3/envs/openpi-py310-torch/bin/python`
+- `OPENPI_PYTORCH_DEVICE=cuda`
+- `OPENPI_SAMPLE_NUM_STEPS=5`
+
 ## 兼容说明
 
 - `support/kubeconfig.yaml` 按敏感文件处理，默认不纳入 git

@@ -178,6 +178,36 @@ def _local_policy_backend_label(metadata: dict[str, Any] | None = None) -> str:
     return backend or f"jax:{_jax_infer_backend_label()}"
 
 
+def _resolve_effective_pytorch_checkpoint_dir() -> Path:
+    raw = os.environ.get("OPENPI_PYTORCH_CHECKPOINT_DIR", "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+
+    from support.load_policy import DEFAULT_CHECKPOINT_DIR, DEFAULT_PYTORCH_CHECKPOINT_DIR
+
+    candidate = Path(DEFAULT_PYTORCH_CHECKPOINT_DIR).resolve()
+    required = (candidate / "model.safetensors", candidate / "config.json")
+    if all(path.exists() for path in required):
+        return candidate
+
+    jax_dir = Path(DEFAULT_CHECKPOINT_DIR).resolve()
+    parts = list(jax_dir.parts)
+    try:
+        idx = next(i for i, part in enumerate(parts) if part == "checkpoints")
+    except StopIteration:
+        return candidate
+    if idx + 1 >= len(parts):
+        return candidate
+
+    config_name = parts[idx + 1]
+    guessed_config = f"{config_name}_pytorch"
+    guessed = Path(*parts[: idx + 1], guessed_config, *parts[idx + 2 :]).resolve()
+    guessed_required = (guessed / "model.safetensors", guessed / "config.json")
+    if all(path.exists() for path in guessed_required):
+        return guessed
+    return candidate
+
+
 def _print_local_policy_pytorch_diagnostics(metadata: dict[str, Any] | None = None) -> None:
     meta = metadata or {}
     print(
@@ -1150,9 +1180,8 @@ def main() -> int:
     os.environ["OPENPI_PYTORCH_TRT_DENOISE"] = "1" if trt_denoise_enabled else "0"
     if trt_denoise_enabled:
         os.environ["OPENPI_POLICY_BACKEND"] = "pytorch"
-        from support.load_policy import DEFAULT_PYTORCH_CHECKPOINT_DIR
-
-        pytorch_checkpoint_dir = Path(DEFAULT_PYTORCH_CHECKPOINT_DIR).resolve()
+        pytorch_checkpoint_dir = _resolve_effective_pytorch_checkpoint_dir()
+        os.environ["OPENPI_PYTORCH_CHECKPOINT_DIR"] = str(pytorch_checkpoint_dir)
         required_files = (
             pytorch_checkpoint_dir / "model.safetensors",
             pytorch_checkpoint_dir / "config.json",
@@ -1173,9 +1202,7 @@ def main() -> int:
         print("\nConnecting to remote inference server...")
     else:
         if trt_denoise_enabled:
-            from support.load_policy import DEFAULT_PYTORCH_CHECKPOINT_DIR
-
-            print(f"\nPYTORCH_CHECKPOINT_DIR={DEFAULT_PYTORCH_CHECKPOINT_DIR}")
+            print(f"\nPYTORCH_CHECKPOINT_DIR={os.environ.get('OPENPI_PYTORCH_CHECKPOINT_DIR', '')}")
         else:
             from support.load_policy import DEFAULT_CHECKPOINT_DIR
 

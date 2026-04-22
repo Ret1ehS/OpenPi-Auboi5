@@ -153,6 +153,16 @@ def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _resolve_attention_backend(explicit: str | None = None) -> str:
+    raw = explicit if explicit is not None else os.environ.get("OPENPI_PYTORCH_ATTN_BACKEND", "")
+    value = str(raw).strip().lower()
+    if value in {"", "eager"}:
+        return "eager"
+    if value == "sdpa":
+        return "sdpa"
+    raise ValueError(f"Unsupported OPENPI_PYTORCH_ATTN_BACKEND={raw!r}; expected eager|sdpa")
+
+
 def _add_system_tensorrt_python_paths() -> None:
     for raw_path in _SYSTEM_TENSORRT_PYTHON_PATHS:
         path = Path(raw_path)
@@ -249,6 +259,82 @@ def _install_mask_aware_prefix_fastpath(model: torch.nn.Module) -> None:
 
     setattr(model, "_openpi_original_embed_prefix", original)
     model.embed_prefix = types.MethodType(embed_prefix_mask_aware, model)
+
+
+def _install_sdpa_attention_fastpath(model: torch.nn.Module) -> None:
+    from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
+
+    @torch.no_grad()
+    def sample_actions_sdpa(self, device, observation, noise=None, num_steps=10):
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            actions_shape = (batch_size, self.config.action_horizon, self.config.action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_q_dtype = self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+        prefix_embs = prefix_embs.to(dtype=prefix_q_dtype)
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks).to(dtype=prefix_q_dtype)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "sdpa"  # noqa: SLF001
+
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        dt = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=device)
+        x_t = noise
+        time_value = torch.tensor(1.0, dtype=torch.float32, device=device)
+        while bool(time_value >= (-dt / 2)):
+            expanded_time = time_value.expand(batch_size)
+            v_t = self.denoise_step(state, prefix_pad_masks, past_key_values, x_t, expanded_time)
+            x_t = x_t + dt * v_t
+            time_value += dt
+        return x_t
+
+    def denoise_step_sdpa(self, state, prefix_pad_masks, past_key_values, x_t, timestep):
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
+        suffix_q_dtype = self.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.q_proj.weight.dtype
+        suffix_embs = suffix_embs.to(dtype=suffix_q_dtype)
+
+        suffix_len = suffix_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+
+        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks).to(dtype=suffix_q_dtype)
+        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "sdpa"  # noqa: SLF001
+
+        outputs_embeds, _ = self.paligemma_with_expert.forward(
+            attention_mask=full_att_2d_masks_4d,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[None, suffix_embs],
+            use_cache=False,
+            adarms_cond=[None, adarms_cond],
+        )
+
+        suffix_out = outputs_embeds[1]
+        suffix_out = suffix_out[:, -self.config.action_horizon :]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+        return self.action_out_proj(suffix_out)
+
+    setattr(model, "_openpi_original_sample_actions", model.sample_actions)
+    setattr(model, "_openpi_original_denoise_step", model.denoise_step)
+    model.sample_actions = types.MethodType(sample_actions_sdpa, model)
+    model.denoise_step = types.MethodType(denoise_step_sdpa, model)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -468,6 +554,7 @@ class OpenPIPyTorchPolicy:
         self._num_steps = int((sample_kwargs or {}).get("num_steps", 10))
         self._compile_mode = _resolve_compile_mode(compile_mode)
         self._checkpoint_dir = checkpoint_dir
+        self._attention_backend = _resolve_attention_backend()
 
         tokenizer_path = Path(
             os.environ.get("OPENPI_PYTORCH_TOKENIZER_MODEL", str(tokenizer_model or DEFAULT_TOKENIZER_MODEL))
@@ -498,6 +585,8 @@ class OpenPIPyTorchPolicy:
         model.paligemma_with_expert.to_bfloat16_for_selected_params(config.dtype)
         model = model.to(self._device)
         _install_mask_aware_prefix_fastpath(model)
+        if self._attention_backend == "sdpa":
+            _install_sdpa_attention_fastpath(model)
         model.eval()
         self._model = model
         self._config = config
@@ -530,6 +619,7 @@ class OpenPIPyTorchPolicy:
             "torch_version": str(torch.__version__),
             "cuda_available": bool(torch.cuda.is_available()),
             "compile_mode": self._compile_mode or "none",
+            "attention_backend": self._attention_backend,
             "sample_num_steps": self._num_steps,
             "tokenizer_model": str(tokenizer_path.resolve()),
             "runtime_python": sys.executable,

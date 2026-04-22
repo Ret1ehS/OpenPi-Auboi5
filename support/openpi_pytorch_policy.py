@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import importlib
 import importlib.machinery
@@ -8,8 +9,10 @@ import json
 import math
 import os
 from pathlib import Path
+import pickle
 import sys
 import time
+import traceback
 import types
 from typing import Any
 
@@ -151,6 +154,48 @@ def prepare_openpi_pytorch_imports(repo_root: Path) -> None:
 
 def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+_NDARRAY_MARKER = "__openpi_worker_ndarray__"
+_NUMPY_SCALAR_MARKER = "__openpi_worker_numpy_scalar__"
+
+
+def encode_worker_value(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return {
+            _NDARRAY_MARKER: True,
+            "dtype": value.dtype.str,
+            "shape": list(value.shape),
+            "data": value.tobytes(),
+        }
+    if isinstance(value, np.generic):
+        return {
+            _NUMPY_SCALAR_MARKER: True,
+            "dtype": value.dtype.str,
+            "value": value.item(),
+        }
+    if isinstance(value, dict):
+        return {key: encode_worker_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [encode_worker_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(encode_worker_value(item) for item in value)
+    return value
+
+
+def decode_worker_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        if value.get(_NDARRAY_MARKER):
+            array = np.frombuffer(value["data"], dtype=np.dtype(value["dtype"]))
+            return array.reshape(value["shape"]).copy()
+        if value.get(_NUMPY_SCALAR_MARKER):
+            return np.asarray(value["value"], dtype=np.dtype(value["dtype"]))[()]
+        return {key: decode_worker_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [decode_worker_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(decode_worker_value(item) for item in value)
+    return value
 
 
 def _resolve_attention_backend(explicit: str | None = None) -> str:
@@ -694,10 +739,95 @@ def build_synthetic_observation(spec: SyntheticObservationSpec | None = None) ->
     }
 
 
+def _read_worker_message() -> dict[str, Any] | None:
+    header = sys.stdin.buffer.read(8)
+    if not header:
+        return None
+    size = int.from_bytes(header, "little", signed=False)
+    payload = sys.stdin.buffer.read(size)
+    while len(payload) < size:
+        chunk = sys.stdin.buffer.read(size - len(payload))
+        if not chunk:
+            raise EOFError("Unexpected EOF while reading worker payload.")
+        payload += chunk
+    return decode_worker_value(pickle.loads(payload))
+
+
+def _write_worker_message(message: dict[str, Any]) -> None:
+    payload = pickle.dumps(encode_worker_value(message), protocol=pickle.HIGHEST_PROTOCOL)
+    sys.stdout.buffer.write(len(payload).to_bytes(8, "little", signed=False))
+    sys.stdout.buffer.write(payload)
+    sys.stdout.buffer.flush()
+
+
+def run_worker_main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="OpenPI PyTorch local policy worker.")
+    parser.add_argument("--repo-root", type=Path, required=True)
+    parser.add_argument("--checkpoint-dir", type=Path, required=True)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--default-prompt", type=str, default="")
+    parser.add_argument("--num-steps", type=int, default=10)
+    parser.add_argument("--compile-mode", type=str, default="")
+    args = parser.parse_args(argv)
+
+    try:
+        policy = OpenPIPyTorchPolicy(
+            repo_root=args.repo_root,
+            checkpoint_dir=args.checkpoint_dir,
+            pytorch_device=args.device,
+            default_prompt=args.default_prompt or None,
+            sample_kwargs={"num_steps": int(args.num_steps)},
+            compile_mode=args.compile_mode or None,
+        )
+        _write_worker_message({"ok": True, "metadata": policy.metadata})
+    except Exception as exc:
+        _write_worker_message(
+            {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc(),
+            }
+        )
+        return 1
+
+    while True:
+        try:
+            message = _read_worker_message()
+            if message is None:
+                return 0
+            op = message.get("op")
+            if op == "infer":
+                _write_worker_message({"ok": True, "result": policy.infer(message["obs"])})
+            elif op == "reset":
+                policy.reset()
+                _write_worker_message({"ok": True})
+            elif op == "close":
+                policy.close()
+                _write_worker_message({"ok": True})
+                return 0
+            else:
+                _write_worker_message({"ok": False, "error": f"Unsupported worker op: {op!r}"})
+        except Exception as exc:
+            _write_worker_message(
+                {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "traceback": traceback.format_exc(),
+                }
+            )
+
+
 __all__ = [
     "DEFAULT_TOKENIZER_MODEL",
     "SyntheticObservationSpec",
     "OpenPIPyTorchPolicy",
     "build_synthetic_observation",
+    "decode_worker_value",
+    "encode_worker_value",
     "prepare_openpi_pytorch_imports",
+    "run_worker_main",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_worker_main())

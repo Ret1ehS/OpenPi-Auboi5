@@ -1146,7 +1146,25 @@ def main() -> int:
         print(f"  Debug Dry Run: {cfg.dry_run}")
 
     # --- Load policy ---
-    os.environ["OPENPI_PYTORCH_TRT_DENOISE"] = "1" if (cfg.policy_location == "local" and cfg.trt_denoise) else "0"
+    trt_denoise_enabled = cfg.policy_location == "local" and cfg.trt_denoise
+    os.environ["OPENPI_PYTORCH_TRT_DENOISE"] = "1" if trt_denoise_enabled else "0"
+    if trt_denoise_enabled:
+        os.environ["OPENPI_POLICY_BACKEND"] = "pytorch"
+        from support.load_policy import DEFAULT_PYTORCH_CHECKPOINT_DIR
+
+        pytorch_checkpoint_dir = Path(DEFAULT_PYTORCH_CHECKPOINT_DIR).resolve()
+        required_files = (
+            pytorch_checkpoint_dir / "model.safetensors",
+            pytorch_checkpoint_dir / "config.json",
+        )
+        missing = [path.name for path in required_files if not path.exists()]
+        if missing:
+            print("\nPyTorch TRT denoise requires a converted PyTorch checkpoint.")
+            print(f"OPENPI_PYTORCH_CHECKPOINT_DIR={pytorch_checkpoint_dir}")
+            print(f"Missing: {', '.join(missing)}")
+            print("Disable `TRT Denoise` in TUI or point OPENPI_PYTORCH_CHECKPOINT_DIR at a converted export.")
+            return 1
+
     t0 = time.monotonic()
     policy_spec = PolicyLoadSpec(
         remote=(cfg.policy_location == "remote"),
@@ -1154,8 +1172,14 @@ def main() -> int:
     if policy_spec.remote:
         print("\nConnecting to remote inference server...")
     else:
-        from support.load_policy import DEFAULT_CHECKPOINT_DIR
-        print(f"\nCHECKPOINT_DIR={DEFAULT_CHECKPOINT_DIR}")
+        if trt_denoise_enabled:
+            from support.load_policy import DEFAULT_PYTORCH_CHECKPOINT_DIR
+
+            print(f"\nPYTORCH_CHECKPOINT_DIR={DEFAULT_PYTORCH_CHECKPOINT_DIR}")
+        else:
+            from support.load_policy import DEFAULT_CHECKPOINT_DIR
+
+            print(f"\nCHECKPOINT_DIR={DEFAULT_CHECKPOINT_DIR}")
         print("Loading policy from checkpoint...")
     policy = load_policy(policy_spec)
     policy_load_s = time.monotonic() - t0

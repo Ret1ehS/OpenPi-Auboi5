@@ -1850,6 +1850,10 @@ def main() -> int:
             print("\n  Waiting for in-flight trajectory to finish...")
             executor.wait_until_idle()
             executor.reset_state()
+            try:
+                policy.reset()
+            except Exception as exc:
+                print(f"  Policy reset after interrupt failed: {exc}")
             _append_infer_log(
                 {
                     "event": "session_stop",
@@ -1868,6 +1872,10 @@ def main() -> int:
     task_observer.stop()
     executor.stop()
     obs_builder.stop()
+    try:
+        policy.close()
+    except Exception:
+        pass
     print("Shutdown complete. Bye.")
     return 0
 

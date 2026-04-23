@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
+import io
 import importlib
 import importlib.machinery
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -15,6 +18,7 @@ import time
 import traceback
 import types
 from typing import Any
+import warnings
 
 import numpy as np
 import safetensors.torch
@@ -28,6 +32,21 @@ IMAGE_SIZE = 224
 _SYSTEM_TENSORRT_PYTHON_PATHS = (
     "/usr/lib/python3/dist-packages",
     "/usr/lib/python3.10/dist-packages",
+)
+_OPTIONAL_RUNTIME_WARNING_PATTERNS = (
+    "Please use the new API settings to control TF32 behavior",
+    "Unable to import torchvision related libraries.",
+    "To copy construct from a tensor, it is recommended to use sourceTensor.detach().clone()",
+)
+_OPTIONAL_RUNTIME_STDERR_PATTERNS = (
+    "Unable to import quantization op. Please install modelopt library",
+    "TensorRT-LLM is not installed.",
+)
+_OPTIONAL_RUNTIME_LOGGERS = (
+    "py.warnings",
+    "torch_tensorrt",
+    "torch_tensorrt.dynamo.conversion.impl.unsqueeze",
+    "torch._library.fake_class_registry",
 )
 
 
@@ -156,6 +175,45 @@ def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _pytorch_runtime_warnings_enabled() -> bool:
+    return _env_truthy("OPENPI_PYTORCH_SHOW_OPTIONAL_WARNINGS")
+
+
+def _configure_optional_runtime_warnings() -> None:
+    if _pytorch_runtime_warnings_enabled():
+        return
+    for pattern in _OPTIONAL_RUNTIME_WARNING_PATTERNS:
+        warnings.filterwarnings("ignore", message=f".*{pattern}.*", category=UserWarning)
+    for logger_name in _OPTIONAL_RUNTIME_LOGGERS:
+        logging.getLogger(logger_name).setLevel(logging.ERROR)
+
+
+def _replay_filtered_runtime_stream(output: str, *, target: io.TextIOBase) -> None:
+    if not output:
+        return
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if any(pattern in stripped for pattern in _OPTIONAL_RUNTIME_STDERR_PATTERNS):
+            continue
+        print(line, file=target)
+
+
+def _import_torch_tensorrt() -> Any:
+    _add_system_tensorrt_python_paths()
+    if _pytorch_runtime_warnings_enabled():
+        return importlib.import_module("torch_tensorrt")
+
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
+        module = importlib.import_module("torch_tensorrt")
+    _replay_filtered_runtime_stream(stdout_buffer.getvalue(), target=sys.stdout)
+    _replay_filtered_runtime_stream(stderr_buffer.getvalue(), target=sys.stderr)
+    return module
+
+
 _NDARRAY_MARKER = "__openpi_worker_ndarray__"
 _NUMPY_SCALAR_MARKER = "__openpi_worker_numpy_scalar__"
 
@@ -230,8 +288,7 @@ def _maybe_build_trt_image_embedder(model: torch.nn.Module, example_input: torch
     if not _env_truthy("OPENPI_PYTORCH_TRT_VISION"):
         return None
 
-    _add_system_tensorrt_python_paths()
-    import torch_tensorrt
+    torch_tensorrt = _import_torch_tensorrt()
 
     cache_dir = Path(
         os.environ.get(
@@ -285,8 +342,7 @@ def _maybe_build_trt_denoise_engine(policy: "OpenPIPyTorchPolicy", model: torch.
     if not _env_truthy("OPENPI_PYTORCH_TRT_DENOISE"):
         return None
 
-    _add_system_tensorrt_python_paths()
-    import torch_tensorrt
+    torch_tensorrt = _import_torch_tensorrt()
     from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
     from transformers.cache_utils import DynamicCache
 
@@ -918,6 +974,8 @@ def run_worker_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--compile-mode", type=str, default="")
     args = parser.parse_args(argv)
 
+    _configure_optional_runtime_warnings()
+
     try:
         policy = OpenPIPyTorchPolicy(
             repo_root=args.repo_root,
@@ -960,6 +1018,12 @@ def run_worker_main(argv: list[str] | None = None) -> int:
                 return 0
             else:
                 _write_worker_message({"ok": False, "error": f"Unsupported worker op: {op!r}"})
+        except KeyboardInterrupt:
+            try:
+                policy.close()
+            except Exception:
+                pass
+            return 0
         except Exception as exc:
             _write_worker_message(
                 {

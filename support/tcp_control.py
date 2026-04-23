@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import os
 import queue
 import math
 import re
@@ -90,6 +91,12 @@ DAEMON_COMMAND_TIMEOUT_S = 10.0
 DAEMON_STOP_TIMEOUT_S = 3.0
 HELPER_RUN_TIMEOUT_S = 20.0
 _DAEMON_SENTINEL = object()
+
+
+def _subprocess_session_kwargs() -> dict[str, object]:
+    if os.name == "nt":
+        return {}
+    return {"start_new_session": True}
 
 JOINT_NAMES = [
     "base_link",
@@ -718,6 +725,7 @@ class _DaemonHelper:
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,  # line-buffered
+            **_subprocess_session_kwargs(),
         )
         self._start_reader_threads(self._proc)
         # Wait for DAEMON_READY

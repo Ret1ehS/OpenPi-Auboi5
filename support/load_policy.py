@@ -65,6 +65,12 @@ def _ensure_openpi_repo_paths(repo_root: Path = DEFAULT_REPO_ROOT) -> None:
 _ensure_openpi_repo_paths()
 
 
+def _subprocess_session_kwargs() -> dict[str, object]:
+    if os.name == "nt":
+        return {}
+    return {"start_new_session": True}
+
+
 _JAX_GPU_PROBE = r"""
 import jax
 import jax.numpy as jnp
@@ -353,6 +359,7 @@ class SubprocessPyTorchPolicy:
             stderr=None,
             bufsize=0,
             env=_build_pytorch_worker_env(self._runtime_python),
+            **_subprocess_session_kwargs(),
         )
         ready = self._recv()
         if not ready.get("ok"):

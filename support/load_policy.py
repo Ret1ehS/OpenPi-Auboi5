@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import numpy as np
 
 if __package__ in (None, ""):
     _PARENT = Path(__file__).resolve().parent.parent
@@ -295,8 +296,10 @@ class LocalPolicyRunner:
         self._policy = policy
         self._metadata = metadata or {}
 
-    def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
-        return self._policy.infer(obs)
+    def infer(self, obs: dict[str, Any], *, noise: np.ndarray | None = None) -> dict[str, Any]:
+        if noise is None:
+            return self._policy.infer(obs)
+        return self._policy.infer(obs, noise=noise)
 
     def reset(self) -> None:
         if hasattr(self._policy, "reset"):
@@ -367,9 +370,9 @@ class SubprocessPyTorchPolicy:
     def metadata(self) -> dict[str, Any]:
         return dict(self._metadata)
 
-    def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
+    def infer(self, obs: dict[str, Any], *, noise: np.ndarray | None = None) -> dict[str, Any]:
         with self._lock:
-            self._send({"op": "infer", "obs": obs})
+            self._send({"op": "infer", "obs": obs, "noise": noise})
             response = self._recv()
         if not response.get("ok"):
             raise RuntimeError(

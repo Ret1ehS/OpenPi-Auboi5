@@ -42,6 +42,37 @@ def _env_is_set(name: str) -> bool:
     return raw is not None and raw.strip() != ""
 
 
+def _checkpoint_export_ready(path: Path) -> bool:
+    return (path / "model.safetensors").exists() and (path / "config.json").exists()
+
+
+def _derive_checkpoint_variant(path: Path, variant_name: str) -> Path:
+    parts = list(path.parts)
+    try:
+        idx = next(i for i, part in enumerate(parts) if part == "checkpoints")
+    except StopIteration:
+        return path
+    if idx + 1 >= len(parts):
+        return path
+    return Path(*parts[: idx + 1], variant_name, *parts[idx + 2 :]).resolve()
+
+
+def _default_pytorch_checkpoint_dir(checkpoint_dir: Path) -> Path:
+    config_name = checkpoint_dir.parts[-3] if len(checkpoint_dir.parts) >= 3 else DEFAULT_CONFIG_NAME
+    attnvecfix = _derive_checkpoint_variant(checkpoint_dir, f"{config_name}_pytorch_attnvecfix")
+    merged = _derive_checkpoint_variant(checkpoint_dir, f"{config_name}_pytorch_lora_merged")
+    legacy = _derive_checkpoint_variant(checkpoint_dir, f"{config_name}_pytorch")
+
+    for candidate in (attnvecfix, merged, legacy):
+        if _checkpoint_export_ready(candidate):
+            return candidate
+    if legacy != checkpoint_dir and legacy.exists():
+        return legacy
+    if merged != checkpoint_dir and merged.exists():
+        return merged
+    return attnvecfix
+
+
 DEFAULT_CONFIG_NAME = _env_str("OPENPI_POLICY_CONFIG_NAME", "pi05_aubo_agv_lora")
 DEFAULT_POLICY_BACKEND = _env_str("OPENPI_POLICY_BACKEND", "auto").lower()
 DEFAULT_CHECKPOINT_DIR = _env_path(
@@ -51,7 +82,7 @@ DEFAULT_CHECKPOINT_DIR = _env_path(
 )
 DEFAULT_PYTORCH_CHECKPOINT_DIR = _env_path(
     "OPENPI_PYTORCH_CHECKPOINT_DIR",
-    DEFAULT_CHECKPOINT_DIR,
+    _default_pytorch_checkpoint_dir(DEFAULT_CHECKPOINT_DIR),
     base=get_repo_root(),
 )
 DEFAULT_PYTORCH_DEVICE = _env_str("OPENPI_PYTORCH_DEVICE", "cuda")

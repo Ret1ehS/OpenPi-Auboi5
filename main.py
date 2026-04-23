@@ -1194,19 +1194,31 @@ def main() -> int:
             print("Disable `TRT Denoise` in TUI or point OPENPI_PYTORCH_CHECKPOINT_DIR at a converted export.")
             return 1
 
+    effective_remote = cfg.policy_location == "remote"
+    effective_backend = os.environ.get("OPENPI_POLICY_BACKEND", "auto").strip().lower() or "auto"
+    effective_pytorch_checkpoint_dir = Path(
+        os.environ.get("OPENPI_PYTORCH_CHECKPOINT_DIR", str(_resolve_effective_pytorch_checkpoint_dir()))
+    ).expanduser().resolve()
+
+    from support.load_policy import DEFAULT_CHECKPOINT_DIR
+
+    effective_jax_checkpoint_dir = Path(os.environ.get("OPENPI_CHECKPOINT_DIR", str(DEFAULT_CHECKPOINT_DIR))).expanduser().resolve()
+
     t0 = time.monotonic()
     policy_spec = PolicyLoadSpec(
-        remote=(cfg.policy_location == "remote"),
+        remote=effective_remote,
+        backend=effective_backend,
+        checkpoint_dir=effective_jax_checkpoint_dir,
+        pytorch_checkpoint_dir=effective_pytorch_checkpoint_dir,
+        pytorch_device=os.environ.get("OPENPI_PYTORCH_DEVICE", "cuda").strip() or "cuda",
     )
     if policy_spec.remote:
         print("\nConnecting to remote inference server...")
     else:
-        if trt_denoise_enabled:
-            print(f"\nPYTORCH_CHECKPOINT_DIR={os.environ.get('OPENPI_PYTORCH_CHECKPOINT_DIR', '')}")
+        if policy_spec.backend == "pytorch":
+            print(f"\nPYTORCH_CHECKPOINT_DIR={policy_spec.pytorch_checkpoint_dir}")
         else:
-            from support.load_policy import DEFAULT_CHECKPOINT_DIR
-
-            print(f"\nCHECKPOINT_DIR={DEFAULT_CHECKPOINT_DIR}")
+            print(f"\nCHECKPOINT_DIR={policy_spec.checkpoint_dir}")
         print("Loading policy from checkpoint...")
     policy = load_policy(policy_spec)
     policy_load_s = time.monotonic() - t0

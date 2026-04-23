@@ -822,7 +822,7 @@ class OpenPIPyTorchPolicy:
     def close(self) -> None:
         return None
 
-    def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
+    def infer(self, obs: dict[str, Any], noise: np.ndarray | None = None) -> dict[str, Any]:
         prompt = _resolve_prompt(obs.get("prompt"), self._default_prompt)
         state = np.asarray(obs["observation/state"], dtype=np.float32).reshape(-1)
         state = _normalize_quantile(state, self._norm_stats["state"])
@@ -852,8 +852,19 @@ class OpenPIPyTorchPolicy:
         if self._device.type == "cuda":
             torch.cuda.synchronize(self._device)
         infer_t0 = time.perf_counter()
+        noise_tensor = None
+        if noise is not None:
+            noise_array = np.asarray(noise, dtype=np.float32)
+            if noise_array.ndim == 2:
+                noise_array = noise_array[None, ...]
+            noise_tensor = torch.from_numpy(noise_array).to(device=self._device, dtype=torch.float32)
         with torch.inference_mode():
-            actions = self._model.sample_actions(str(self._device), observation, num_steps=self._num_steps)
+            actions = self._model.sample_actions(
+                str(self._device),
+                observation,
+                noise=noise_tensor,
+                num_steps=self._num_steps,
+            )
         if self._device.type == "cuda":
             torch.cuda.synchronize(self._device)
         infer_ms = (time.perf_counter() - infer_t0) * 1000.0
@@ -934,7 +945,12 @@ def run_worker_main(argv: list[str] | None = None) -> int:
                 return 0
             op = message.get("op")
             if op == "infer":
-                _write_worker_message({"ok": True, "result": policy.infer(message["obs"])})
+                _write_worker_message(
+                    {
+                        "ok": True,
+                        "result": policy.infer(message["obs"], noise=message.get("noise")),
+                    }
+                )
             elif op == "reset":
                 policy.reset()
                 _write_worker_message({"ok": True})

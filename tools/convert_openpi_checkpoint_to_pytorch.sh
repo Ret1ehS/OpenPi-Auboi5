@@ -10,18 +10,28 @@ fi
 repo_python="$1"
 config_name="$2"
 jax_checkpoint_dir="$3"
-output_dir="${4:-${jax_checkpoint_dir}_pytorch}"
-
 scripts_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 openpi_root="$(cd "${scripts_root}/.." && pwd)"
 repo_root="${openpi_root}/repo"
+
+if [[ $# -ge 4 ]]; then
+  output_dir="$4"
+else
+  rel_checkpoint="${jax_checkpoint_dir#${repo_root}/checkpoints/}"
+  if [[ "${rel_checkpoint}" != "${jax_checkpoint_dir}" ]]; then
+    output_dir="${repo_root}/checkpoints/${config_name}_pytorch_lora_merged/${rel_checkpoint#*/}"
+  else
+    output_dir="${jax_checkpoint_dir}_pytorch_lora_merged"
+  fi
+fi
 
 echo "repo_python=${repo_python}"
 echo "config_name=${config_name}"
 echo "jax_checkpoint_dir=${jax_checkpoint_dir}"
 echo "output_dir=${output_dir}"
 
-exec "${repo_python}" "${repo_root}/examples/convert_jax_model_to_pytorch.py" \
+exec "${repo_python}" "${scripts_root}/tools/convert_openpi_checkpoint_to_pytorch.py" \
+  --repo-root "${repo_root}" \
   --checkpoint_dir "${jax_checkpoint_dir}" \
   --config_name "${config_name}" \
   --output_path "${output_dir}"

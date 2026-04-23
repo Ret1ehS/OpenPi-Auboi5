@@ -32,10 +32,8 @@ from utils.env_utils import load_default_env
 from utils.path_utils import get_openpi_root, get_repo_root
 from utils.runtime_config import (
     DEFAULT_CHECKPOINT_DIR,
-    DEFAULT_CONFIG_NAME,
     DEFAULT_LOCAL_PORT,
     DEFAULT_NAMESPACE,
-    DEFAULT_POLICY_BACKEND,
     DEFAULT_PYTORCH_CHECKPOINT_DIR,
     DEFAULT_PYTORCH_DEVICE,
     DEFAULT_REMOTE_PORT,
@@ -47,6 +45,8 @@ load_default_env()
 SCRIPT_DIR = Path(__file__).resolve().parent
 OPENPI_ROOT = get_openpi_root()
 DEFAULT_REPO_ROOT = get_repo_root()
+DEFAULT_CONFIG_NAME = (os.environ.get("OPENPI_POLICY_CONFIG_NAME", "").strip() or "pi05_aubo_agv_lora")
+DEFAULT_POLICY_BACKEND = (os.environ.get("OPENPI_POLICY_BACKEND", "").strip().lower() or "auto")
 DEFAULT_PYTORCH_RUNTIME_PYTHON = OPENPI_ROOT / "miniforge3" / "envs" / "openpi-py310-torch" / "bin" / "python"
 PYTORCH_WORKER_SCRIPT = SCRIPT_DIR / "pytorch_support.py"
 

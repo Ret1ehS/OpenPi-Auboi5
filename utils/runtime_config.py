@@ -6,7 +6,6 @@ from pathlib import Path
 from utils.env_utils import load_default_env
 from utils.path_utils import (
     SCRIPTS_ROOT,
-    get_openpi_root,
     get_repo_root,
     get_support_dir,
 )
@@ -37,11 +36,6 @@ def _env_path(name: str, default: Path, *, base: Path | None = None) -> Path:
     return path.resolve()
 
 
-def _env_is_set(name: str) -> bool:
-    raw = os.environ.get(name)
-    return raw is not None and raw.strip() != ""
-
-
 def _checkpoint_export_ready(path: Path) -> bool:
     return (path / "model.safetensors").exists() and (path / "config.json").exists()
 
@@ -58,7 +52,7 @@ def _derive_checkpoint_variant(path: Path, variant_name: str) -> Path:
 
 
 def _default_pytorch_checkpoint_dir(checkpoint_dir: Path) -> Path:
-    config_name = checkpoint_dir.parts[-3] if len(checkpoint_dir.parts) >= 3 else DEFAULT_CONFIG_NAME
+    config_name = checkpoint_dir.parts[-3] if len(checkpoint_dir.parts) >= 3 else "pi05_aubo_agv_lora"
     attnvecfix = _derive_checkpoint_variant(checkpoint_dir, f"{config_name}_pytorch_attnvecfix")
     merged = _derive_checkpoint_variant(checkpoint_dir, f"{config_name}_pytorch_lora_merged")
     legacy = _derive_checkpoint_variant(checkpoint_dir, f"{config_name}_pytorch")
@@ -73,11 +67,9 @@ def _default_pytorch_checkpoint_dir(checkpoint_dir: Path) -> Path:
     return attnvecfix
 
 
-DEFAULT_CONFIG_NAME = _env_str("OPENPI_POLICY_CONFIG_NAME", "pi05_aubo_agv_lora")
-DEFAULT_POLICY_BACKEND = _env_str("OPENPI_POLICY_BACKEND", "auto").lower()
 DEFAULT_CHECKPOINT_DIR = _env_path(
     "OPENPI_CHECKPOINT_DIR",
-    Path("checkpoints") / DEFAULT_CONFIG_NAME / "my_eighth_run" / "29999",
+    Path("checkpoints") / _env_str("OPENPI_POLICY_CONFIG_NAME", "pi05_aubo_agv_lora") / "my_eighth_run" / "29999",
     base=get_repo_root(),
 )
 DEFAULT_PYTORCH_CHECKPOINT_DIR = _env_path(
@@ -99,8 +91,6 @@ DEFAULT_AUBO_RPC_PORT = _env_int("OPENPI_ROBOT_PORT", 30004)
 DEFAULT_AUBO_USER = _env_str("OPENPI_ROBOT_USER", "aubo")
 DEFAULT_AUBO_PASSWORD = _env_str("OPENPI_ROBOT_PASSWORD", "123456")
 DEFAULT_ROBOT_IP = _env_str("OPENPI_ROBOT_IP", "192.168.1.100")
-ROBOT_PASSWORD_FROM_ENV = _env_is_set("OPENPI_ROBOT_PASSWORD")
-ROBOT_IP_FROM_ENV = _env_is_set("OPENPI_ROBOT_IP")
 
 DEFAULT_GRIPPER_PORT = _env_str(
     "OPENPI_GRIPPER_PORT",
@@ -119,36 +109,11 @@ DEFAULT_FORCE_SENSOR_FALLBACK_PORT = _env_str(
     "/dev/ttyUSB4",
 )
 
-DEFAULT_OBSERVER_PYTHON = _env_path(
-    "OPENPI_TASK_OBSERVER_PYTHON",
-    get_openpi_root() / "venvs" / "vllm-jp62-clean" / "bin" / "python",
-)
-DEFAULT_OBSERVER_MODEL = _env_path(
-    "OPENPI_TASK_OBSERVER_MODEL",
-    get_openpi_root() / "modelscope_models" / "google" / "gemma-4-E2B-it",
-)
-
-
-def get_robot_config_warnings() -> tuple[str, ...]:
-    warnings: list[str] = []
-    if not ROBOT_IP_FROM_ENV:
-        warnings.append(
-            "OPENPI_ROBOT_IP is not set; using the built-in default robot address."
-        )
-    if not ROBOT_PASSWORD_FROM_ENV:
-        warnings.append(
-            "OPENPI_ROBOT_PASSWORD is not set; using the built-in default robot password."
-        )
-    return tuple(warnings)
-
-
 __all__ = [
     "DEFAULT_AUBO_PASSWORD",
     "DEFAULT_AUBO_RPC_PORT",
     "DEFAULT_AUBO_USER",
     "DEFAULT_CHECKPOINT_DIR",
-    "DEFAULT_CONFIG_NAME",
-    "DEFAULT_POLICY_BACKEND",
     "DEFAULT_PYTORCH_CHECKPOINT_DIR",
     "DEFAULT_PYTORCH_DEVICE",
     "DEFAULT_FORCE_SENSOR_FALLBACK_PORT",
@@ -157,12 +122,7 @@ __all__ = [
     "DEFAULT_GRIPPER_PORT",
     "DEFAULT_LOCAL_PORT",
     "DEFAULT_NAMESPACE",
-    "DEFAULT_OBSERVER_MODEL",
-    "DEFAULT_OBSERVER_PYTHON",
     "DEFAULT_REMOTE_PORT",
     "DEFAULT_ROBOT_IP",
     "KUBECONFIG_PATH",
-    "ROBOT_IP_FROM_ENV",
-    "ROBOT_PASSWORD_FROM_ENV",
-    "get_robot_config_warnings",
 ]

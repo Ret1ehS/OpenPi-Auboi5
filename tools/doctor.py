@@ -34,13 +34,10 @@ from utils.runtime_config import (
     DEFAULT_FORCE_SENSOR_PORT,
     DEFAULT_GRIPPER_FALLBACK_PORT,
     DEFAULT_GRIPPER_PORT,
-    DEFAULT_OBSERVER_MODEL,
-    DEFAULT_OBSERVER_PYTHON,
     DEFAULT_PYTORCH_CHECKPOINT_DIR,
     DEFAULT_PYTORCH_DEVICE,
     DEFAULT_ROBOT_IP,
     KUBECONFIG_PATH,
-    get_robot_config_warnings,
 )
 
 
@@ -77,6 +74,29 @@ def _check_path(label: str, path: Path, *, required: bool = True, kind: str = "p
     if required:
         return _fail(label, f"{kind} missing: {path}")
     return _warn(label, f"{kind} missing: {path}")
+
+
+def _observer_python_path() -> Path:
+    raw = os.environ.get("OPENPI_TASK_OBSERVER_PYTHON", "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return (get_openpi_root() / "venvs" / "vllm-jp62-clean" / "bin" / "python").resolve()
+
+
+def _observer_model_path() -> Path:
+    raw = os.environ.get("OPENPI_TASK_OBSERVER_MODEL", "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return (get_openpi_root() / "modelscope_models" / "google" / "gemma-4-E2B-it").resolve()
+
+
+def _robot_config_warnings() -> tuple[str, ...]:
+    warnings: list[str] = []
+    if not os.environ.get("OPENPI_ROBOT_IP", "").strip():
+        warnings.append("OPENPI_ROBOT_IP is not set; using the built-in default robot address.")
+    if not os.environ.get("OPENPI_ROBOT_PASSWORD", "").strip():
+        warnings.append("OPENPI_ROBOT_PASSWORD is not set; using the built-in default robot password.")
+    return tuple(warnings)
 
 
 def _runtime_checks() -> list[CheckResult]:
@@ -119,7 +139,7 @@ def _runtime_checks() -> list[CheckResult]:
     results.extend(_pytorch_runtime_checks())
 
     results.append(_ok("robot_ip", DEFAULT_ROBOT_IP))
-    for detail in get_robot_config_warnings():
+    for detail in _robot_config_warnings():
         results.append(_warn("robot_config", detail))
     return results
 
@@ -553,8 +573,8 @@ def _camera_checks() -> list[CheckResult]:
 
 def _observer_checks() -> list[CheckResult]:
     results: list[CheckResult] = []
-    results.append(_check_path("observer_python", DEFAULT_OBSERVER_PYTHON, required=False, kind="file"))
-    results.append(_check_path("observer_model", DEFAULT_OBSERVER_MODEL, required=False, kind="path"))
+    results.append(_check_path("observer_python", _observer_python_path(), required=False, kind="file"))
+    results.append(_check_path("observer_model", _observer_model_path(), required=False, kind="path"))
     observer_modules = ("torch", "transformers", "PIL")
     for module_name in observer_modules:
         if _has_module(module_name):

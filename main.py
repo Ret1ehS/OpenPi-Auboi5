@@ -586,9 +586,11 @@ class ParallelTrajectoryExecutor:
         *,
         execute: bool,
         max_speed_mps: float = 0.05,
+        max_angular_speed_radps: float = float("inf"),
     ):
         self._execute = execute
         self._max_speed_mps = max_speed_mps
+        self._max_angular_speed_radps = max_angular_speed_radps
         self._queue: queue.Queue = queue.Queue(maxsize=16)
         self._sentinel = object()
         self._lock = threading.Lock()
@@ -786,6 +788,45 @@ class ParallelTrajectoryExecutor:
             )
         return fused_pose
 
+    def _apply_speed_caps(
+        self,
+        target_pose_sim: np.ndarray,
+        current_pose_sim: np.ndarray,
+        control_dt_s: float,
+    ) -> np.ndarray:
+        target = np.asarray(target_pose_sim, dtype=np.float64).reshape(6).copy()
+        current = np.asarray(current_pose_sim, dtype=np.float64).reshape(6)
+
+        max_linear_step = float(self._max_speed_mps) * float(control_dt_s)
+        if np.isfinite(max_linear_step) and max_linear_step > 0.0:
+            linear_delta = target[:3] - current[:3]
+            linear_dist = float(np.linalg.norm(linear_delta))
+            if linear_dist > max_linear_step and linear_dist > 1e-12:
+                target[:3] = current[:3] + linear_delta * (max_linear_step / linear_dist)
+
+        max_angular_step = float(self._max_angular_speed_radps) * float(control_dt_s)
+        if np.isfinite(max_angular_step) and max_angular_step > 0.0:
+            angular_delta = np.zeros((3,), dtype=np.float64)
+            for axis in range(3):
+                angular_delta[axis] = float(
+                    np.arctan2(
+                        np.sin(target[3 + axis] - current[3 + axis]),
+                        np.cos(target[3 + axis] - current[3 + axis]),
+                    )
+                )
+            angular_dist = float(np.linalg.norm(angular_delta))
+            if angular_dist > max_angular_step and angular_dist > 1e-12:
+                angular_delta *= float(max_angular_step / angular_dist)
+                for axis in range(3):
+                    target[3 + axis] = float(
+                        np.arctan2(
+                            np.sin(current[3 + axis] + angular_delta[axis]),
+                            np.cos(current[3 + axis] + angular_delta[axis]),
+                        )
+                    )
+
+        return target
+
     def _ingest_submission(self, submission: ChunkSubmission) -> tuple[int, int]:
         plan = submission.plan
         accepted = 0
@@ -934,6 +975,7 @@ class ParallelTrajectoryExecutor:
                     continue
 
                 target_pose_sim = self._aggregate_pose_candidates(candidates, current_pose_sim)
+                target_pose_sim = self._apply_speed_caps(target_pose_sim, current_pose_sim, control_dt_s)
                 target_pose_real = sim_pose_to_real(target_pose_sim)
 
                 if self._execute:
@@ -1077,6 +1119,7 @@ def main() -> int:
         set_alignment_mode,
     )
     from support.tcp_control import (
+        DEFAULT_TCP_ANGULAR_SPEED_RADPS,
         RetimedTcpChunk,
         RetimedTcpStep,
         build_helper as build_tcp_helper,
@@ -1281,10 +1324,12 @@ def main() -> int:
         print("Cameras ready.")
 
     effective_speed = float('inf') if cfg.speed_mode == "native" else cfg.exec_speed_mps
+    effective_angular_speed = float("inf") if cfg.speed_mode == "native" else float(DEFAULT_TCP_ANGULAR_SPEED_RADPS)
     is_native_speed = cfg.speed_mode == "native"
     executor = ParallelTrajectoryExecutor(
         execute=execute,
         max_speed_mps=effective_speed,
+        max_angular_speed_radps=effective_angular_speed,
     )
     executor.start()
     infer_log_dir = SCRIPT_DIR / "log"

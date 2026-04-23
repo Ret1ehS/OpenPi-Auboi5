@@ -167,6 +167,59 @@ def _print_local_policy_jax_diagnostics() -> None:
         print(f"JAX_RUNTIME diagnose failed: {type(exc).__name__}: {exc}")
 
 
+def _local_policy_backend_label(metadata: dict[str, Any] | None = None) -> str:
+    meta = metadata or {}
+    backend = str(meta.get("policy_backend", "")).strip().lower()
+    if backend == "pytorch":
+        device = str(meta.get("pytorch_device", "")).strip()
+        return f"pytorch:{device}" if device else "pytorch"
+    if backend == "jax":
+        return f"jax:{_jax_infer_backend_label()}"
+    return backend or f"jax:{_jax_infer_backend_label()}"
+
+
+def _resolve_effective_pytorch_checkpoint_dir() -> Path:
+    raw = os.environ.get("OPENPI_PYTORCH_CHECKPOINT_DIR", "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+
+    from support.load_policy import DEFAULT_CHECKPOINT_DIR, DEFAULT_PYTORCH_CHECKPOINT_DIR
+
+    candidate = Path(DEFAULT_PYTORCH_CHECKPOINT_DIR).resolve()
+    required = (candidate / "model.safetensors", candidate / "config.json")
+    if all(path.exists() for path in required):
+        return candidate
+
+    jax_dir = Path(DEFAULT_CHECKPOINT_DIR).resolve()
+    parts = list(jax_dir.parts)
+    try:
+        idx = next(i for i, part in enumerate(parts) if part == "checkpoints")
+    except StopIteration:
+        return candidate
+    if idx + 1 >= len(parts):
+        return candidate
+
+    config_name = parts[idx + 1]
+    guessed_config = f"{config_name}_pytorch"
+    guessed = Path(*parts[: idx + 1], guessed_config, *parts[idx + 2 :]).resolve()
+    guessed_required = (guessed / "model.safetensors", guessed / "config.json")
+    if all(path.exists() for path in guessed_required):
+        return guessed
+    return candidate
+
+
+def _print_local_policy_pytorch_diagnostics(metadata: dict[str, Any] | None = None) -> None:
+    meta = metadata or {}
+    print(
+        "PYTORCH_RUNTIME "
+        f"device={meta.get('pytorch_device', 'unknown')} "
+        f"torch={meta.get('torch_version', 'unknown')} "
+        f"compile_mode={meta.get('compile_mode', 'unknown')} "
+        f"num_steps={meta.get('sample_num_steps', 'unknown')} "
+        f"runtime_python={meta.get('runtime_python', 'unknown')}"
+    )
+
+
 def _maybe_reexec_into_repo_venv() -> None:
     _apply_niic_jax_gpu_process_env()
     target = _select_runtime_python()
@@ -533,9 +586,11 @@ class ParallelTrajectoryExecutor:
         *,
         execute: bool,
         max_speed_mps: float = 0.05,
+        max_angular_speed_radps: float = float("inf"),
     ):
         self._execute = execute
         self._max_speed_mps = max_speed_mps
+        self._max_angular_speed_radps = max_angular_speed_radps
         self._queue: queue.Queue = queue.Queue(maxsize=16)
         self._sentinel = object()
         self._lock = threading.Lock()
@@ -733,6 +788,45 @@ class ParallelTrajectoryExecutor:
             )
         return fused_pose
 
+    def _apply_speed_caps(
+        self,
+        target_pose_sim: np.ndarray,
+        current_pose_sim: np.ndarray,
+        control_dt_s: float,
+    ) -> np.ndarray:
+        target = np.asarray(target_pose_sim, dtype=np.float64).reshape(6).copy()
+        current = np.asarray(current_pose_sim, dtype=np.float64).reshape(6)
+
+        max_linear_step = float(self._max_speed_mps) * float(control_dt_s)
+        if np.isfinite(max_linear_step) and max_linear_step > 0.0:
+            linear_delta = target[:3] - current[:3]
+            linear_dist = float(np.linalg.norm(linear_delta))
+            if linear_dist > max_linear_step and linear_dist > 1e-12:
+                target[:3] = current[:3] + linear_delta * (max_linear_step / linear_dist)
+
+        max_angular_step = float(self._max_angular_speed_radps) * float(control_dt_s)
+        if np.isfinite(max_angular_step) and max_angular_step > 0.0:
+            angular_delta = np.zeros((3,), dtype=np.float64)
+            for axis in range(3):
+                angular_delta[axis] = float(
+                    np.arctan2(
+                        np.sin(target[3 + axis] - current[3 + axis]),
+                        np.cos(target[3 + axis] - current[3 + axis]),
+                    )
+                )
+            angular_dist = float(np.linalg.norm(angular_delta))
+            if angular_dist > max_angular_step and angular_dist > 1e-12:
+                angular_delta *= float(max_angular_step / angular_dist)
+                for axis in range(3):
+                    target[3 + axis] = float(
+                        np.arctan2(
+                            np.sin(current[3 + axis] + angular_delta[axis]),
+                            np.cos(current[3 + axis] + angular_delta[axis]),
+                        )
+                    )
+
+        return target
+
     def _ingest_submission(self, submission: ChunkSubmission) -> tuple[int, int]:
         plan = submission.plan
         accepted = 0
@@ -881,6 +975,7 @@ class ParallelTrajectoryExecutor:
                     continue
 
                 target_pose_sim = self._aggregate_pose_candidates(candidates, current_pose_sim)
+                target_pose_sim = self._apply_speed_caps(target_pose_sim, current_pose_sim, control_dt_s)
                 target_pose_real = sim_pose_to_real(target_pose_sim)
 
                 if self._execute:
@@ -1024,6 +1119,7 @@ def main() -> int:
         set_alignment_mode,
     )
     from support.tcp_control import (
+        DEFAULT_TCP_ANGULAR_SPEED_RADPS,
         RetimedTcpChunk,
         RetimedTcpStep,
         build_helper as build_tcp_helper,
@@ -1113,6 +1209,7 @@ def main() -> int:
     else:
         print(f"  Exec Speed: native (no retime)")
     print(f"  Record:     {cfg.record}")
+    print(f"  TRT Denoise:{'enabled' if cfg.trt_denoise else 'disabled'}")
     print(f"  Observer:   {'enabled' if cfg.task_observer_enabled else 'disabled'}")
     if cfg.task_observer_enabled:
         print(f"  Observer Interval: {cfg.task_observer_interval_s} s")
@@ -1122,22 +1219,61 @@ def main() -> int:
         print(f"  Debug Dry Run: {cfg.dry_run}")
 
     # --- Load policy ---
+    trt_denoise_enabled = cfg.policy_location == "local" and cfg.trt_denoise
+    os.environ["OPENPI_PYTORCH_TRT_DENOISE"] = "1" if trt_denoise_enabled else "0"
+    if trt_denoise_enabled:
+        os.environ["OPENPI_POLICY_BACKEND"] = "pytorch"
+        pytorch_checkpoint_dir = _resolve_effective_pytorch_checkpoint_dir()
+        os.environ["OPENPI_PYTORCH_CHECKPOINT_DIR"] = str(pytorch_checkpoint_dir)
+        required_files = (
+            pytorch_checkpoint_dir / "model.safetensors",
+            pytorch_checkpoint_dir / "config.json",
+        )
+        missing = [path.name for path in required_files if not path.exists()]
+        if missing:
+            print("\nPyTorch TRT denoise requires a converted PyTorch checkpoint.")
+            print(f"OPENPI_PYTORCH_CHECKPOINT_DIR={pytorch_checkpoint_dir}")
+            print(f"Missing: {', '.join(missing)}")
+            print("Disable `TRT Denoise` in TUI or point OPENPI_PYTORCH_CHECKPOINT_DIR at a converted export.")
+            return 1
+
+    effective_remote = cfg.policy_location == "remote"
+    effective_backend = os.environ.get("OPENPI_POLICY_BACKEND", "auto").strip().lower() or "auto"
+    effective_pytorch_checkpoint_dir = Path(
+        os.environ.get("OPENPI_PYTORCH_CHECKPOINT_DIR", str(_resolve_effective_pytorch_checkpoint_dir()))
+    ).expanduser().resolve()
+
+    from support.load_policy import DEFAULT_CHECKPOINT_DIR
+
+    effective_jax_checkpoint_dir = Path(os.environ.get("OPENPI_CHECKPOINT_DIR", str(DEFAULT_CHECKPOINT_DIR))).expanduser().resolve()
+
     t0 = time.monotonic()
     policy_spec = PolicyLoadSpec(
-        remote=(cfg.policy_location == "remote"),
+        remote=effective_remote,
+        backend=effective_backend,
+        checkpoint_dir=effective_jax_checkpoint_dir,
+        pytorch_checkpoint_dir=effective_pytorch_checkpoint_dir,
+        pytorch_device=os.environ.get("OPENPI_PYTORCH_DEVICE", "cuda").strip() or "cuda",
     )
     if policy_spec.remote:
         print("\nConnecting to remote inference server...")
     else:
-        from support.load_policy import DEFAULT_CHECKPOINT_DIR
-        print(f"\nCHECKPOINT_DIR={DEFAULT_CHECKPOINT_DIR}")
+        if policy_spec.backend == "pytorch":
+            print(f"\nPYTORCH_CHECKPOINT_DIR={policy_spec.pytorch_checkpoint_dir}")
+        else:
+            print(f"\nCHECKPOINT_DIR={policy_spec.checkpoint_dir}")
         print("Loading policy from checkpoint...")
     policy = load_policy(policy_spec)
     policy_load_s = time.monotonic() - t0
+    infer_backend_label = "remote" if policy_spec.remote else _local_policy_backend_label(policy.metadata)
     print(f"POLICY_READY={type(policy).__name__}  load_time={policy_load_s:.3f}s")
+    print(f"POLICY_BACKEND={infer_backend_label}")
     print(f"POSE_FRAME={get_alignment_mode()}")
     if not policy_spec.remote:
-        _print_local_policy_jax_diagnostics()
+        if str(policy.metadata.get("policy_backend", "")).strip().lower() == "pytorch":
+            _print_local_policy_pytorch_diagnostics(policy.metadata)
+        else:
+            _print_local_policy_jax_diagnostics()
 
     task_observer_env_cfg = TaskObserverConfig.from_env()
     task_observer_spec = task_observer_env_cfg.task_spec
@@ -1188,10 +1324,12 @@ def main() -> int:
         print("Cameras ready.")
 
     effective_speed = float('inf') if cfg.speed_mode == "native" else cfg.exec_speed_mps
+    effective_angular_speed = float("inf") if cfg.speed_mode == "native" else float(DEFAULT_TCP_ANGULAR_SPEED_RADPS)
     is_native_speed = cfg.speed_mode == "native"
     executor = ParallelTrajectoryExecutor(
         execute=execute,
         max_speed_mps=effective_speed,
+        max_angular_speed_radps=effective_angular_speed,
     )
     executor.start()
     infer_log_dir = SCRIPT_DIR / "log"
@@ -1569,6 +1707,8 @@ def main() -> int:
                 t_infer = time.monotonic()
                 action_result = policy.infer(obs)
                 infer_time = time.monotonic() - t_infer
+                policy_timing = action_result.get("policy_timing", {}) if isinstance(action_result, dict) else {}
+                policy_infer_ms = policy_timing.get("infer_ms") if isinstance(policy_timing, dict) else None
 
                 raw_actions = np.asarray(action_result["actions"], dtype=np.float64)
                 if raw_actions.ndim == 1:
@@ -1642,7 +1782,8 @@ def main() -> int:
                         "step": int(step),
                         "prompt": prompt,
                         "infer_time_s": float(infer_time),
-                        "jax_backend": _jax_infer_backend_label(),
+                        "policy_backend": infer_backend_label,
+                        "policy_infer_ms": None if policy_infer_ms is None else float(policy_infer_ms),
                         "planning_latency_s": float(planning_latency_s),
                         "raw_action_count": int(len(raw_actions)),
                         "exec_action_count": int(len(exec_actions)),
@@ -1737,7 +1878,7 @@ def main() -> int:
                 gripper_str = f"{gripper_action:.2f}" if gripper_action is not None else "N/A"
                 print(
                     f"  [{step:4d}] infer={infer_time:.3f}s  "
-                    f"jax={_jax_infer_backend_label()}  "
+                    f"backend={infer_backend_label}  "
                     f"track={track_status}  "
                     f"samples={samples}  "
                     f"gripper={gripper_str}  "
@@ -1754,6 +1895,10 @@ def main() -> int:
             print("\n  Waiting for in-flight trajectory to finish...")
             executor.wait_until_idle()
             executor.reset_state()
+            try:
+                policy.reset()
+            except Exception as exc:
+                print(f"  Policy reset after interrupt failed: {exc}")
             _append_infer_log(
                 {
                     "event": "session_stop",
@@ -1772,6 +1917,10 @@ def main() -> int:
     task_observer.stop()
     executor.stop()
     obs_builder.stop()
+    try:
+        policy.close()
+    except Exception:
+        pass
     print("Shutdown complete. Bye.")
     return 0
 

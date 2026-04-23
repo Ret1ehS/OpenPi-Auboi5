@@ -6,7 +6,7 @@ from pathlib import Path
 
 UTILS_DIR = Path(__file__).resolve().parent
 SCRIPTS_ROOT = UTILS_DIR.parent
-CONFIG_DIR = SCRIPTS_ROOT / "config"
+DEFAULT_CONFIG_FILE = SCRIPTS_ROOT / "config"
 
 _LOADED_ENV_FILE: Path | None = None
 
@@ -55,12 +55,7 @@ def load_default_env(*, override: bool = False) -> Path | None:
     candidates: list[Path] = []
     if explicit:
         candidates.append(Path(explicit))
-    candidates.extend(
-        [
-            CONFIG_DIR / "local.env",
-            CONFIG_DIR / "niic.env",
-        ]
-    )
+    candidates.append(DEFAULT_CONFIG_FILE)
     for candidate in candidates:
         loaded = load_env_file(candidate, override=override)
         if loaded is not None:

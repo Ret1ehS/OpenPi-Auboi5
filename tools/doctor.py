@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -34,6 +36,8 @@ from utils.runtime_config import (
     DEFAULT_GRIPPER_PORT,
     DEFAULT_OBSERVER_MODEL,
     DEFAULT_OBSERVER_PYTHON,
+    DEFAULT_PYTORCH_CHECKPOINT_DIR,
+    DEFAULT_PYTORCH_DEVICE,
     DEFAULT_ROBOT_IP,
     KUBECONFIG_PATH,
     get_robot_config_warnings,
@@ -112,6 +116,8 @@ def _runtime_checks() -> list[CheckResult]:
         else:
             results.append(_warn(f"module:{module_name}", "not importable in current Python"))
 
+    results.extend(_pytorch_runtime_checks())
+
     results.append(_ok("robot_ip", DEFAULT_ROBOT_IP))
     for detail in get_robot_config_warnings():
         results.append(_warn("robot_config", detail))
@@ -121,9 +127,179 @@ def _runtime_checks() -> list[CheckResult]:
 def _diagnostic_checks() -> list[CheckResult]:
     results: list[CheckResult] = []
     results.extend(_diagnostic_prerequisite_checks())
+    results.extend(_pytorch_diagnostic_checks())
     results.extend(_robot_connectivity_checks())
     results.extend(_policy_connectivity_checks())
     results.extend(_sensor_connectivity_checks())
+    return results
+
+
+def _select_pytorch_runtime_python() -> Path:
+    explicit = os.environ.get("OPENPI_PYTORCH_RUNTIME_PYTHON", "").strip()
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    return (get_openpi_root() / "miniforge3" / "envs" / "openpi-py310-torch" / "bin" / "python").resolve()
+
+
+def _pytorch_runtime_checks() -> list[CheckResult]:
+    results: list[CheckResult] = []
+    runtime_python = _select_pytorch_runtime_python()
+    results.append(_check_path("pytorch_runtime_python", runtime_python, required=False, kind="file"))
+    results.append(_check_path("pytorch_checkpoint_dir", DEFAULT_PYTORCH_CHECKPOINT_DIR, required=False, kind="dir"))
+    weight_file = DEFAULT_PYTORCH_CHECKPOINT_DIR / "model.safetensors"
+    config_file = DEFAULT_PYTORCH_CHECKPOINT_DIR / "config.json"
+    if weight_file.exists() and config_file.exists():
+        results.append(_ok("pytorch_checkpoint_export", f"export looks valid: {weight_file.name} + {config_file.name}"))
+    else:
+        results.append(
+            _warn(
+                "pytorch_checkpoint_export",
+                f"PyTorch export incomplete under {DEFAULT_PYTORCH_CHECKPOINT_DIR} "
+                f"(need {weight_file.name} and {config_file.name})",
+            )
+        )
+
+    backend = os.environ.get("OPENPI_POLICY_BACKEND", "").strip() or "auto"
+    attn_backend = os.environ.get("OPENPI_PYTORCH_ATTN_BACKEND", "").strip() or "eager"
+    sample_steps = os.environ.get("OPENPI_SAMPLE_NUM_STEPS", "").strip() or "default"
+    device = os.environ.get("OPENPI_PYTORCH_DEVICE", "").strip() or DEFAULT_PYTORCH_DEVICE
+    trt_vision = os.environ.get("OPENPI_PYTORCH_TRT_VISION", "").strip() or "0"
+    trt_denoise = os.environ.get("OPENPI_PYTORCH_TRT_DENOISE", "").strip() or "0"
+    results.append(
+        _ok(
+            "pytorch_env",
+            "backend="
+            f"{backend} device={device} attn={attn_backend} sample_steps={sample_steps} "
+            f"trt_vision={trt_vision} trt_denoise={trt_denoise}",
+        )
+    )
+    return results
+
+
+def _pytorch_diagnostic_checks() -> list[CheckResult]:
+    results: list[CheckResult] = []
+    runtime_python = _select_pytorch_runtime_python()
+    if not runtime_python.exists():
+        results.append(_skip("check.pytorch_runtime", f"skipped: runtime python missing ({runtime_python})"))
+        return results
+    if not DEFAULT_PYTORCH_CHECKPOINT_DIR.exists():
+        results.append(
+            _skip(
+                "check.pytorch_runtime",
+                f"skipped: pytorch checkpoint dir missing ({DEFAULT_PYTORCH_CHECKPOINT_DIR})",
+            )
+        )
+        return results
+    weight_file = DEFAULT_PYTORCH_CHECKPOINT_DIR / "model.safetensors"
+    config_file = DEFAULT_PYTORCH_CHECKPOINT_DIR / "config.json"
+    if not (weight_file.exists() and config_file.exists()):
+        results.append(
+            _skip(
+                "check.pytorch_runtime",
+                "skipped: pytorch checkpoint export incomplete "
+                f"({DEFAULT_PYTORCH_CHECKPOINT_DIR}, need {weight_file.name} and {config_file.name})",
+            )
+        )
+        return results
+
+    probe = r"""
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path.cwd()))
+sys.path.insert(0, str(Path.cwd().parent))
+
+out = {
+    "python": sys.executable,
+    "backend": os.environ.get("OPENPI_POLICY_BACKEND", ""),
+    "device": os.environ.get("OPENPI_PYTORCH_DEVICE", ""),
+    "attn_backend": os.environ.get("OPENPI_PYTORCH_ATTN_BACKEND", ""),
+    "trt_vision_requested": os.environ.get("OPENPI_PYTORCH_TRT_VISION", ""),
+    "trt_denoise_requested": os.environ.get("OPENPI_PYTORCH_TRT_DENOISE", ""),
+}
+
+import torch
+out["torch_version"] = str(torch.__version__)
+out["cuda_available"] = bool(torch.cuda.is_available())
+if torch.cuda.is_available():
+    out["cuda_device_name"] = torch.cuda.get_device_name(0)
+
+for module_name in ("tensorrt", "torch_tensorrt"):
+    try:
+        __import__(module_name)
+        out[f"module_{module_name}"] = True
+    except Exception as exc:
+        out[f"module_{module_name}"] = f"{type(exc).__name__}: {exc}"
+
+from support.pytorch_support import OpenPIPyTorchPolicy
+
+policy = OpenPIPyTorchPolicy(
+    repo_root=Path.cwd().parent / "repo",
+    checkpoint_dir=Path(os.environ["OPENPI_PYTORCH_CHECKPOINT_DIR"]),
+    pytorch_device=os.environ.get("OPENPI_PYTORCH_DEVICE", "cuda"),
+)
+try:
+    out["runner_type"] = type(policy).__name__
+    out["metadata"] = policy.metadata
+finally:
+    policy.close()
+
+print(json.dumps(out, ensure_ascii=False))
+"""
+
+    probe_env = dict(os.environ)
+    probe_env["PYTHONNOUSERSITE"] = "1"
+    probe_env["OPENPI_POLICY_BACKEND"] = "pytorch"
+    probe_env.setdefault("OPENPI_PYTORCH_DEVICE", DEFAULT_PYTORCH_DEVICE)
+    probe_env["OPENPI_PYTORCH_CHECKPOINT_DIR"] = str(DEFAULT_PYTORCH_CHECKPOINT_DIR)
+
+    started = time.monotonic()
+    try:
+        completed = subprocess.run(
+            [str(runtime_python), "-c", probe],
+            cwd=str(get_scripts_root()),
+            env=probe_env,
+            capture_output=True,
+            text=True,
+            timeout=420,
+        )
+    except subprocess.TimeoutExpired:
+        results.append(_fail("check.pytorch_runtime", "timed out after 420s"))
+        return results
+    except Exception as exc:
+        results.append(_fail("check.pytorch_runtime", f"{type(exc).__name__}: {exc}"))
+        return results
+
+    elapsed = time.monotonic() - started
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        stdout = (completed.stdout or "").strip()
+        detail = stderr or stdout or f"returncode={completed.returncode}"
+        results.append(_fail("check.pytorch_runtime", f"{detail}"))
+        return results
+
+    stdout = (completed.stdout or "").strip().splitlines()
+    payload_line = stdout[-1] if stdout else ""
+    try:
+        payload = json.loads(payload_line)
+    except json.JSONDecodeError:
+        results.append(_fail("check.pytorch_runtime", f"unexpected probe output: {payload_line[:240]}"))
+        return results
+
+    metadata = payload.get("metadata", {}) or {}
+    detail = (
+        f"ok in {elapsed:.2f}s "
+        f"(runner={payload.get('runner_type')}, "
+        f"cuda={payload.get('cuda_available')}, "
+        f"torch={payload.get('torch_version')}, "
+        f"attn={metadata.get('attention_backend', 'unknown')}, "
+        f"trt_vision={metadata.get('trt_vision_enabled', 'unknown')}, "
+        f"trt_denoise={metadata.get('trt_denoise_enabled', 'unknown')}, "
+        f"load_s={metadata.get('load_s', 'unknown')})"
+    )
+    results.append(_ok("check.pytorch_runtime", detail))
     return results
 
 

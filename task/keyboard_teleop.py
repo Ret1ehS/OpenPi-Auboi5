@@ -25,10 +25,10 @@ from support.keyboard_control import (
     KEY_UP,
     KEY_DOWN,
     RawTerminal,
+    RemoteKeyboardRelay,
     drain_keys,
     render_keyboard_ui,
 )
-from support.keyboard_remote import RemoteKeyboardRelay
 
 
 CONTROL_DT_S = 0.01

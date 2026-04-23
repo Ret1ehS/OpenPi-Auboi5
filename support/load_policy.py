@@ -10,20 +10,24 @@ from __future__ import annotations
 
 import atexit
 import os
+import pickle
 import shlex
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import numpy as np
 
 if __package__ in (None, ""):
     _PARENT = Path(__file__).resolve().parent.parent
     if str(_PARENT) not in sys.path:
         sys.path.insert(0, str(_PARENT))
 
+from support.pytorch_support import decode_worker_value, encode_worker_value
 from utils.env_utils import load_default_env
 from utils.path_utils import get_openpi_root, get_repo_root
 from utils.runtime_config import (
@@ -31,6 +35,9 @@ from utils.runtime_config import (
     DEFAULT_CONFIG_NAME,
     DEFAULT_LOCAL_PORT,
     DEFAULT_NAMESPACE,
+    DEFAULT_POLICY_BACKEND,
+    DEFAULT_PYTORCH_CHECKPOINT_DIR,
+    DEFAULT_PYTORCH_DEVICE,
     DEFAULT_REMOTE_PORT,
     KUBECONFIG_PATH,
 )
@@ -40,6 +47,8 @@ load_default_env()
 SCRIPT_DIR = Path(__file__).resolve().parent
 OPENPI_ROOT = get_openpi_root()
 DEFAULT_REPO_ROOT = get_repo_root()
+DEFAULT_PYTORCH_RUNTIME_PYTHON = OPENPI_ROOT / "miniforge3" / "envs" / "openpi-py310-torch" / "bin" / "python"
+PYTORCH_WORKER_SCRIPT = SCRIPT_DIR / "pytorch_support.py"
 
 
 def _ensure_openpi_repo_paths(repo_root: Path = DEFAULT_REPO_ROOT) -> None:
@@ -54,6 +63,12 @@ def _ensure_openpi_repo_paths(repo_root: Path = DEFAULT_REPO_ROOT) -> None:
 
 
 _ensure_openpi_repo_paths()
+
+
+def _subprocess_session_kwargs() -> dict[str, object]:
+    if os.name == "nt":
+        return {}
+    return {"start_new_session": True}
 
 
 _JAX_GPU_PROBE = r"""
@@ -141,6 +156,18 @@ def _checkpoint_has_safetensors_weights(checkpoint_dir: Path) -> bool:
     return any(checkpoint_dir.glob("*.safetensors"))
 
 
+def _select_pytorch_runtime_python() -> Path:
+    explicit = os.environ.get("OPENPI_PYTORCH_RUNTIME_PYTHON", "").strip()
+    candidate = Path(explicit).expanduser() if explicit else DEFAULT_PYTORCH_RUNTIME_PYTHON
+    candidate = candidate.resolve()
+    if not candidate.exists():
+        raise FileNotFoundError(
+            f"PyTorch runtime python not found: {candidate}. "
+            "Set OPENPI_PYTORCH_RUNTIME_PYTHON to the py310 CUDA torch environment."
+        )
+    return candidate
+
+
 def _choose_local_jax_platform(checkpoint_dir: Path) -> str | None:
     requested = os.environ.get("OPENPI_JAX_PLATFORM")
     if requested:
@@ -190,14 +217,47 @@ def _apply_jax_platform(platform: str | None) -> None:
     os.environ["JAX_PLATFORM_NAME"] = platform
 
 
+def _build_pytorch_worker_env(runtime_python: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    env["PYTHONNOUSERSITE"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+    env.pop("PYTHONHOME", None)
+
+    pythonpath = env.get("PYTHONPATH", "")
+    if pythonpath:
+        runtime_prefix = runtime_python.resolve().parent.parent
+        filtered: list[str] = []
+        for entry in pythonpath.split(os.pathsep):
+            if not entry:
+                continue
+            normalized = entry.replace("\\", "/")
+            if "/.local/lib/python" in normalized:
+                continue
+            try:
+                resolved = Path(entry).expanduser().resolve()
+            except OSError:
+                filtered.append(entry)
+                continue
+            if "site-packages" in resolved.parts and runtime_prefix not in resolved.parents:
+                continue
+            filtered.append(entry)
+        if filtered:
+            env["PYTHONPATH"] = os.pathsep.join(filtered)
+        else:
+            env.pop("PYTHONPATH", None)
+    return env
+
+
 @dataclass(frozen=True)
 class PolicyLoadSpec:
     remote: bool = False
     config_name: str = DEFAULT_CONFIG_NAME
     checkpoint_dir: Path = DEFAULT_CHECKPOINT_DIR
+    backend: str = DEFAULT_POLICY_BACKEND  # "auto" | "jax" | "pytorch"
+    pytorch_checkpoint_dir: Path = DEFAULT_PYTORCH_CHECKPOINT_DIR
     default_prompt: str | None = None
     action_horizon: int | None = None
-    pytorch_device: str | None = None
+    pytorch_device: str | None = DEFAULT_PYTORCH_DEVICE
     #: Passed to OpenPI `create_trained_policy(..., sample_kwargs=...)`, e.g. `{"num_steps": 5}` for
     #: JAX Pi0 flow-matching (upstream default `num_steps` is 10 in `Pi0.sample_actions`).
     sample_kwargs: dict[str, Any] | None = None
@@ -219,21 +279,177 @@ def _effective_sample_kwargs(spec: PolicyLoadSpec) -> dict[str, Any] | None:
     return merged if merged else None
 
 
+def _resolve_local_backend_and_checkpoint(spec: PolicyLoadSpec) -> tuple[str, Path]:
+    backend = (spec.backend or "auto").strip().lower()
+    if backend not in {"auto", "jax", "pytorch"}:
+        raise ValueError(f"Unsupported OPENPI_POLICY_BACKEND={spec.backend!r}; expected auto|jax|pytorch")
+
+    jax_checkpoint_dir = Path(spec.checkpoint_dir).resolve()
+    pytorch_checkpoint_dir = Path(spec.pytorch_checkpoint_dir).resolve()
+
+    if backend == "jax":
+        return "jax", jax_checkpoint_dir
+    if backend == "pytorch":
+        return "pytorch", pytorch_checkpoint_dir
+
+    if _checkpoint_has_safetensors_weights(pytorch_checkpoint_dir):
+        return "pytorch", pytorch_checkpoint_dir
+    return "jax", jax_checkpoint_dir
+
+
 class LocalPolicyRunner:
     def __init__(self, policy: Any, *, metadata: dict[str, Any] | None = None) -> None:
         self._policy = policy
         self._metadata = metadata or {}
 
-    def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
-        return self._policy.infer(obs)
+    def infer(self, obs: dict[str, Any], *, noise: np.ndarray | None = None) -> dict[str, Any]:
+        if noise is None:
+            return self._policy.infer(obs)
+        return self._policy.infer(obs, noise=noise)
 
     def reset(self) -> None:
         if hasattr(self._policy, "reset"):
             self._policy.reset()
 
+    def close(self) -> None:
+        if hasattr(self._policy, "close"):
+            self._policy.close()
+
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
+
+
+class SubprocessPyTorchPolicy:
+    def __init__(
+        self,
+        *,
+        repo_root: Path,
+        checkpoint_dir: Path,
+        pytorch_device: str | None,
+        default_prompt: str | None,
+        sample_kwargs: dict[str, Any] | None,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._runtime_python = _select_pytorch_runtime_python()
+        num_steps = int((sample_kwargs or {}).get("num_steps", 10))
+        compile_mode = os.environ.get("OPENPI_PYTORCH_COMPILE_MODE", "").strip()
+        cmd = [
+            str(self._runtime_python),
+            "-u",
+            "-s",
+            str(PYTORCH_WORKER_SCRIPT),
+            "--repo-root",
+            str(repo_root),
+            "--checkpoint-dir",
+            str(checkpoint_dir),
+            "--device",
+            str(pytorch_device or DEFAULT_PYTORCH_DEVICE or "cuda"),
+            "--num-steps",
+            str(num_steps),
+        ]
+        if default_prompt:
+            cmd.extend(["--default-prompt", str(default_prompt)])
+        if compile_mode:
+            cmd.extend(["--compile-mode", compile_mode])
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            bufsize=0,
+            env=_build_pytorch_worker_env(self._runtime_python),
+            **_subprocess_session_kwargs(),
+        )
+        ready = self._recv()
+        if not ready.get("ok"):
+            self.close()
+            raise RuntimeError(
+                "PyTorch policy worker failed to start: "
+                f"{ready.get('error', 'unknown error')}\n{ready.get('traceback', '')}".rstrip()
+            )
+        self._metadata = dict(ready.get("metadata", {}) or {})
+        self._metadata.setdefault("policy_backend", "pytorch")
+        self._metadata.setdefault("checkpoint_dir", str(checkpoint_dir))
+        self._metadata.setdefault("runtime_python", str(self._runtime_python))
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        return dict(self._metadata)
+
+    def infer(self, obs: dict[str, Any], *, noise: np.ndarray | None = None) -> dict[str, Any]:
+        with self._lock:
+            self._send({"op": "infer", "obs": obs, "noise": noise})
+            response = self._recv()
+        if not response.get("ok"):
+            raise RuntimeError(
+                "PyTorch policy worker infer failed: "
+                f"{response.get('error', 'unknown error')}\n{response.get('traceback', '')}".rstrip()
+            )
+        return response["result"]
+
+    def reset(self) -> None:
+        with self._lock:
+            self._send({"op": "reset"})
+            response = self._recv()
+        if not response.get("ok"):
+            raise RuntimeError(response.get("error", "PyTorch policy worker reset failed"))
+
+    def close(self) -> None:
+        proc = getattr(self, "_proc", None)
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                try:
+                    with self._lock:
+                        self._send({"op": "close"})
+                        self._recv()
+                except Exception:
+                    pass
+        finally:
+            if proc.stdin:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+            if proc.stdout:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            self._proc = None
+
+    def _send(self, message: dict[str, Any]) -> None:
+        if self._proc.stdin is None:
+            raise RuntimeError("PyTorch policy worker stdin is not available.")
+        payload = pickle.dumps(encode_worker_value(message), protocol=pickle.HIGHEST_PROTOCOL)
+        self._proc.stdin.write(len(payload).to_bytes(8, "little", signed=False))
+        self._proc.stdin.write(payload)
+        self._proc.stdin.flush()
+
+    def _recv(self) -> dict[str, Any]:
+        if self._proc.stdout is None:
+            raise RuntimeError("PyTorch policy worker stdout is not available.")
+        header = self._proc.stdout.read(8)
+        if not header:
+            rc = self._proc.poll()
+            raise RuntimeError(f"PyTorch policy worker exited unexpectedly (returncode={rc}).")
+        size = int.from_bytes(header, "little", signed=False)
+        payload = self._proc.stdout.read(size)
+        while len(payload) < size:
+            chunk = self._proc.stdout.read(size - len(payload))
+            if not chunk:
+                rc = self._proc.poll()
+                raise RuntimeError(f"PyTorch policy worker stream closed unexpectedly (returncode={rc}).")
+            payload += chunk
+        return decode_worker_value(pickle.loads(payload))
 
 
 class RemotePolicyRunner:
@@ -372,37 +588,61 @@ class RemotePolicyRunner:
 
 def create_local_policy(spec: PolicyLoadSpec | None = None) -> LocalPolicyRunner:
     spec = spec or PolicyLoadSpec()
-    checkpoint_dir = Path(spec.checkpoint_dir).resolve()
+    backend, checkpoint_dir = _resolve_local_backend_and_checkpoint(spec)
     if not checkpoint_dir.exists():
         raise FileNotFoundError(f"checkpoint directory not found: {checkpoint_dir}")
 
-    _apply_local_jax_runtime_defaults()
-    _apply_jax_platform(_choose_local_jax_platform(checkpoint_dir))
-
-    try:
-        from openpi.training.config import get_config
-        from openpi.policies.policy_config import create_trained_policy
-        from openpi_client.action_chunk_broker import ActionChunkBroker
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "OpenPI local inference dependencies are not available in the current Python environment. "
-            "Please run under an environment with the OpenPI repo dependencies installed."
-        ) from exc
-
-    train_cfg = get_config(spec.config_name)
     sample_kwargs = _effective_sample_kwargs(spec)
     if sample_kwargs:
         print(f"  [local] OpenPI sample_kwargs: {sample_kwargs}")
-    policy = create_trained_policy(
-        train_cfg,
-        checkpoint_dir,
-        default_prompt=spec.default_prompt,
-        pytorch_device=spec.pytorch_device,
-        sample_kwargs=sample_kwargs,
+    print(
+        "  [local] OpenPI backend="
+        f"{backend} checkpoint={checkpoint_dir} "
+        f"pytorch_device={spec.pytorch_device if backend == 'pytorch' else 'n/a'}"
     )
+
+    try:
+        from openpi_client.action_chunk_broker import ActionChunkBroker
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "OpenPI client dependencies are not available in the current Python environment."
+        ) from exc
+
+    if backend == "jax":
+        _apply_local_jax_runtime_defaults()
+        _apply_jax_platform(_choose_local_jax_platform(checkpoint_dir))
+        try:
+            from openpi.training.config import get_config
+            from openpi.policies.policy_config import create_trained_policy
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "OpenPI JAX local inference dependencies are not available in the current Python environment. "
+                "Please run under an environment with the OpenPI repo dependencies installed."
+            ) from exc
+        train_cfg = get_config(spec.config_name)
+        policy = create_trained_policy(
+            train_cfg,
+            checkpoint_dir,
+            default_prompt=spec.default_prompt,
+            pytorch_device=spec.pytorch_device,
+            sample_kwargs=sample_kwargs,
+        )
+    else:
+        policy = SubprocessPyTorchPolicy(
+            repo_root=DEFAULT_REPO_ROOT,
+            checkpoint_dir=checkpoint_dir,
+            pytorch_device=spec.pytorch_device,
+            default_prompt=spec.default_prompt,
+            sample_kwargs=sample_kwargs,
+        )
+
+    metadata = dict(getattr(policy, "metadata", {}) or {})
     if spec.action_horizon is not None:
         policy = ActionChunkBroker(policy, action_horizon=int(spec.action_horizon))
-    metadata = getattr(policy, "metadata", {})
+    metadata.setdefault("policy_backend", backend)
+    metadata.setdefault("checkpoint_dir", str(checkpoint_dir))
+    if backend == "pytorch" and spec.pytorch_device:
+        metadata.setdefault("pytorch_device", str(spec.pytorch_device))
     return LocalPolicyRunner(policy, metadata=metadata)
 
 

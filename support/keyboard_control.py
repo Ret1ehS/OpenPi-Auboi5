@@ -208,7 +208,7 @@ class ContinuousKeyState:
             self._last_right_ts = -1.0
             self._last_ctrl_up_ts = -1.0
             self._last_ctrl_down_ts = -1.0
-            self._last_ctrl_LEFT_ts = -1.0
+            self._last_ctrl_left_ts = -1.0
             self._last_ctrl_right_ts = -1.0
 
     def clear(self) -> None:

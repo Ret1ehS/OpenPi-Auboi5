@@ -1,45 +1,45 @@
 # OpenPI-AUBO i5 Scripts
 
-杩欎釜浠撳簱鍙寘鍚満鍣ㄤ汉渚ц剼鏈紝璐熻矗锛?
+这个仓库只包含机器人侧脚本，负责：
 
-- 鍦ㄧ嚎鎺ㄧ悊鎵ц
-- 鐪熸満鏁版嵁閲囬泦
-- 瑙傛祴鏋勫缓
-- AUBO 鎺у埗杈呭姪閫昏緫
-- 浠诲姟瀹屾垚鍒ゆ柇
+- 在线推理执行
+- 真机数据采集
+- 观测构建
+- AUBO 控制辅助逻辑
+- 任务完成判断
 
-榛樿鐩綍褰㈡€侊細
+默认目录形态：
 
 ```text
 openpi/
-鈹溾攢 repo/        # OpenPI 涓讳粨搴?
-鈹溾攢 OpenPi-Auboi5/
-鈹溾攢 aubo_sdk/
-鈹斺攢 captures/
+├─ repo/            # OpenPI 主仓库
+├─ OpenPi-Auboi5/   # 当前仓库
+├─ aubo_sdk/
+└─ captures/
 ```
 
-## 浠撳簱缁撴瀯
+## 仓库结构
 
 ```text
 OpenPi-Auboi5/
-鈹溾攢 config       # 鏍圭洰褰曞崟鏂囦欢閰嶇疆
-鈹溾攢 tools/
-鈹溾攢 utils/
-鈹溾攢 support/
-鈹溾攢 task/
-鈹溾攢 data/
-鈹溾攢 main.py
-鈹斺攢 collect_data.py
+├─ config           # 根目录单文件配置
+├─ tools/
+├─ utils/
+├─ support/
+├─ task/
+├─ data/
+├─ main.py
+└─ collect_data.py
 ```
 
-`utils/` 鏀剧幆澧冦€佽矾寰勫拰閫氱敤宸ュ叿銆?
-`support/` 鏀炬満鍣ㄤ汉鎺у埗銆佺瓥鐣ュ姞杞姐€佽娴嬨€乀UI 鍜?observer 鐩稿叧閫昏緫銆?
+`utils/` 放环境、路径和通用工具。  
+`support/` 放机器人控制、策略加载、观测、TUI 和 observer 相关逻辑。
 
-## 蹇€熷紑濮?
+## 快速开始
 
-1. 鐩存帴缂栬緫鏍圭洰褰?`config`
+1. 直接编辑根目录 `config`
 
-鑷冲皯纭杩欎簺瀛楁锛?
+至少确认这些字段：
 
 - `OPENPI_RUNTIME_PYTHON`
 - `OPENPI_SDK_ROOT`
@@ -47,98 +47,98 @@ OpenPi-Auboi5/
 - `OPENPI_CHECKPOINT_DIR`
 - `OPENPI_TASK_OBSERVER_PYTHON`
 - `OPENPI_TASK_OBSERVER_MODEL`
-- 涓插彛鐩稿叧閰嶇疆
+- 串口相关配置
 
-2. 杩愯鐜妫€鏌ワ細
+2. 运行环境检查：
 
 ```bash
 python3 tools/doctor.py
 ```
 
-鍙鏌ヤ富杩愯鐜锛?
+只检查主运行环境：
 
 ```bash
 python3 tools/doctor.py --section runtime
 ```
 
-鍙鏌?observer 鐜锛?
+只检查 observer 环境：
 
 ```bash
 python3 tools/doctor.py --section observer
 ```
 
-3. 鍚姩鍦ㄧ嚎鎺ㄧ悊锛?
+3. 启动在线推理：
 
 ```bash
 python3 main.py
 ```
 
-4. 鍚姩鏁版嵁閲囬泦锛?
+4. 启动数据采集：
 
 ```bash
 python3 collect_data.py
 ```
 
-## 閰嶇疆鍔犺浇瑙勫垯
+## 配置加载规则
 
-榛樿浼氭寜涓嬮潰椤哄簭鍔犺浇閰嶇疆锛?
+默认按下面顺序加载配置：
 
-1. `OPENPI_ENV_FILE` 鎸囧悜鐨勬樉寮忔枃浠?
-2. 浠撳簱鏍圭洰褰曚笅鐨?`config`
+1. `OPENPI_ENV_FILE` 指向的显式文件
+2. 仓库根目录下的 `config`
 
-鐜板湪涓嶅啀浣跨敤 `config/` 鐩綍瀛樻斁 `.env` 妯℃澘銆?
+现在不再使用 `config/` 目录存放 `.env` 模板。
 
-## 鐜渚濊禆
+## 环境依赖
 
-杩欎釜浠撳簱涓嶆槸瀹屾暣鍗曚粨鐜锛岃繍琛屽墠浠嶉渶瑕佸噯澶囧閮ㄤ緷璧栥€?
+这个仓库不是完整单仓环境，运行前仍需要准备外部依赖。
 
-### 鐩綍渚濊禆
+### 目录依赖
 
-榛樿瑕佹眰浠ヤ笅鐩綍涓庡綋鍓嶄粨搴撳苟鍒楀瓨鍦細
+默认要求以下目录与当前仓库并列存在：
 
 - `../repo`
 - `../aubo_sdk`
 
-### Python 鐜
+### Python 环境
 
-鎺ㄨ崘涓ゅ Python锛?
+推荐两套 Python：
 
-- OpenPI 涓荤幆澧?
-  鐢?`OPENPI_RUNTIME_PYTHON` 鎸囧悜
-- Observer / Gemma 鐜
-  鐢?`OPENPI_TASK_OBSERVER_PYTHON` 鎸囧悜
+- OpenPI 主环境  
+  由 `OPENPI_RUNTIME_PYTHON` 指向
+- Observer / Gemma 环境  
+  由 `OPENPI_TASK_OBSERVER_PYTHON` 指向
 
-鏈湴 PyTorch worker 涔熷彲浠ュ崟鐙敤涓€濂楃幆澧冿紝鐢?`OPENPI_PYTORCH_RUNTIME_PYTHON` 鎸囧悜銆?
+本地 PyTorch worker 也可以单独用一套环境，由 `OPENPI_PYTORCH_RUNTIME_PYTHON` 指向。
 
-### 绯荤粺鍜岃澶囦緷璧?
+### 系统和设备依赖
 
-杩愯鍓嶉€氬父杩橀渶瑕侊細
+运行前通常还需要：
 
 - Jetson + JetPack / CUDA
 - AUBO SDK
 - Orbbec Python SDK
-- 涓插彛璁惧
-- Gemma 妯″瀷鐩綍
+- 串口设备
+- Gemma 模型目录
 
-`tools/doctor.py` 浼氬敖閲忔彁鍓嶆毚闇茬己椤癸紝浣嗕笉鏇夸唬绯荤粺灞傚畨瑁呫€?
+`tools/doctor.py` 会尽量提前暴露缺项，但不替代系统层安装。
 
-## 涓昏鍏ュ彛
+## 主要入口
 
-- `main.py`: 鍦ㄧ嚎鎺ㄧ悊鎵ц鍏ュ彛
-- `collect_data.py`: 鐪熸満鏁版嵁閲囬泦鍏ュ彛
-- `support/load_policy.py`: 鏈湴 / 杩滅绛栫暐缁熶竴鍔犺浇
-- `support/get_obs.py`: 瑙傛祴鏋勫缓
-- `support/task_observer.py`: 浠诲姟瀹屾垚鍒ゆ柇
+- `main.py`: 在线推理执行入口
+- `collect_data.py`: 真机数据采集入口
+- `support/load_policy.py`: 本地 / 远端策略统一加载
+- `support/get_obs.py`: 观测构建
+- `support/task_observer.py`: 任务完成判断
 
 ## PyTorch Local Backend
 
-鏈湴 PyTorch 鎺ㄧ悊褰撳墠閫氳繃鐙珛 worker 杩涚▼杩愯锛?
+本地 PyTorch 推理当前通过独立 worker 进程运行：
 
-- 涓昏繘绋嬬户缁礋璐ｇ浉鏈恒€佹満鍣ㄤ汉鍜屼富鎺у埗閫昏緫
-- PyTorch policy worker 杩愯鍦?`OPENPI_PYTORCH_RUNTIME_PYTHON` 鎸囧悜鐨勭幆澧?
-- worker 鐜闇€瑕佽兘鍔犺浇 CUDA Torch 鍜岃浆鎹㈠悗鐨?`model.safetensors`
+- 主进程继续负责相机、机器人和主控制逻辑
+- PyTorch policy worker 运行在 `OPENPI_PYTORCH_RUNTIME_PYTHON` 指向的环境
+- worker 环境需要能加载 CUDA Torch 和转换后的 `model.safetensors`
 
-甯哥敤鍙橀噺锛?
+常用变量：
 
 - `OPENPI_POLICY_BACKEND=pytorch`
 - `OPENPI_PYTORCH_CHECKPOINT_DIR=...`
@@ -146,6 +146,6 @@ python3 collect_data.py
 - `OPENPI_PYTORCH_DEVICE=cuda`
 - `OPENPI_SAMPLE_NUM_STEPS=5`
 
-## 鍏煎璇存槑
+## 兼容说明
 
-- `support/kubeconfig.yaml` 鎸夋晱鎰熸枃浠跺鐞嗭紝榛樿涓嶇撼鍏?git
+- `support/kubeconfig.yaml` 按敏感文件处理，默认不纳入 git

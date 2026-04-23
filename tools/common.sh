@@ -10,10 +10,8 @@ export PYTHONPATH="${SCRIPTS_ROOT}:${PYTHONPATH:-}"
 
 if [[ -n "${OPENPI_ENV_FILE:-}" ]]; then
   _env_file="${OPENPI_ENV_FILE}"
-elif [[ -f "${SCRIPTS_ROOT}/config/local.env" ]]; then
-  _env_file="${SCRIPTS_ROOT}/config/local.env"
-elif [[ -f "${SCRIPTS_ROOT}/config/niic.env" ]]; then
-  _env_file="${SCRIPTS_ROOT}/config/niic.env"
+elif [[ -f "${SCRIPTS_ROOT}/config" ]]; then
+  _env_file="${SCRIPTS_ROOT}/config"
 else
   _env_file=""
 fi

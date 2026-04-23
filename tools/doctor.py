@@ -233,7 +233,7 @@ for module_name in ("tensorrt", "torch_tensorrt"):
     except Exception as exc:
         out[f"module_{module_name}"] = f"{type(exc).__name__}: {exc}"
 
-from support.openpi_pytorch_policy import OpenPIPyTorchPolicy
+from support.pytorch_support import OpenPIPyTorchPolicy
 
 policy = OpenPIPyTorchPolicy(
     repo_root=Path.cwd().parent / "repo",

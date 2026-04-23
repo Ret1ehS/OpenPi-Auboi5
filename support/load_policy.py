@@ -27,7 +27,7 @@ if __package__ in (None, ""):
     if str(_PARENT) not in sys.path:
         sys.path.insert(0, str(_PARENT))
 
-from support.openpi_pytorch_policy import decode_worker_value, encode_worker_value
+from support.pytorch_support import decode_worker_value, encode_worker_value
 from utils.env_utils import load_default_env
 from utils.path_utils import get_openpi_root, get_repo_root
 from utils.runtime_config import (
@@ -48,7 +48,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 OPENPI_ROOT = get_openpi_root()
 DEFAULT_REPO_ROOT = get_repo_root()
 DEFAULT_PYTORCH_RUNTIME_PYTHON = OPENPI_ROOT / "miniforge3" / "envs" / "openpi-py310-torch" / "bin" / "python"
-PYTORCH_WORKER_SCRIPT = SCRIPT_DIR / "openpi_pytorch_policy.py"
+PYTORCH_WORKER_SCRIPT = SCRIPT_DIR / "pytorch_support.py"
 
 
 def _ensure_openpi_repo_paths(repo_root: Path = DEFAULT_REPO_ROOT) -> None:

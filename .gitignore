@@ -4,9 +4,11 @@ __pycache__/
 log/
 Log/
 captures/
-config/*.env
-!config/*.env.example
-config/local.env
+tools/*
+!tools/common.sh
+!tools/doctor.py
+!tools/convert_openpi_checkpoint_to_pytorch.py
+!tools/convert_openpi_checkpoint_to_pytorch.sh
 tools/__pycache__/
 utils/__pycache__/
 data/*

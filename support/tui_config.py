@@ -187,21 +187,31 @@ def _render(
 
         if isinstance(row, ToggleItem):
             label = f"{row.label:<20s}"
+            is_disabled = row.label in disabled or row.label in nonselectable
             if row.label == "Task":
                 current = row.choices[row.selected]
-                if is_focused:
+                if is_disabled:
+                    value = f"{DIM}< {current} >{RESET}"
+                    line = f"{prefix}{DIM}{label}{RESET}{value}"
+                elif is_focused:
                     value = f"{BOLD}{BG_BLUE}{FG_WHITE}< {current} >{RESET}"
+                    line = f"{prefix}{label}{value}"
                 else:
                     value = f"{FG_WHITE}< {current} >{RESET}"
-                line = f"{prefix}{label}{value}"
+                    line = f"{prefix}{label}{value}"
             else:
                 parts = []
                 for i, choice in enumerate(row.choices):
-                    if i == row.selected:
+                    if is_disabled:
+                        parts.append(f"{DIM} {choice} {RESET}")
+                    elif i == row.selected:
                         parts.append(f"{BOLD}{BG_BLUE}{FG_WHITE} {choice} {RESET}")
                     else:
                         parts.append(f"{DIM} {choice} {RESET}")
-                line = f"{prefix}{label}{''.join(parts)}"
+                if is_disabled:
+                    line = f"{prefix}{DIM}{label}{RESET}{''.join(parts)}"
+                else:
+                    line = f"{prefix}{label}{''.join(parts)}"
             lines.append(line)
 
         elif isinstance(row, TextItem):

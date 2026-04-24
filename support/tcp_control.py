@@ -681,11 +681,70 @@ class _DaemonHelper:
         self._stdout_thread = None
         self._stderr_thread = None
 
+    def _clear_servo_cache(self) -> None:
+        self._last_servo_pose_real = None
+        self._servo_force_guard_fz_n = None
+        self._servo_force_guard_scale = None
+        self._servo_force_guard_warning_active = False
+        self._servo_force_guard_force_live = False
+        self._servo_force_guard_live_mode = False
+        self._servo_force_guard_block_z_m = 0.0
+        self._servo_force_guard_block_v_mps = 0.0
+        self._servo_force_guard_last_apply_ts_s = None
+        self._servo_force_target_fz_n = None
+
+    def close_stdin_and_reset(self, *, wait_s: float = DAEMON_STOP_TIMEOUT_S) -> bool:
+        """Break a daemon out of keepalive without waiting for the command lock.
+
+        Closing stdin makes the helper leave its poll()/getline() loop and run
+        C++ cleanup_servo().  If it does not exit promptly, terminate the helper
+        process and let the next command spawn a fresh daemon.
+        """
+        proc = self._proc
+        if proc is None:
+            self._reset_proc_state(None)
+            self._clear_servo_cache()
+            return True
+
+        exited = False
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except Exception:
+            pass
+
+        try:
+            proc.wait(timeout=max(0.0, float(wait_s)))
+            exited = True
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=0.75)
+                exited = True
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=0.75)
+                    exited = True
+                except Exception:
+                    exited = False
+
+        self._reset_proc_state(proc)
+        self._clear_servo_cache()
+        return bool(exited)
+
     def _readline(self, *, timeout_s: float, context: str) -> str:
-        if self._stdout_queue is None:
+        stdout_queue = self._stdout_queue
+        if stdout_queue is None:
             raise RuntimeError(f"daemon helper is not ready during {context}")
         try:
-            item = self._stdout_queue.get(timeout=timeout_s)
+            item = stdout_queue.get(timeout=timeout_s)
         except queue.Empty as exc:
             raise TimeoutError(f"daemon helper timed out during {context} after {timeout_s:.1f}s") from exc
         if item is _DAEMON_SENTINEL:
@@ -748,7 +807,7 @@ class _DaemonHelper:
                 break
         return self._proc
 
-    def _send_cmd(self, cmd: str) -> dict[str, object]:
+    def _send_cmd(self, cmd: str, *, timeout_s: float = DAEMON_COMMAND_TIMEOUT_S) -> dict[str, object]:
         """Send a command, read lines until 'END', return parsed dict."""
         proc = self._ensure_started()
         try:
@@ -758,8 +817,72 @@ class _DaemonHelper:
         except Exception:
             self._reset_proc_state(proc)
             raise
-        lines = self._read_until_end(timeout_s=DAEMON_COMMAND_TIMEOUT_S, context=cmd.split()[0])
+        lines = self._read_until_end(timeout_s=timeout_s, context=cmd.split()[0])
         return _parse_helper_output("\n".join(lines))
+
+    def emergency_stop_motion(
+        self,
+        *,
+        graceful_timeout_s: float = 2.5,
+        restart_wait_s: float = DAEMON_STOP_TIMEOUT_S,
+    ) -> dict[str, object]:
+        """Stop servo/motion even if another thread is stuck in keepalive.
+
+        First try the normal RPC path with a short timeout.  If the daemon is
+        busy or the protocol stalls, close stdin so the helper exits through its
+        cleanup path, then spawn a fresh helper and issue stop_motion once more.
+        """
+        result: dict[str, object] = {
+            "ok": False,
+            "graceful": False,
+            "daemon_restarted": False,
+            "stdin_closed": False,
+        }
+        deadline = time.monotonic() + max(0.0, float(graceful_timeout_s))
+        acquired = self._lock.acquire(timeout=max(0.0, float(graceful_timeout_s)))
+        if acquired:
+            try:
+                remaining = max(0.05, deadline - time.monotonic())
+                servo_resp = self._send_cmd("servo_stop", timeout_s=remaining)
+                self._clear_servo_cache()
+                result["servo_stop"] = servo_resp
+                servo_wait_ret = servo_resp.get("wait_ret")
+                if servo_wait_ret is not None and int(servo_wait_ret) == 0:
+                    result["graceful"] = True
+                    result["ok"] = True
+                    return result
+                remaining = max(0.05, deadline - time.monotonic())
+                motion_resp = self._send_cmd("stop_motion 1 1", timeout_s=remaining)
+                result["stop_motion"] = motion_resp
+                result["graceful"] = True
+                result["ok"] = int(motion_resp.get("wait_ret", -1)) == 0
+                if result["ok"]:
+                    return result
+            except Exception as exc:
+                result["graceful_error"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                self._lock.release()
+        else:
+            result["graceful_error"] = "daemon command lock busy"
+
+        result["stdin_closed"] = self.close_stdin_and_reset(wait_s=restart_wait_s)
+        result["daemon_restarted"] = True
+        try:
+            acquired_after_reset = self._lock.acquire(timeout=DAEMON_STOP_TIMEOUT_S)
+            if not acquired_after_reset:
+                result["restart_stop_error"] = "daemon command lock still busy after reset"
+                result["ok"] = False
+                return result
+            try:
+                motion_resp = self._send_cmd("stop_motion 1 1")
+                result["stop_motion_after_restart"] = motion_resp
+                result["ok"] = int(motion_resp.get("wait_ret", -1)) == 0
+            finally:
+                self._lock.release()
+        except Exception as exc:
+            result["restart_stop_error"] = f"{type(exc).__name__}: {exc}"
+            result["ok"] = False
+        return result
 
     def snapshot_raw(self) -> str:
         """Send 'snapshot' command and return all output lines until 'END'."""
@@ -778,16 +901,7 @@ class _DaemonHelper:
     def servo_start(self, track_time_s: float = DEFAULT_TRACK_CONTROL_DT_S) -> dict[str, object]:
         """Enter servo mode on the daemon."""
         with self._lock:
-            self._last_servo_pose_real = None
-            self._servo_force_guard_fz_n = None
-            self._servo_force_guard_scale = None
-            self._servo_force_guard_warning_active = False
-            self._servo_force_guard_force_live = False
-            self._servo_force_guard_live_mode = False
-            self._servo_force_guard_block_z_m = 0.0
-            self._servo_force_guard_block_v_mps = 0.0
-            self._servo_force_guard_last_apply_ts_s = None
-            self._servo_force_target_fz_n = None
+            self._clear_servo_cache()
             return self._send_cmd(f"servo_start {track_time_s:.12g}")
 
     def servo_begin_chunk(
@@ -1025,16 +1139,7 @@ class _DaemonHelper:
         """Exit servo mode."""
         with self._lock:
             resp = self._send_cmd("servo_stop")
-            self._last_servo_pose_real = None
-            self._servo_force_guard_fz_n = None
-            self._servo_force_guard_scale = None
-            self._servo_force_guard_warning_active = False
-            self._servo_force_guard_force_live = False
-            self._servo_force_guard_live_mode = False
-            self._servo_force_guard_block_z_m = 0.0
-            self._servo_force_guard_block_v_mps = 0.0
-            self._servo_force_guard_last_apply_ts_s = None
-            self._servo_force_target_fz_n = None
+            self._clear_servo_cache()
             return resp
 
     def stop(self) -> None:

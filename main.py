@@ -62,6 +62,8 @@ EXECUTOR_IDLE_WAIT_S = 0.05
 ASYNC_REFILL_THRESHOLD_STEPS = 80
 EXECUTOR_STALL_WARN_S = 0.5
 EXECUTOR_STALL_RESET_S = 1.0
+EXECUTOR_STOP_WAIT_S = 2.0
+EXECUTOR_STOP_SETTLE_S = 0.25
 
 
 @dataclass
@@ -215,9 +217,17 @@ def _print_local_policy_pytorch_diagnostics(metadata: dict[str, Any] | None = No
         f"device={meta.get('pytorch_device', 'unknown')} "
         f"torch={meta.get('torch_version', 'unknown')} "
         f"compile_mode={meta.get('compile_mode', 'unknown')} "
+        f"attention={meta.get('attention_backend', 'unknown')} "
+        f"requested_attention={meta.get('requested_attention_backend', 'unknown')} "
         f"num_steps={meta.get('sample_num_steps', 'unknown')} "
+        f"discrete_state={meta.get('discrete_state_input', 'unknown')} "
+        f"trt_vision={meta.get('trt_vision_enabled', 'unknown')} "
+        f"trt_denoise={meta.get('trt_denoise_enabled', 'unknown')} "
         f"runtime_python={meta.get('runtime_python', 'unknown')}"
     )
+    checkpoint = str(meta.get("checkpoint_dir", "")).strip()
+    if checkpoint:
+        print(f"PYTORCH_CHECKPOINT={checkpoint}")
 
 
 def _maybe_reexec_into_repo_venv() -> None:
@@ -704,7 +714,11 @@ class ParallelTrajectoryExecutor:
         with self._lock:
             self._future_candidates.clear()
             self._pending_step_budget = 0
-        self._idle.set()
+            servo_active = bool(self._servo_active)
+        if servo_active:
+            self._idle.clear()
+        else:
+            self._idle.set()
 
     def wait_until_idle(self, timeout: float | None = None) -> bool:
         return self._idle.wait(timeout=timeout)
@@ -725,7 +739,72 @@ class ParallelTrajectoryExecutor:
             self._latest_snapshot = None
             self._future_candidates.clear()
             self._pending_step_budget = 0
+            servo_active = bool(self._servo_active)
+        if servo_active:
+            self._idle.clear()
+        else:
+            self._idle.set()
+
+    def _force_clear_executor_state(self) -> None:
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        with self._lock:
+            self._expected_pose = None
+            self._last_result = None
+            self._reset_servo = False
+            self._current_pose_sim = None
+            self._current_tick = 0
+            self._control_dt_s = 0.01
+            self._latest_snapshot = None
+            self._future_candidates.clear()
+            self._pending_step_budget = 0
+            self._servo_active = False
         self._idle.set()
+
+    def stop_streaming_and_reset(self, timeout: float = EXECUTOR_STOP_WAIT_S) -> bool:
+        """Clear queued motion, request servo_stop, and wait until the executor processes it."""
+        self.reset_state()
+        executor_stopped = self._wait_for_executor_servo_stop(timeout)
+        daemon_stopped = self._force_daemon_motion_stop(settle_s=EXECUTOR_STOP_SETTLE_S)
+        if daemon_stopped and not executor_stopped:
+            executor_stopped = self._wait_for_executor_servo_stop(max(0.5, min(float(timeout), 1.0)))
+        if daemon_stopped:
+            self._force_clear_executor_state()
+            executor_stopped = True
+        if executor_stopped and daemon_stopped:
+            self._idle.set()
+        return bool(executor_stopped and daemon_stopped)
+
+    def _wait_for_executor_servo_stop(self, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while time.monotonic() <= deadline:
+            with self._lock:
+                done = not bool(self._reset_servo) and not bool(self._servo_active)
+            if done:
+                return True
+            time.sleep(0.01)
+        return False
+
+    def _force_daemon_motion_stop(self, *, settle_s: float = 0.0) -> bool:
+        if not self._execute:
+            if settle_s > 0:
+                time.sleep(float(settle_s))
+            return True
+        ok = True
+        try:
+            from support.tcp_control import _get_servo_daemon
+
+            daemon = _get_servo_daemon()
+            resp = daemon.emergency_stop_motion(graceful_timeout_s=2.5, restart_wait_s=1.0)
+            ok = bool(resp.get("ok", False))
+        except Exception:
+            ok = False
+        if settle_s > 0:
+            time.sleep(float(settle_s))
+        return ok
 
     def _update_idle_flag(self) -> None:
         with self._lock:
@@ -1002,10 +1081,10 @@ class ParallelTrajectoryExecutor:
                             self._idle.set()
                             time.sleep(control_dt_s)
                             continue
-                        daemon.servo_begin_chunk(sim_pose_to_real(current_pose_sim))
                         servo_active = True
                         with self._lock:
                             self._servo_active = True
+                        daemon.servo_begin_chunk(sim_pose_to_real(current_pose_sim))
 
                     resp = daemon.servo_pose(target_pose_real)
                     pose_ret = int(resp.get("servo_pose_ret", -1))
@@ -1074,8 +1153,13 @@ class ParallelTrajectoryExecutor:
                 _set_expected_pose(None)
                 with self._lock:
                     self._future_candidates.clear()
+                    self._pending_step_budget = 0
+                    self._current_pose_sim = None
+                    self._latest_snapshot = None
+                    self._reset_servo = False
                 print(f"  [executor] Error: {exc}")
                 _finish_servo()
+                self._idle.set()
 
             next_send_ts += max(self._control_dt_s, 1e-6)
             if next_send_ts < time.monotonic() - max(self._control_dt_s, 1e-6):
@@ -1384,12 +1468,11 @@ def main() -> int:
             continue
 
         if cmd_lower == "align":
-            executor.clear_pending()
-            executor.wait_until_idle()
-            executor.reset_state()
+            if not executor.stop_streaming_and_reset():
+                print("  Warning: executor did not confirm servo stop before align.")
             print("Moving to initial joint positions...")
             result = move_to_joint_positions(initial_qpos_rad, execute=execute)
-            executor.reset_state()
+            executor.stop_streaming_and_reset()
             print(f"  Result: ok={result.ok}, reason={result.reason}")
             if execute:
                 if result.ok:
@@ -1418,9 +1501,8 @@ def main() -> int:
             continue
 
         if cmd_lower == "reset":
-            executor.clear_pending()
-            executor.wait_until_idle()
-            executor.reset_state()
+            if not executor.stop_streaming_and_reset():
+                print("  Warning: executor did not confirm servo stop during reset.")
             obs_builder.reset_pose_filter()
             policy.reset()
             task_observer.end_session()
@@ -1444,7 +1526,8 @@ def main() -> int:
         )
 
         policy.reset()
-        executor.reset_state()
+        if not executor.stop_streaming_and_reset():
+            print("  Warning: executor did not confirm servo stop before auto-init.")
         task_observer.begin_session(prompt)
 
         if execute:
@@ -1452,12 +1535,20 @@ def main() -> int:
             align_result = move_to_joint_positions(initial_qpos_rad, execute=True)
             print(f"  Auto-init align: ok={align_result.ok}, reason={align_result.reason}")
             if not align_result.ok:
+                print("  Auto-init align failed; stopping residual motion and retrying once...")
+                if not executor.stop_streaming_and_reset(timeout=max(EXECUTOR_STOP_WAIT_S, 3.0)):
+                    print("  Warning: executor did not fully confirm servo stop before auto-init retry.")
+                align_result = move_to_joint_positions(initial_qpos_rad, execute=True)
+                print(f"  Auto-init retry: ok={align_result.ok}, reason={align_result.reason}")
+            if align_result.ok:
+                print("Auto-init: opening gripper...")
+                command_gripper_state(1, timeout_s=10.0)
+                _calibrate_alignment(pose_frame=cfg.pose_frame)
+            else:
                 clear_runtime_alignment()
                 print("  Auto-init aborted: pose alignment cleared because joint alignment failed.")
+                task_observer.end_session()
                 continue
-            print("Auto-init: opening gripper...")
-            command_gripper_state(1, timeout_s=10.0)
-            _calibrate_alignment(pose_frame=cfg.pose_frame)
 
         if not execute and not is_alignment_ready():
             _calibrate_alignment(pose_frame=cfg.pose_frame)
@@ -1597,14 +1688,12 @@ def main() -> int:
             while True:
                 observer_result = task_observer.pop_completion()
                 if observer_result is not None and observer_result.complete:
-                    executor.clear_pending()
                     print(
                         "\n  Task observer marked the task as complete. "
                         f"confidence={observer_result.confidence:.2f} reason={observer_result.reason}"
                     )
-                    print("  Waiting for in-flight trajectory to finish...")
-                    executor.wait_until_idle()
-                    executor.reset_state()
+                    print("  Stopping in-flight trajectory...")
+                    executor.stop_streaming_and_reset()
                     task_observer.end_session()
                     _append_infer_log(
                         {
@@ -1627,8 +1716,7 @@ def main() -> int:
                 last_res = executor.last_result
                 if last_res and not last_res.ok:
                     print(f"    Track error: {last_res.reason}")
-                    executor.clear_pending()
-                    executor.reset_state()
+                    executor.stop_streaming_and_reset()
                     time.sleep(0.05)
                     continue
 
@@ -1683,8 +1771,7 @@ def main() -> int:
                             "last_progress_age_s": float(queue_state_before_obs["last_progress_age_s"]),
                         }
                     )
-                    executor.clear_pending()
-                    executor.reset_state()
+                    executor.stop_streaming_and_reset()
                     time.sleep(0.05)
                     continue
                 if queue_state_before_obs["effective_buffered_steps"] > ASYNC_REFILL_THRESHOLD_STEPS:
@@ -1762,19 +1849,25 @@ def main() -> int:
                 )
                 planning_latency_s = time.monotonic() - loop_start
                 submit_queue_state = executor.get_progress()
-                stale_steps = max(0, int(submit_queue_state["current_tick"]) - observation_tick)
-                stale_steps = min(stale_steps, len(plan.steps))
+                wall_clock_stale_steps = max(0, int(submit_queue_state["current_tick"]) - observation_tick)
+                wall_clock_stale_steps = min(wall_clock_stale_steps, len(plan.steps))
+                dropped_stale_steps = 0
+                submit_observation_tick = int(observation_tick)
                 rebased_plan = plan
                 rebased_from_executor = False
-                if stale_steps > 0:
+                if wall_clock_stale_steps > 0:
                     rebase_pose_sim = executor.expected_pose
                     if rebase_pose_sim is not None:
+                        dropped_stale_steps = int(wall_clock_stale_steps)
                         rebased_plan = _rebase_retimed_plan(
                             plan,
-                            stale_steps=stale_steps,
+                            stale_steps=dropped_stale_steps,
                             rebase_pose_sim=np.asarray(rebase_pose_sim, dtype=np.float64).reshape(6).copy(),
                         )
+                        submit_observation_tick = int(submit_queue_state["current_tick"])
                         rebased_from_executor = True
+                    else:
+                        dropped_stale_steps = int(wall_clock_stale_steps)
                 remaining_steps = max(0, len(rebased_plan.steps))
                 _append_infer_log(
                     {
@@ -1793,9 +1886,11 @@ def main() -> int:
                         "prefix_abs_integral": [float(v) for v in prefix_abs_integral.tolist()],
                         "retimed_step_count": int(len(plan.steps)),
                         "observation_tick": int(observation_tick),
-                        "stale_steps_before_submit": int(stale_steps),
+                        "stale_steps_before_submit": int(wall_clock_stale_steps),
+                        "dropped_stale_steps_before_submit": int(dropped_stale_steps),
                         "remaining_step_count": int(remaining_steps),
                         "rebased_from_executor": bool(rebased_from_executor),
+                        "submit_observation_tick": int(submit_observation_tick),
                         "queue_refill_threshold_steps": int(ASYNC_REFILL_THRESHOLD_STEPS),
                         "queue_buffered_steps_before_obs": int(queue_state_before_obs["buffered_steps"]),
                         "queue_effective_buffered_steps_before_obs": int(queue_state_before_obs["effective_buffered_steps"]),
@@ -1816,7 +1911,8 @@ def main() -> int:
                 if remaining_steps <= 0:
                     print(
                         f"  [{step:4d}] Chunk expired before execution "
-                        f"(retimed={len(plan.steps)} stale={stale_steps}), re-inferring..."
+                        f"(retimed={len(plan.steps)} stale={wall_clock_stale_steps} "
+                        f"dropped={dropped_stale_steps}), re-inferring..."
                     )
                     continue
 
@@ -1828,7 +1924,7 @@ def main() -> int:
                 executor.submit(
                     rebased_plan,
                     aligned_obs.robot_snapshot,
-                    observation_tick=observation_tick,
+                    observation_tick=submit_observation_tick,
                     generation=step,
                 )
                 post_submit_queue_state = executor.get_progress()
@@ -1838,6 +1934,7 @@ def main() -> int:
                         "step": int(step),
                         "prompt": prompt,
                         "observation_tick": int(observation_tick),
+                        "submit_observation_tick": int(submit_observation_tick),
                         "submitted_step_count": int(len(rebased_plan.steps)),
                         "remaining_step_count": int(remaining_steps),
                         "rebased_from_executor": bool(rebased_from_executor),
@@ -1859,13 +1956,15 @@ def main() -> int:
                     last_res = executor.last_result
                     if last_res and not last_res.ok:
                         print(f"    Track error before gripper command: {last_res.reason}")
-                        executor.reset_state()
+                        executor.stop_streaming_and_reset()
                     else:
+                        executor.stop_streaming_and_reset()
                         _apply_gripper_command(step, int(scheduled_gripper_state))
                 else:
                     print(
                         f"  [{step:4d}] Async submit: {remaining_steps} queued servo steps "
-                        f"(stale {stale_steps}, buffered={post_submit_queue_state['effective_buffered_steps']}, "
+                        f"(stale {wall_clock_stale_steps}, dropped={dropped_stale_steps}, "
+                        f"buffered={post_submit_queue_state['effective_buffered_steps']}, "
                         f"pending={post_submit_queue_state['pending_submissions']}, "
                         f"rebased={rebased_from_executor}), "
                         f"continuing to next observation..."
@@ -1890,11 +1989,10 @@ def main() -> int:
                 continue
 
         except KeyboardInterrupt:
-            executor.clear_pending()
             task_observer.end_session()
-            print("\n  Waiting for in-flight trajectory to finish...")
-            executor.wait_until_idle()
-            executor.reset_state()
+            print("\n  Stopping in-flight trajectory...")
+            if not executor.stop_streaming_and_reset():
+                print("  Warning: executor did not confirm servo stop after interrupt.")
             try:
                 policy.reset()
             except Exception as exc:

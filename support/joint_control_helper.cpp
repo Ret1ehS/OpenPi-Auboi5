@@ -16,8 +16,6 @@ using namespace arcs::common_interface;
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
-constexpr int kMoveJointBusyRet = -4;
-
 struct Options {
     std::string robot_ip = "192.168.1.100";
     int port = 30004;
@@ -346,10 +344,10 @@ int main(int argc, char **argv)
     motion->setSpeedFraction(opt.speed_fraction);
     int move_ret = motion->moveJoint(opt.joint_target, acc_rad, speed_rad, 0.0, 0.0);
     std::cout << "moveJoint_first_ret=" << move_ret << std::endl;
-    if (move_ret == kMoveJointBusyRet) {
-        std::cout << "moveJoint_busy_retry=1" << std::endl;
-        preclear_motion_queue(robot, motion, "busy_retry", true);
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (move_ret != 0) {
+        std::cout << "moveJoint_recovery_retry=1" << std::endl;
+        preclear_motion_queue(robot, motion, "recovery_retry", true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
         move_ret = motion->moveJoint(opt.joint_target, acc_rad, speed_rad, 0.0, 0.0);
         std::cout << "moveJoint_retry_ret=" << move_ret << std::endl;
     }

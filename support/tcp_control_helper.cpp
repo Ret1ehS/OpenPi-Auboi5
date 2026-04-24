@@ -615,13 +615,17 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
     double servo_gain = 150.0;
 
     auto cleanup_servo = [&]() {
-        if (servo_active) {
+        const int servo_mode_before = motion->getServoModeSelect();
+        if (servo_active || servo_mode_before == 1) {
+            const int servo_exit_ret = motion->setServoModeSelect(0);
             log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
                      ",\"event\":\"servo_exit\",\"sent\":" + std::to_string(sent) +
+                     ",\"servo_mode_before\":" + std::to_string(servo_mode_before) +
+                     ",\"servo_exit_ret\":" + std::to_string(servo_exit_ret) +
                      ",\"hold_pose\":" + vec_to_json(hold_pose) + "}");
-            motion->setServoModeSelect(0);
             servo_active = false;
             std::cout << "servo_active=0" << std::endl;
+            std::cout << "servo_exit_ret=" << servo_exit_ret << std::endl;
         }
     };
 
@@ -980,14 +984,32 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
         } else if (line == "servo_stop") {
             int total_sent = sent;
             cleanup_servo();
-            auto final_q = robot->getRobotState()->getJointPositions();
+            auto robot_state = robot->getRobotState();
+            int stop_ret = 0;
+            if (!(motion->getExecId() == -1 && robot_state->isSteady())) {
+                stop_ret = motion->stopMove(true, true);
+            }
+            const int clear_path_ret = motion->clearPath();
+            const int wait_ret = wait_for_motion_idle(robot, motion, 2000);
+            robot_state = robot->getRobotState();
+            auto final_q = robot_state->getJointPositions();
             log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
                      ",\"event\":\"servo_stop\",\"servo_sent\":" + std::to_string(total_sent) +
+                     ",\"stop_ret\":" + std::to_string(stop_ret) +
+                     ",\"clear_path_ret\":" + std::to_string(clear_path_ret) +
+                     ",\"wait_ret\":" + std::to_string(wait_ret) +
+                     ",\"exec_id\":" + std::to_string(motion->getExecId()) +
+                     ",\"is_steady\":" + std::string(robot_state->isSteady() ? "true" : "false") +
                      ",\"final_q\":" + vec_to_json(final_q) + "}");
             print_vec("final_q_rad", final_q);
             std::cout << "servo_sent=" << total_sent << std::endl;
-            std::cout << "collision_after=" << robot->getRobotState()->isCollisionOccurred() << std::endl;
-            std::cout << "within_safety_limits_after=" << robot->getRobotState()->isWithinSafetyLimits() << std::endl;
+            std::cout << "stop_ret=" << stop_ret << std::endl;
+            std::cout << "clear_path_ret=" << clear_path_ret << std::endl;
+            std::cout << "wait_ret=" << wait_ret << std::endl;
+            std::cout << "exec_id=" << motion->getExecId() << std::endl;
+            std::cout << "is_steady=" << robot_state->isSteady() << std::endl;
+            std::cout << "collision_after=" << robot_state->isCollisionOccurred() << std::endl;
+            std::cout << "within_safety_limits_after=" << robot_state->isWithinSafetyLimits() << std::endl;
             std::cout << "END" << std::endl;
 
         } else if (line == "motion_status") {
@@ -1018,15 +1040,14 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
                 }
             }
 
-            if (servo_active) {
-                cleanup_servo();
-            }
+            cleanup_servo();
 
             auto robot_state = robot->getRobotState();
             int stop_ret = 0;
             if (!(motion->getExecId() == -1 && robot_state->isSteady())) {
                 stop_ret = motion->stopMove(quick, all_tasks);
             }
+            const int clear_path_ret = motion->clearPath();
 
             int wait_ret = 0;
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1043,11 +1064,13 @@ int run_daemon(RobotInterfacePtr robot, RobotConfigPtr config, const Options &op
             }
             log_diag("{\"ts_ms\":" + std::to_string(epoch_ms_now()) +
                      ",\"event\":\"stop_motion\",\"stop_ret\":" + std::to_string(stop_ret) +
+                     ",\"clear_path_ret\":" + std::to_string(clear_path_ret) +
                      ",\"wait_ret\":" + std::to_string(wait_ret) +
                      ",\"exec_id\":" + std::to_string(motion->getExecId()) +
                      ",\"is_steady\":" + std::string(robot_state->isSteady() ? "true" : "false") + "}");
 
             std::cout << "stop_ret=" << stop_ret << std::endl;
+            std::cout << "clear_path_ret=" << clear_path_ret << std::endl;
             std::cout << "wait_ret=" << wait_ret << std::endl;
             std::cout << "exec_id=" << motion->getExecId() << std::endl;
             std::cout << "is_steady=" << robot_state->isSteady() << std::endl;

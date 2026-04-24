@@ -5,7 +5,7 @@
 # Python / SDK
 OPENPI_RUNTIME_PYTHON=/home/niic/openpi/miniforge3/envs/openpi-py311/bin/python
 OPENPI_PYTORCH_RUNTIME_PYTHON=/home/niic/openpi/miniforge3/envs/openpi-py310-torch/bin/python
-OPENPI_SDK_ROOT=/home/niic/openpi/aubo_sdk/aubo_sdk-0.26.0-rc.3-Linux_aarch64+589233b
+OPENPI_SDK_ROOT=/home/niic/openpi/aubo_sdk/aubo_sdk-0.24.1-rc.3-Linux_aarch64+318754d
 # OPENPI_ROOT=/home/niic/openpi/repo
 # OPENPI_CONDA_PYTHON=/home/niic/openpi/miniforge3/envs/openpi-py311/bin/python
 

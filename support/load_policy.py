@@ -331,6 +331,7 @@ class SubprocessPyTorchPolicy:
         sample_kwargs: dict[str, Any] | None,
     ) -> None:
         self._lock = threading.Lock()
+        self._request_id = 0
         self._runtime_python = _select_pytorch_runtime_python()
         num_steps = int((sample_kwargs or {}).get("num_steps", 10))
         compile_mode = os.environ.get("OPENPI_PYTORCH_COMPILE_MODE", "").strip()
@@ -379,19 +380,23 @@ class SubprocessPyTorchPolicy:
 
     def infer(self, obs: dict[str, Any], *, noise: np.ndarray | None = None) -> dict[str, Any]:
         with self._lock:
-            self._send({"op": "infer", "obs": obs, "noise": noise})
-            response = self._recv()
+            request_id = self._next_request_id()
+            self._send({"op": "infer", "obs": obs, "noise": noise, "request_id": request_id})
+            response = self._recv_response(request_id)
         if not response.get("ok"):
             raise RuntimeError(
                 "PyTorch policy worker infer failed: "
                 f"{response.get('error', 'unknown error')}\n{response.get('traceback', '')}".rstrip()
             )
+        if "result" not in response:
+            raise RuntimeError(f"PyTorch policy worker infer returned no result: {response!r}")
         return response["result"]
 
     def reset(self) -> None:
         with self._lock:
-            self._send({"op": "reset"})
-            response = self._recv()
+            request_id = self._next_request_id()
+            self._send({"op": "reset", "request_id": request_id})
+            response = self._recv_response(request_id)
         if not response.get("ok"):
             raise RuntimeError(response.get("error", "PyTorch policy worker reset failed"))
 
@@ -403,8 +408,9 @@ class SubprocessPyTorchPolicy:
             if proc.poll() is None:
                 try:
                     with self._lock:
-                        self._send({"op": "close"})
-                        self._recv()
+                        request_id = self._next_request_id()
+                        self._send({"op": "close", "request_id": request_id})
+                        self._recv_response(request_id)
                 except Exception:
                     pass
         finally:
@@ -425,6 +431,18 @@ class SubprocessPyTorchPolicy:
                 except subprocess.TimeoutExpired:
                     proc.kill()
             self._proc = None
+
+    def _next_request_id(self) -> int:
+        self._request_id += 1
+        return self._request_id
+
+    def _recv_response(self, request_id: int) -> dict[str, Any]:
+        while True:
+            response = self._recv()
+            response_id = response.get("request_id")
+            if response_id is None or str(response_id) == str(request_id):
+                return response
+            print(f"  [local] discarded stale PyTorch worker response request_id={response_id}")
 
     def _send(self, message: dict[str, Any]) -> None:
         if self._proc.stdin is None:

@@ -322,6 +322,7 @@ def convert_checkpoint(
         "action_horizon": model_config.action_horizon,
         "paligemma_variant": model_config.paligemma_variant,
         "action_expert_variant": model_config.action_expert_variant,
+        "discrete_state_input": bool(getattr(model_config, "discrete_state_input", True)),
         "precision": precision,
     }
     (output_path / "config.json").write_text(json.dumps(config_dict, indent=2), encoding="utf-8")

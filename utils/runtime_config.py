@@ -6,6 +6,7 @@ from pathlib import Path
 from utils.env_utils import load_default_env
 from utils.path_utils import (
     SCRIPTS_ROOT,
+    get_openpi_root,
     get_repo_root,
     get_support_dir,
 )
@@ -108,6 +109,16 @@ DEFAULT_FORCE_SENSOR_FALLBACK_PORT = _env_str(
     "OPENPI_FORCE_SENSOR_FALLBACK_PORT",
     "/dev/ttyUSB4",
 )
+DEFAULT_OBSERVER_PYTHON = _env_path(
+    "OPENPI_TASK_OBSERVER_PYTHON",
+    Path("venvs") / "vllm-jp62-clean" / "bin" / "python",
+    base=get_openpi_root(),
+)
+DEFAULT_OBSERVER_MODEL = _env_path(
+    "OPENPI_TASK_OBSERVER_MODEL",
+    Path("modelscope_models") / "google" / "gemma-4-E2B-it",
+    base=get_openpi_root(),
+)
 
 __all__ = [
     "DEFAULT_AUBO_PASSWORD",
@@ -122,6 +133,8 @@ __all__ = [
     "DEFAULT_GRIPPER_PORT",
     "DEFAULT_LOCAL_PORT",
     "DEFAULT_NAMESPACE",
+    "DEFAULT_OBSERVER_MODEL",
+    "DEFAULT_OBSERVER_PYTHON",
     "DEFAULT_REMOTE_PORT",
     "DEFAULT_ROBOT_IP",
     "KUBECONFIG_PATH",

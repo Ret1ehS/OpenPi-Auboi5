@@ -359,7 +359,8 @@ def _maybe_build_trt_denoise_engine(policy: "OpenPIPyTorchPolicy", model: torch.
     sample_state_np = np.asarray(sample_obs["observation/state"], dtype=np.float32).reshape(-1)
     sample_state_np = _normalize_quantile(sample_state_np, policy._norm_stats["state"])
     sample_padded_state = _pad_to_dim(sample_state_np[None, :], policy._config.action_dim)
-    tokenized_prompt, tokenized_prompt_mask = policy._tokenizer.tokenize(sample_prompt, sample_state_np)
+    sample_token_state = sample_state_np if policy._config.discrete_state_input else None
+    tokenized_prompt, tokenized_prompt_mask = policy._tokenizer.tokenize(sample_prompt, sample_token_state)
     sample_observation = SimpleObservation(
         images={
             "base_0_rgb": _image_to_model_tensor(sample_obs["observation/image"], policy._device),
@@ -570,6 +571,7 @@ class Pi0TorchConfig:
     dtype: str = "bfloat16"
     max_token_len: int = 200
     pytorch_compile_mode: str | None = None
+    discrete_state_input: bool = True
 
 
 @dataclasses.dataclass
@@ -675,9 +677,10 @@ def _image_to_model_tensor(image: Any, device: torch.device) -> torch.Tensor:
     array = _parse_image(image)
     tensor = torch.from_numpy(array[None, ...]).to(device=device, dtype=torch.float32)
     tensor = tensor.permute(0, 3, 1, 2)
+    tensor = tensor / 255.0 * 2.0 - 1.0
     if tensor.shape[-2:] != (IMAGE_SIZE, IMAGE_SIZE):
         tensor = _resize_with_pad_torch(tensor, IMAGE_SIZE, IMAGE_SIZE)
-    return tensor / 255.0 * 2.0 - 1.0
+    return tensor
 
 
 def _find_norm_stats_path(checkpoint_dir: Path) -> Path:
@@ -710,6 +713,7 @@ def _load_checkpoint_config(checkpoint_dir: Path, *, compile_mode: str | None) -
         precision=precision,
         dtype=precision,
         pytorch_compile_mode=compile_mode,
+        discrete_state_input=bool(config_data.get("discrete_state_input", True)),
     )
 
 
@@ -856,6 +860,7 @@ class OpenPIPyTorchPolicy:
             "attention_backend": effective_attention_backend,
             "requested_attention_backend": self._attention_backend,
             "sample_num_steps": self._num_steps,
+            "discrete_state_input": bool(config.discrete_state_input),
             "tokenizer_model": str(tokenizer_path.resolve()),
             "runtime_python": sys.executable,
             "load_s": float(load_s),
@@ -882,7 +887,8 @@ class OpenPIPyTorchPolicy:
         prompt = _resolve_prompt(obs.get("prompt"), self._default_prompt)
         state = np.asarray(obs["observation/state"], dtype=np.float32).reshape(-1)
         state = _normalize_quantile(state, self._norm_stats["state"])
-        tokenized_prompt, tokenized_prompt_mask = self._tokenizer.tokenize(prompt, state)
+        token_state = state if self._config.discrete_state_input else None
+        tokenized_prompt, tokenized_prompt_mask = self._tokenizer.tokenize(prompt, token_state)
         padded_state = _pad_to_dim(state[None, :], self._config.action_dim)
 
         base_image = _image_to_model_tensor(obs["observation/image"], self._device)
@@ -1002,22 +1008,24 @@ def run_worker_main(argv: list[str] | None = None) -> int:
             if message is None:
                 return 0
             op = message.get("op")
+            request_id = message.get("request_id")
             if op == "infer":
                 _write_worker_message(
                     {
                         "ok": True,
+                        "request_id": request_id,
                         "result": policy.infer(message["obs"], noise=message.get("noise")),
                     }
                 )
             elif op == "reset":
                 policy.reset()
-                _write_worker_message({"ok": True})
+                _write_worker_message({"ok": True, "request_id": request_id})
             elif op == "close":
                 policy.close()
-                _write_worker_message({"ok": True})
+                _write_worker_message({"ok": True, "request_id": request_id})
                 return 0
             else:
-                _write_worker_message({"ok": False, "error": f"Unsupported worker op: {op!r}"})
+                _write_worker_message({"ok": False, "request_id": request_id, "error": f"Unsupported worker op: {op!r}"})
         except KeyboardInterrupt:
             try:
                 policy.close()
@@ -1028,6 +1036,7 @@ def run_worker_main(argv: list[str] | None = None) -> int:
             _write_worker_message(
                 {
                     "ok": False,
+                    "request_id": locals().get("request_id"),
                     "error": f"{type(exc).__name__}: {exc}",
                     "traceback": traceback.format_exc(),
                 }

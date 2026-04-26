@@ -39,6 +39,7 @@ QUAT_NORM_FAIL = 1e-2
 ACTION_ERR_WARN_STRICT = 1e-4
 ACTION_ERR_WARN_ORIENTATION = 1e-3
 ACTION_ERR_FAIL = 1e-3
+STATE_MODE_YAW = "yaw"
 CHECK_PASSED_KEY = "check_data_passed"
 CHECKER_VERSION_KEY = "check_data_checker_version"
 CHECKER_VERSION = 1
@@ -61,10 +62,6 @@ def read_episode_metadata(ep_dir: Path) -> dict[str, Any]:
 
 def write_episode_metadata(ep_dir: Path, metadata: dict[str, Any]) -> None:
     (ep_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-
-
-def _wrap_angle(angle: float) -> float:
-    return float(np.arctan2(np.sin(angle), np.cos(angle)))
 
 
 def quat_to_euler_wxyz(quat: np.ndarray) -> np.ndarray:
@@ -98,7 +95,7 @@ def axis_angle_to_quat_wxyz(axis_angle: np.ndarray) -> np.ndarray:
     )
 
 
-def expected_actions_from_states(states: np.ndarray, *, state_mode: str) -> np.ndarray:
+def expected_actions_from_states(states: np.ndarray) -> np.ndarray:
     states = np.asarray(states, dtype=np.float64)
     actions = np.zeros((states.shape[0], ACTION_DIM), dtype=np.float64)
     if len(states) == 0:
@@ -112,21 +109,25 @@ def expected_actions_from_states(states: np.ndarray, *, state_mode: str) -> np.n
     actions[:-1, :3] = pos[1:] - pos[:-1]
     deulers = np.arctan2(np.sin(eulers[1:] - eulers[:-1]), np.cos(eulers[1:] - eulers[:-1]))
     actions[:-1, 3:5] = deulers[:, :2]
-    if state_mode == "j6" and states.shape[1] >= 8:
-        actions[:-1, 5] = np.array([_wrap_angle(v) for v in states[1:, 7] - states[:-1, 7]], dtype=np.float64)
-    else:
-        actions[:-1, 5] = deulers[:, 2]
+    actions[:-1, 5] = deulers[:, 2]
     actions[:-1, 6] = grip[1:]
     actions[-1, 6] = grip[-1]
     return actions
 
 
-def action_err_warn_thresholds(*, state_mode: str) -> np.ndarray:
+def action_err_warn_thresholds() -> np.ndarray:
     thresholds = np.full(ACTION_DIM, ACTION_ERR_WARN_STRICT, dtype=np.float64)
-    thresholds[3:5] = ACTION_ERR_WARN_ORIENTATION
-    if state_mode != "j6":
-        thresholds[5] = ACTION_ERR_WARN_ORIENTATION
+    thresholds[3:6] = ACTION_ERR_WARN_ORIENTATION
     return thresholds
+
+
+def validate_state_mode(metadata: dict[str, Any], *, state_dim: int) -> str:
+    state_mode = str(metadata.get("state_mode", STATE_MODE_YAW) or STATE_MODE_YAW).strip().lower()
+    if state_mode != STATE_MODE_YAW:
+        raise ValueError(f"only yaw state_mode is supported, got {state_mode!r}")
+    if int(state_dim) != 7:
+        raise ValueError(f"only yaw state_mode is supported; expected 7-column states, got state_dim={state_dim}")
+    return STATE_MODE_YAW
 
 
 def image_stream_metrics(arr: np.ndarray, *, saved_fps: float, raw_capture_fps: float) -> dict[str, Any]:
@@ -237,7 +238,7 @@ def inspect_episode(ep_dir: Path, *, raw_capture_fps: float, force_recheck: bool
 
     state_dim = int(metadata.get("state_dim", states.shape[1] if states.ndim == 2 else 0))
     action_dim = int(metadata.get("action_dim", ACTION_DIM))
-    state_mode = str(metadata.get("state_mode", "j6" if state_dim >= 8 else "yaw")).strip().lower()
+    state_mode = validate_state_mode(metadata, state_dim=state_dim)
     metrics["state_dim"] = state_dim
     metrics["action_dim"] = action_dim
     metrics["state_mode"] = state_mode
@@ -297,10 +298,10 @@ def inspect_episode(ep_dir: Path, *, raw_capture_fps: float, force_recheck: bool
             warnings.append(f"timestamps slightly deviate from grid: {grid_err:.6g}s")
 
     if states.shape == (n_frames, state_dim) and actions.shape == (n_frames, action_dim) and action_dim == ACTION_DIM:
-        expected_actions = expected_actions_from_states(states, state_mode=state_mode)
+        expected_actions = expected_actions_from_states(states)
         action_err = np.abs(actions.astype(np.float64) - expected_actions)
         max_action_err = np.max(action_err, axis=0)
-        warn_thresholds = action_err_warn_thresholds(state_mode=state_mode)
+        warn_thresholds = action_err_warn_thresholds()
         metrics["action_err_max"] = max_action_err.tolist()
         metrics["action_err_warn_thresholds"] = warn_thresholds.tolist()
         if float(np.max(max_action_err)) > ACTION_ERR_FAIL:

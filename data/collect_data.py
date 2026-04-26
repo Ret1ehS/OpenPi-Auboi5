@@ -208,14 +208,9 @@ def _require_yaw_readback(joint_q: np.ndarray, *, context: str) -> float:
     return float(joint_q_arr[5])
 
 
-def _normalize_state_mode(state_mode: str) -> str:
-    _ = state_mode
-    return STATE_MODE_YAW
-
-
-def build_state_row(pose6_zyx: np.ndarray, gripper: float, yaw: float, *, state_mode: str) -> np.ndarray:
-    """Build one state row for the selected collect-data mode."""
-    _ = _normalize_state_mode(state_mode)
+def build_state_row(pose6_zyx: np.ndarray, gripper: float, yaw: float) -> np.ndarray:
+    """Build one yaw-mode state row."""
+    _ = yaw
     pose = np.asarray(pose6_zyx, dtype=np.float64).reshape(6)
     quat = _euler_zyx_to_quat_wxyz(pose[3:6])
     aa = _quat_to_axis_angle_wxyz(quat)
@@ -255,11 +250,8 @@ def compute_delta_actions(
     pose6: np.ndarray,
     gripper: np.ndarray,
     yaw: np.ndarray,
-    *,
-    state_mode: str,
 ) -> np.ndarray:
     """Compute (N, 7) delta actions for yaw-mode datasets."""
-    _ = _normalize_state_mode(state_mode)
     pose6 = np.asarray(pose6, dtype=np.float32)
     gripper = np.asarray(gripper, dtype=np.float32).reshape(-1)
     yaw = np.asarray(yaw, dtype=np.float32).reshape(-1)
@@ -288,8 +280,7 @@ def compute_delta_actions(
     return actions
 
 
-def compute_actions_from_saved_states(states: np.ndarray, *, state_mode: str) -> np.ndarray:
-    _ = _normalize_state_mode(state_mode)
+def compute_actions_from_saved_states(states: np.ndarray) -> np.ndarray:
     states = np.asarray(states, dtype=np.float32)
     num_frames = int(states.shape[0])
     actions = np.zeros((num_frames, 7), dtype=np.float32)
@@ -313,13 +304,11 @@ def compute_actions_from_saved_states(states: np.ndarray, *, state_mode: str) ->
     return actions
 
 
-def state_schema_for_mode(state_mode: str) -> list[str]:
-    _ = _normalize_state_mode(state_mode)
+def state_schema() -> list[str]:
     return ["x", "y", "z", "aa_x", "aa_y", "aa_z", "gripper_open"]
 
 
-def action_schema_for_mode(state_mode: str) -> list[str]:
-    _ = _normalize_state_mode(state_mode)
+def action_schema() -> list[str]:
     return ["dx", "dy", "dz", "droll", "dpitch", "dyaw", "gripper_next"]
 
 
@@ -1103,12 +1092,10 @@ def prepare_episode_for_save(
     frames: list[RecordedFrame],
     *,
     save_fps: int,
-    state_mode: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Convert raw episode frames onto the target save grid."""
     if not frames:
         raise RuntimeError("no frames to resample")
-    mode = _normalize_state_mode(state_mode)
     if save_fps not in (RAW_CAPTURE_FPS, UPSAMPLED_SAVE_FPS):
         raise ValueError(f"unsupported save_fps={save_fps}, expected {RAW_CAPTURE_FPS} or {UPSAMPLED_SAVE_FPS}")
 
@@ -1124,7 +1111,7 @@ def prepare_episode_for_save(
         target_count = len(frames)
         env_steps = np.arange(target_count, dtype=np.int64)
         target_times = env_steps.astype(np.float32) * np.float32(1.0 / RAW_CAPTURE_FPS)
-        state_dim = len(state_schema_for_mode(mode))
+        state_dim = len(state_schema())
         states = np.zeros((target_count, state_dim), dtype=np.float32)
         pose6_saved = raw_pose6.astype(np.float32, copy=True)
         gripper_saved = raw_gripper.astype(np.float32, copy=True)
@@ -1136,9 +1123,8 @@ def prepare_episode_for_save(
                 pose6_saved[out_idx],
                 gripper_saved[out_idx],
                 yaw_saved[out_idx],
-                state_mode=mode,
             )
-        actions = compute_actions_from_saved_states(states, state_mode=mode)
+        actions = compute_actions_from_saved_states(states)
         return (
             states,
             actions,
@@ -1153,7 +1139,7 @@ def prepare_episode_for_save(
     env_steps = np.arange(target_count, dtype=np.int64)
     target_times = env_steps.astype(np.float32) * np.float32(save_control_dt)
 
-    state_dim = len(state_schema_for_mode(mode))
+    state_dim = len(state_schema())
     states = np.zeros((target_count, state_dim), dtype=np.float32)
     pose6_resampled = np.zeros((target_count, 6), dtype=np.float32)
     gripper_resampled = np.zeros((target_count,), dtype=np.float32)
@@ -1209,12 +1195,11 @@ def prepare_episode_for_save(
             interp_pose6,
             gripper_resampled[out_idx],
             yaw_resampled[out_idx],
-            state_mode=mode,
         )
         main_images[out_idx] = raw_main_images[image_idx]
         wrist_images[out_idx] = raw_wrist_images[image_idx]
 
-    actions = compute_actions_from_saved_states(states, state_mode=mode)
+    actions = compute_actions_from_saved_states(states)
     return (
         states,
         actions,
@@ -1235,7 +1220,6 @@ def save_episode(
     prompt: str,
     *,
     save_fps: int,
-    state_mode: str,
 ) -> Path:
     """Save a recorded episode to disk."""
     from support.pose_align import get_alignment_mode
@@ -1254,10 +1238,9 @@ def save_episode(
     states, actions, timestamps, env_steps, main_images, wrist_images = prepare_episode_for_save(
         frames,
         save_fps=save_fps,
-        state_mode=state_mode,
     )
-    state_schema = state_schema_for_mode(state_mode)
-    action_schema = action_schema_for_mode(state_mode)
+    state_names = state_schema()
+    action_names = action_schema()
 
     np.save(episode_dir / "states.npy", states)
     np.save(episode_dir / "actions.npy", actions)
@@ -1285,8 +1268,8 @@ def save_episode(
         "env_steps_file": "env_steps.npy",
         "state_dim": len(state_schema),
         "action_dim": 7,
-        "state_schema": state_schema,
-        "action_schema": action_schema,
+        "state_schema": state_names,
+        "action_schema": action_names,
         "state_mode": STATE_MODE_YAW,
         "pose_frame": get_alignment_mode(),
     }
@@ -1527,7 +1510,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-episodes", type=int, default=0)
     parser.add_argument("--speed", type=float, default=LINEAR_SPEED)
     parser.add_argument("--save-fps", type=int, choices=(RAW_CAPTURE_FPS, UPSAMPLED_SAVE_FPS), default=DEFAULT_SAVE_FPS)
-    parser.add_argument("--state-mode", type=str, choices=(STATE_MODE_YAW,), default=STATE_MODE_YAW)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--gripper-timeout", type=float, default=10.0)
     parser.add_argument("--pose-frame", type=str, choices=("sim", "real"), default="sim")
@@ -1566,7 +1548,6 @@ def main() -> int:
         default_resume_mode="continue" if saved_state_preview is not None else "reset",
         default_task="pick_and_place",
         default_save_fps=args.save_fps,
-        default_state_mode=args.state_mode,
     )
     if tui_cfg.quit:
         print("Exiting.")
@@ -1578,7 +1559,6 @@ def main() -> int:
         tui_cfg.auto_episodes = 1
     auto_episodes = 0 if tui_cfg.mode == "manual" else int(tui_cfg.auto_episodes)
     save_fps = int(tui_cfg.save_fps)
-    collect_state_mode = _normalize_state_mode(tui_cfg.state_mode)
     resume_mode = str(tui_cfg.resume_mode)
 
     print("\nConfiguration:")
@@ -1588,7 +1568,6 @@ def main() -> int:
     print(f"  Resume:     {resume_mode}")
     print(f"  Task:       {selected_task}")
     print(f"  Save FPS:   {save_fps}")
-    print(f"  State Mode: {collect_state_mode}")
     print(f"  Pose Frame: {get_alignment_mode()}")
     print(f"  Speed:      {LINEAR_SPEED} m/s")
     print(f"  Dry-run:    {args.dry_run}")
@@ -1626,7 +1605,6 @@ def main() -> int:
     print(f"Speed: {LINEAR_SPEED} m/s")
     print(f"Dry-run: {args.dry_run}")
     print(f"Pose frame: {get_alignment_mode()}")
-    print(f"State mode: {collect_state_mode}")
     if selected_task == "pick_and_place":
         print(f"Objects:      {list(OBJECT_ORDER)}")
         print("Prompt mode:  auto random ('pick up ...' / 'put ... on ...')")
@@ -1838,7 +1816,6 @@ def main() -> int:
             config=KeyboardTeleopConfig(
                 prompt=prompt_text,
                 save_fps=save_fps,
-                state_mode=collect_state_mode,
                 workspace_x_min=WORKSPACE_X_MIN,
                 workspace_x_max=WORKSPACE_X_MAX,
                 workspace_y_min=WORKSPACE_Y_MIN,
@@ -2015,7 +1992,6 @@ def main() -> int:
                         save_dir,
                         recorded.plan.prompt,
                         save_fps=save_fps,
-                        state_mode=collect_state_mode,
                     )
                     pp_finalize_episode(runtime, pick_session, recorded)
                 elif selected_task == "storage":
@@ -2025,7 +2001,6 @@ def main() -> int:
                         save_dir,
                         recorded.plan.prompt,
                         save_fps=save_fps,
-                        state_mode=collect_state_mode,
                     )
                     st_finalize_episode(runtime, storage_session, recorded)
                 else:
@@ -2035,14 +2010,12 @@ def main() -> int:
                         save_dir,
                         recorded_cycle.plan.open_plan.prompt,
                         save_fps=save_fps,
-                        state_mode=collect_state_mode,
                     )
                     save_episode(
                         recorded_cycle.close_frames,
                         save_dir,
                         recorded_cycle.plan.close_plan.prompt,
                         save_fps=save_fps,
-                        state_mode=collect_state_mode,
                     )
                     oc_finalize_cycle(open_close_session, recorded_cycle)
 

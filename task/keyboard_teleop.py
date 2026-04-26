@@ -62,11 +62,11 @@ STATE_DEDUP_GRIP_TOL = 1e-6
 class KeyboardTeleopConfig:
     prompt: str
     save_fps: int
-    state_mode: str
     workspace_x_min: float
     workspace_x_max: float
     workspace_y_min: float
     workspace_y_max: float
+    state_mode: str = "yaw"
     move_step_m: float = DEFAULT_MOVE_STEP_M
     rotate_step_deg: float = DEFAULT_ROTATE_STEP_DEG
 
@@ -479,7 +479,6 @@ def run_session(
                             save_dir,
                             _current_prompt(),
                             save_fps=config.save_fps,
-                            state_mode=config.state_mode,
                         )
                         saved_episode_count += 1
                         status_line = (

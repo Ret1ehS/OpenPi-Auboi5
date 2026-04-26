@@ -38,19 +38,8 @@ except Exception:
 # state helpers
 # -------------------------
 STATE_MODE_YAW = "yaw"
-STATE_MODE_J6 = "j6"
-RAW_STATE_FORMAT_YAW_AA = "yaw_aa"
-RAW_STATE_FORMAT_J6 = "j6"
 LEROBOT_STATE_DIM = 8
 ACTION_DIM = 7
-
-
-def state_format_to_mode(state_format: str) -> str:
-    if state_format == RAW_STATE_FORMAT_YAW_AA:
-        return STATE_MODE_YAW
-    if state_format == RAW_STATE_FORMAT_J6:
-        return STATE_MODE_J6
-    raise ValueError(f"unsupported state_format={state_format!r}")
 
 
 def infer_state_mode_from_metadata(metadata: dict) -> str | None:
@@ -61,47 +50,27 @@ def infer_state_mode_from_metadata(metadata: dict) -> str | None:
     state_mode = str(state_mode).strip().lower()
     if state_mode == STATE_MODE_YAW:
         return STATE_MODE_YAW
-    if state_mode == STATE_MODE_J6:
-        return STATE_MODE_J6
-    raise ValueError(f"unsupported metadata['state_mode']={state_mode!r}; expected 'yaw' or 'j6'")
+    raise ValueError(f"only yaw state_mode is supported, got metadata['state_mode']={state_mode!r}")
 
 
 def infer_episode_state_format(episode_dir: Path, states: np.ndarray, metadata: dict) -> str:
     """
     Supported rules:
-      - metadata['state_mode'] present: trust it strictly
-      - metadata['state_mode'] missing: 7 columns -> yaw, 8 columns -> hard error
-    This avoids silently treating ambiguous 8-column states as j6.
+      - metadata['state_mode'] present: only 'yaw' is accepted
+      - metadata['state_mode'] missing: only 7-column yaw states are accepted
     """
     if len(states.shape) != 2:
         raise ValueError(f"{episode_dir}: states must be rank-2, got {states.shape}")
 
     state_dim = int(states.shape[1])
     metadata_state_mode = infer_state_mode_from_metadata(metadata)
-    if metadata_state_mode is not None:
-        if metadata_state_mode == STATE_MODE_YAW:
-            if state_dim != 7:
-                raise ValueError(
-                    f"{episode_dir}: metadata['state_mode']='yaw' requires 7-column states, got shape {states.shape}. "
-                    "Legacy 8-column quaternion yaw must use the legacy conversion branch."
-                )
-            return RAW_STATE_FORMAT_YAW_AA
-
-        if state_dim != 8:
-            raise ValueError(
-                f"{episode_dir}: metadata['state_mode']='j6' requires 8-column states, got shape {states.shape}"
-            )
-        return RAW_STATE_FORMAT_J6
-
-    if state_dim == 7:
-        return RAW_STATE_FORMAT_YAW_AA
-    if state_dim == 8:
+    if metadata_state_mode is not None and metadata_state_mode != STATE_MODE_YAW:
+        raise ValueError(f"{episode_dir}: only yaw state_mode is supported")
+    if state_dim != 7:
         raise ValueError(
-            f"{episode_dir}: 8-column states are ambiguous without metadata['state_mode']. "
-            "Please add metadata['state_mode']='j6' for the new format, or use the legacy conversion branch "
-            "for legacy 8-column quaternion yaw."
+            f"{episode_dir}: only yaw state_mode is supported; expected states shape (N,7), got {states.shape}"
         )
-    raise ValueError(f"{episode_dir}: unsupported states shape {states.shape}; expected (N,7) or (N,8)")
+    return STATE_MODE_YAW
 
 
 def inspect_episode_state_mode(episode_dir: Path) -> str:
@@ -110,8 +79,7 @@ def inspect_episode_state_mode(episode_dir: Path) -> str:
     if meta_path.exists():
         metadata = json.loads(meta_path.read_text(encoding="utf-8"))
     states = np.load(episode_dir / "states.npy", mmap_mode="r")
-    state_format = infer_episode_state_format(episode_dir, states, metadata)
-    return state_format_to_mode(state_format)
+    return infer_episode_state_format(episode_dir, states, metadata)
 
 
 def ensure_dataset_state_mode(episode_dirs: List[Path]) -> str | None:
@@ -127,36 +95,20 @@ def ensure_dataset_state_mode(episode_dirs: List[Path]) -> str | None:
     if not mode_to_episodes:
         return None
 
-    if len(mode_to_episodes) > 1:
-        yaw_eps = ", ".join(mode_to_episodes.get(STATE_MODE_YAW, [])) or "<none>"
-        j6_eps = ", ".join(mode_to_episodes.get(STATE_MODE_J6, [])) or "<none>"
-        raise RuntimeError(
-            "Mixed episode state formats detected under data_dir; refusing to convert because "
-            "the 6th motion action dimension differs between yaw and j6 datasets (dyaw vs dj6).\n"
-            f"yaw episodes: {yaw_eps}\n"
-            f"j6 episodes: {j6_eps}"
-        )
-
     return next(iter(mode_to_episodes))
 
 
-def convert_state_to_lerobot(state: np.ndarray, state_mode: str) -> np.ndarray:
+def convert_state_to_lerobot(state: np.ndarray) -> np.ndarray:
     """
     yaw input: [x,y,z, aa_x,aa_y,aa_z, gripper] -> [x,y,z, aa_x,aa_y,aa_z, gripper,gripper]
-    j6  input: [x,y,z, aa_x,aa_y,aa_z, gripper,j6] -> [x,y,z, aa_x,aa_y,aa_z, gripper,j6]
     """
     s = np.asarray(state, dtype=np.float32)
+    if s.shape[0] != 7:
+        raise ValueError(f"only yaw state_mode is supported; expected 7-column state, got shape {s.shape}")
     pos = s[:3]
     aa = s[3:6]
     grip = float(s[6])
-
-    if state_mode == STATE_MODE_YAW:
-        tail = np.array([grip, grip], dtype=np.float32)
-    elif state_mode == STATE_MODE_J6:
-        tail = np.array([grip, float(s[7])], dtype=np.float32)
-    else:
-        raise ValueError(f"unsupported state_mode={state_mode!r}")
-
+    tail = np.array([grip, grip], dtype=np.float32)
     out = np.concatenate([pos.astype(np.float32), aa.astype(np.float32), tail], axis=0)
     assert out.shape == (LEROBOT_STATE_DIM,)
     return out
@@ -282,7 +234,7 @@ def load_episode(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict, np.ndarray | None, np.ndarray | None]:
     """
     episode_dir contains:
-      states.npy (N,7) yaw mode or (N,8) j6 mode
+      states.npy (N,7) yaw mode
       actions.npy (N,7)
       images.npz (optional; contains main_images, wrist_images)
       OR main_images.npy + wrist_images.npy (legacy)
@@ -342,8 +294,7 @@ def validate_episode_data(
     """Validate one episode and return `(state_mode, image_size, warnings)`."""
     warnings: List[str] = []
 
-    state_format = infer_episode_state_format(episode_dir, states, metadata)
-    state_mode = state_format_to_mode(state_format)
+    state_mode = infer_episode_state_format(episode_dir, states, metadata)
 
     if actions.ndim != 2 or actions.shape[1] != ACTION_DIM:
         raise ValueError(f"{episode_dir}: actions shape {actions.shape} != (N,{ACTION_DIM})")
@@ -390,7 +341,7 @@ def validate_episode_data(
             )
 
     meta_state_dim = metadata.get("state_dim")
-    expected_state_dim = 7 if state_mode == STATE_MODE_YAW else 8
+    expected_state_dim = 7
     if meta_state_dim is not None and int(meta_state_dim) != expected_state_dim:
         warnings.append(f"metadata state_dim={meta_state_dim} (expected {expected_state_dim})")
 
@@ -541,12 +492,6 @@ def main(args: Args) -> None:
             )
             continue
 
-        if dataset_state_mode is not None and ep_state_mode != dataset_state_mode:
-            raise RuntimeError(
-                f"Mixed episode state formats detected during conversion: expected {dataset_state_mode}, "
-                f"but {ep_dir.name} is {ep_state_mode}. Refusing to continue."
-            )
-
         if validation_warnings:
             print(f"[warn] {ep_dir.name}: " + " | ".join(validation_warnings))
 
@@ -566,7 +511,7 @@ def main(args: Args) -> None:
         # build columns
         # state convert
         lerobot_states = np.stack(
-            [convert_state_to_lerobot(states[i], ep_state_mode) for i in range(N)],
+            [convert_state_to_lerobot(states[i]) for i in range(N)],
             axis=0,
         ).astype(np.float32)
         actions = np.asarray(actions, dtype=np.float32)

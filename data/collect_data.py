@@ -30,13 +30,17 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+_REPO_IMPORT_ROOT = SCRIPT_DIR.parent
+if str(_REPO_IMPORT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_IMPORT_ROOT))
+
 import numpy as np
 from utils.env_utils import load_default_env
 from utils.path_utils import get_openpi_root, get_repo_root
 
 load_default_env()
 
-SCRIPT_DIR = Path(__file__).resolve().parent
 OPENPI_ROOT = get_openpi_root()
 REPO_ROOT = get_repo_root()
 REPO_VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
@@ -1519,7 +1523,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Real-robot data collection for OpenPI.")
     # task is selected interactively at startup, not via CLI
     parser.add_argument("--prompt", type=str, default="", help=argparse.SUPPRESS)
-    parser.add_argument("--data-dir", type=str, default=str(SCRIPT_DIR / "data"))
+    parser.add_argument("--data-dir", type=str, default=str(REPO_ROOT / "data"))
     parser.add_argument("--max-episodes", type=int, default=0)
     parser.add_argument("--speed", type=float, default=LINEAR_SPEED)
     parser.add_argument("--save-fps", type=int, choices=(RAW_CAPTURE_FPS, UPSAMPLED_SAVE_FPS), default=DEFAULT_SAVE_FPS)

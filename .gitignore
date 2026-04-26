@@ -13,6 +13,7 @@ tools/__pycache__/
 utils/__pycache__/
 data/*
 !data/
+!data/collect_data.py
 !data/check_data.py
 !data/convert_mujoco_to_lerobot.py
 *.bak_*

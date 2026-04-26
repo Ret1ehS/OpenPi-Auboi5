@@ -4,6 +4,8 @@ __pycache__/
 log/
 Log/
 captures/
+docs/
+tests/
 tools/*
 !tools/common.sh
 !tools/doctor.py

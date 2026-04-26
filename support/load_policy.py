@@ -540,14 +540,13 @@ class RemotePolicyRunner:
         ]
         self._port_forward_proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         atexit.register(self._stop_port_forward)
         time.sleep(2.0)
         if self._port_forward_proc.poll() is not None:
-            stderr = self._port_forward_proc.stderr.read().decode() if self._port_forward_proc.stderr else ""
-            raise RuntimeError(f"kubectl port-forward exited immediately: {stderr}")
+            raise RuntimeError("kubectl port-forward exited immediately")
         print("  Port-forward established.")
 
     def _find_pod(self) -> str:

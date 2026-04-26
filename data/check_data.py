@@ -201,7 +201,12 @@ def inspect_episode(ep_dir: Path, *, raw_capture_fps: float, force_recheck: bool
         )
 
     metadata = read_episode_metadata(ep_dir)
-    if not force_recheck and bool(metadata.get(CHECK_PASSED_KEY, False)):
+    marker_version = metadata.get(CHECKER_VERSION_KEY)
+    if (
+        not force_recheck
+        and bool(metadata.get(CHECK_PASSED_KEY, False))
+        and marker_version == CHECKER_VERSION
+    ):
         n_frames = int(metadata.get("n_frames", 0) or 0)
         task = metadata.get("task")
         metrics["task"] = task

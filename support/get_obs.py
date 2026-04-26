@@ -324,6 +324,9 @@ class CameraPair:
                 if all(frame is not None for frame in self._latest_frames.values()):
                     return
             time.sleep(0.05)
+        with self._lock:
+            missing = sorted(role for role, frame in self._latest_frames.items() if frame is None)
+        raise RuntimeError(f"camera frames not ready: {missing}")
 
     def grab(self) -> tuple[np.ndarray, np.ndarray]:
         with self._lock:

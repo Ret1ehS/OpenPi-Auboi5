@@ -1514,55 +1514,78 @@ def main() -> int:
         print(f"Starting inference loop with prompt: \"{prompt}\"")
         print(f"  Execute={execute}  PoseFrame={get_alignment_mode()}")
         print("  Press Ctrl+C to stop.\n")
-        _append_infer_log(
-            {
-                "event": "session_start",
-                "prompt": prompt,
-                "execute": bool(execute),
-                "pose_frame": str(get_alignment_mode()),
-                "speed_mode": str(cfg.speed_mode),
-                "exec_speed_mps": None if cfg.speed_mode == "native" else float(cfg.exec_speed_mps),
-            }
-        )
-
-        policy.reset()
-        if not executor.stop_streaming_and_reset():
-            print("  Warning: executor did not confirm servo stop before auto-init.")
-        task_observer.begin_session(prompt)
-
-        if execute:
-            print("Auto-init: aligning joints...")
-            align_result = move_to_joint_positions(initial_qpos_rad, execute=True)
-            print(f"  Auto-init align: ok={align_result.ok}, reason={align_result.reason}")
-            if not align_result.ok:
-                print("  Auto-init align failed; stopping residual motion and retrying once...")
-                if not executor.stop_streaming_and_reset(timeout=max(EXECUTOR_STOP_WAIT_S, 3.0)):
-                    print("  Warning: executor did not fully confirm servo stop before auto-init retry.")
-                align_result = move_to_joint_positions(initial_qpos_rad, execute=True)
-                print(f"  Auto-init retry: ok={align_result.ok}, reason={align_result.reason}")
-            if align_result.ok:
-                print("Auto-init: opening gripper...")
-                command_gripper_state(1, timeout_s=10.0)
-                _calibrate_alignment(pose_frame=cfg.pose_frame)
-            else:
-                clear_runtime_alignment()
-                print("  Auto-init aborted: pose alignment cleared because joint alignment failed.")
-                task_observer.end_session()
-                continue
-
-        if not execute and not is_alignment_ready():
-            _calibrate_alignment(pose_frame=cfg.pose_frame)
-
-        ensure_cameras_ready()
-        obs_builder.reset_pose_filter()
-        obs_builder.set_gripper_open_scalar(1.0)
         step = 0
         last_gripper_state: int | None = None
-
-        # --- Optional video recording (background thread) ---
         _rec_stop = threading.Event()
         _rec_thread = None
         video_path = None
+
+        try:
+            _append_infer_log(
+                {
+                    "event": "session_start",
+                    "prompt": prompt,
+                    "execute": bool(execute),
+                    "pose_frame": str(get_alignment_mode()),
+                    "speed_mode": str(cfg.speed_mode),
+                    "exec_speed_mps": None if cfg.speed_mode == "native" else float(cfg.exec_speed_mps),
+                }
+            )
+
+            policy.reset()
+            if not executor.stop_streaming_and_reset():
+                print("  Warning: executor did not confirm servo stop before auto-init.")
+            task_observer.begin_session(prompt)
+
+            if execute:
+                print("Auto-init: aligning joints...")
+                align_result = move_to_joint_positions(initial_qpos_rad, execute=True)
+                print(f"  Auto-init align: ok={align_result.ok}, reason={align_result.reason}")
+                if not align_result.ok:
+                    print("  Auto-init align failed; stopping residual motion and retrying once...")
+                    if not executor.stop_streaming_and_reset(timeout=max(EXECUTOR_STOP_WAIT_S, 3.0)):
+                        print("  Warning: executor did not fully confirm servo stop before auto-init retry.")
+                    align_result = move_to_joint_positions(initial_qpos_rad, execute=True)
+                    print(f"  Auto-init retry: ok={align_result.ok}, reason={align_result.reason}")
+                if align_result.ok:
+                    print("Auto-init: opening gripper...")
+                    command_gripper_state(1, timeout_s=10.0)
+                    _calibrate_alignment(pose_frame=cfg.pose_frame)
+                else:
+                    clear_runtime_alignment()
+                    print("  Auto-init aborted: pose alignment cleared because joint alignment failed.")
+                    task_observer.end_session()
+                    continue
+
+            if not execute and not is_alignment_ready():
+                _calibrate_alignment(pose_frame=cfg.pose_frame)
+
+            ensure_cameras_ready()
+            obs_builder.reset_pose_filter()
+            obs_builder.set_gripper_open_scalar(1.0)
+        except Exception as exc:
+            task_observer.end_session()
+            print(f"\n  Inference setup failed: {type(exc).__name__}: {exc}")
+            print("  Stopping in-flight trajectory...")
+            if not executor.stop_streaming_and_reset():
+                print("  Warning: executor did not confirm servo stop after setup error.")
+            try:
+                policy.reset()
+            except Exception as reset_exc:
+                print(f"  Policy reset after setup error failed: {reset_exc}")
+            _append_infer_log(
+                {
+                    "event": "session_stop",
+                    "prompt": prompt,
+                    "steps": int(step),
+                    "reason": "setup_exception",
+                    "exception_type": type(exc).__name__,
+                    "exception": str(exc),
+                }
+            )
+            continue
+
+        # --- Optional video recording (background thread) ---
         if cfg.record:
             import cv2
             captures_dir = OPENPI_ROOT / "captures"
@@ -1598,6 +1621,15 @@ def main() -> int:
 
             _rec_thread = threading.Thread(target=_record_loop, daemon=True)
             _rec_thread.start()
+
+        def _stop_recording_video() -> None:
+            nonlocal _rec_thread
+            if _rec_thread is None:
+                return
+            _rec_stop.set()
+            _rec_thread.join(timeout=3)
+            print(f"  Video saved: {video_path}")
+            _rec_thread = None
 
         def _apply_gripper_command(step_id: int, target_state: int) -> None:
             nonlocal last_gripper_state
@@ -1705,11 +1737,7 @@ def main() -> int:
                             "observer_reason": str(observer_result.reason),
                         }
                     )
-                    if _rec_thread is not None:
-                        _rec_stop.set()
-                        _rec_thread.join(timeout=3)
-                        print(f"  Video saved: {video_path}")
-                        _rec_thread = None
+                    _stop_recording_video()
                     print(f"\n  Inference stopped after {step} steps.")
                     break
 
@@ -2005,11 +2033,29 @@ def main() -> int:
                     "reason": "keyboard_interrupt",
                 }
             )
-            if _rec_thread is not None:
-                _rec_stop.set()
-                _rec_thread.join(timeout=3)
-                print(f"  Video saved: {video_path}")
-                _rec_thread = None
+            _stop_recording_video()
+            print(f"\n  Inference stopped after {step} steps.")
+        except Exception as exc:
+            task_observer.end_session()
+            print(f"\n  Inference failed: {type(exc).__name__}: {exc}")
+            print("  Stopping in-flight trajectory...")
+            if not executor.stop_streaming_and_reset():
+                print("  Warning: executor did not confirm servo stop after error.")
+            try:
+                policy.reset()
+            except Exception as reset_exc:
+                print(f"  Policy reset after error failed: {reset_exc}")
+            _append_infer_log(
+                {
+                    "event": "session_stop",
+                    "prompt": prompt,
+                    "steps": int(step),
+                    "reason": "exception",
+                    "exception_type": type(exc).__name__,
+                    "exception": str(exc),
+                }
+            )
+            _stop_recording_video()
             print(f"\n  Inference stopped after {step} steps.")
 
     task_observer.stop()

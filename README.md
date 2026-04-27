@@ -1,67 +1,64 @@
 # OpenPI-AUBO i5
 
-Robot-side scripts for running OpenPI on an AUBO i5 robot.
+这是 AUBO i5 机器人侧的 OpenPI 运行脚本仓库。
 
-This repository contains only the robot/runtime glue code. The OpenPI training
-repository, AUBO SDK, checkpoints, models, and device drivers are external
-dependencies configured through `config.yaml`.
+本仓库只放机器人运行、观测、策略加载和数据采集相关代码。OpenPI 训练仓库、AUBO SDK、checkpoint、模型和设备驱动都作为外部依赖，通过 `config.yaml` 配置。
 
-## What Is Here
+## 目录
 
-- `main.py`: online inference entrypoint.
-- `data/collect_data.py`: real-robot data collection.
-- `data/check_data.py`: collected episode inspection.
-- `data/convert_data.py`: dataset conversion helpers.
-- `support/get_obs.py`: camera capture and OpenPI observation building.
-- `support/load_policy.py`: local or remote policy loading.
-- `support/gripper_control.py`: gripper serial control.
-- `support/task_observer.py`: optional task-completion observer.
-- `task/`: task utilities and observer completion rules.
-- `tools/doctor.py`: environment/config sanity checks.
+- `main.py`: 在线推理入口。
+- `data/collect_data.py`: 真机数据采集。
+- `data/check_data.py`: episode 数据检查。
+- `data/convert_data.py`: 数据转换工具。
+- `support/get_obs.py`: 相机采集和 OpenPI observation 构建。
+- `support/load_policy.py`: 本地或远程策略加载。
+- `support/gripper_control.py`: 夹爪串口控制。
+- `support/task_observer.py`: 可选的任务完成判断。
+- `task/`: 任务工具和 observer 判断规则。
+- `tools/doctor.py`: 环境和配置检查。
 
-## Configuration
+## 配置
 
-Runtime config is loaded from root `config.yaml` by default.
+默认读取根目录 `config.yaml`。
 
-Use a private config file when running on another machine:
+如果要使用另一份本机私有配置：
 
 ```bash
 export OPENPI_CONFIG_FILE=/path/to/config.yaml
 ```
 
-Common fields to check:
+通常需要确认这些字段：
 
 - `OPENPI_RUNTIME_PYTHON`
 - `OPENPI_SDK_ROOT`
 - `OPENPI_ROBOT_IP`
 - `OPENPI_CHECKPOINT_DIR`
-- serial ports for the gripper and force sensor
-- policy backend/checkpoint settings
+- 夹爪和力传感器串口
+- 策略后端和 checkpoint 路径
 
-`OPENPI_ENV_FILE` is still accepted for old env-style files, but new setups
-should use `config.yaml`.
+旧的 `OPENPI_ENV_FILE` 仍然兼容，但新配置建议使用 `config.yaml`。
 
-## Quick Start
+## 快速开始
 
-Check the environment:
+检查环境：
 
 ```bash
 python3 tools/doctor.py
 ```
 
-Run online inference:
+运行在线推理：
 
 ```bash
 python3 main.py
 ```
 
-Collect real-robot data:
+采集真机数据：
 
 ```bash
 python3 data/collect_data.py
 ```
 
-Check collected data:
+检查采集数据：
 
 ```bash
 python3 data/check_data.py /path/to/dataset
@@ -69,11 +66,9 @@ python3 data/check_data.py /path/to/dataset
 
 ## Task Observer
 
-The task observer is optional. The robot can run inference and collect data
-without it.
+Task observer 是可选功能，不是运行必须项。即使关闭 observer，机器人仍然可以正常推理和采集数据。
 
-Enable it only when you want the system to periodically judge whether the
-current task is complete from camera images and robot state:
+只有在需要系统根据相机图像和机器人状态周期性判断任务是否完成时，才启用它：
 
 ```yaml
 env:
@@ -83,14 +78,13 @@ env:
   OPENPI_TASK_OBSERVER_SPEC_FILE: task/prompt.txt
 ```
 
-Observer completion rules live in `task/prompt.txt`.
+observer 的任务完成规则写在 `task/prompt.txt`。
 
-If the observer is disabled or misconfigured, keep it disabled and run the main
-robot workflow first.
+如果 observer 环境或模型还没配好，保持关闭即可，先跑通主流程。
 
-## Policy Modes
+## 策略模式
 
-Remote policy:
+远程策略：
 
 ```yaml
 env:
@@ -100,7 +94,7 @@ env:
   OPENPI_POLICY_REMOTE_PORT: 8000
 ```
 
-Local PyTorch policy:
+本地 PyTorch 策略：
 
 ```yaml
 env:
@@ -110,10 +104,9 @@ env:
   OPENPI_PYTORCH_DEVICE: cuda
 ```
 
-## Notes
+## 备注
 
-- `support/kubeconfig.yaml` is treated as local sensitive config and should not
-  be committed.
-- `docs/` and `tests/` are local-only by default.
-- Use `tools/doctor.py --section runtime` or `tools/doctor.py --section observer`
-  for narrower checks.
+- `support/kubeconfig.yaml` 属于本机敏感配置，不应提交。
+- `docs/` 和 `tests/` 默认只作为本地目录使用。
+- 只检查主运行环境：`python3 tools/doctor.py --section runtime`。
+- 只检查 observer 环境：`python3 tools/doctor.py --section observer`。

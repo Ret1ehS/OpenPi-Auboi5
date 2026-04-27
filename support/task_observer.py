@@ -50,6 +50,8 @@ class TaskObserverConfig:
         spec_file = os.environ.get('OPENPI_TASK_OBSERVER_SPEC_FILE', '').strip()
         if not task_spec and spec_file:
             spec_path = Path(spec_file).expanduser()
+            if not spec_path.is_absolute():
+                spec_path = SCRIPTS_ROOT / spec_path
             if spec_path.exists():
                 task_spec = spec_path.read_text(encoding='utf-8').strip()
         python_bin = Path(os.environ.get('OPENPI_TASK_OBSERVER_PYTHON', str(_DEFAULT_PYTHON))).expanduser()

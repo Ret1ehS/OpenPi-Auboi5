@@ -35,7 +35,6 @@ _REPO_IMPORT_ROOT = SCRIPT_DIR.parent
 if str(_REPO_IMPORT_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_IMPORT_ROOT))
 
-import numpy as np
 from utils.env_utils import load_default_env
 from utils.path_utils import get_openpi_root, get_repo_root
 
@@ -44,6 +43,35 @@ load_default_env()
 OPENPI_ROOT = get_openpi_root()
 REPO_ROOT = get_repo_root()
 REPO_VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
+OPENPI_CONDA_PYTHON = OPENPI_ROOT / "miniforge3" / "envs" / "openpi-py311" / "bin" / "python"
+
+
+def _select_runtime_python() -> Path:
+    explicit = os.environ.get("OPENPI_RUNTIME_PYTHON", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    if OPENPI_CONDA_PYTHON.exists():
+        return OPENPI_CONDA_PYTHON
+    return REPO_VENV_PYTHON
+
+
+def _maybe_reexec_into_repo_venv() -> None:
+    target = _select_runtime_python()
+    if not target.exists():
+        return
+    try:
+        current = Path(sys.executable).resolve()
+        desired = target.resolve()
+        if current == desired:
+            return
+    except Exception:
+        desired = target
+    os.execv(str(target), [str(target), *sys.argv])
+
+
+_maybe_reexec_into_repo_venv()
+
+import numpy as np
 
 
 # ---------------------------------------------------------------------------
@@ -86,20 +114,6 @@ DEFAULT_YAW_HOME_RAD = 0.11434
 DEFAULT_YAW_EXEC_TOL_RAD = float(np.deg2rad(1.0))
 ROTATE_ABS_DEG_MIN = 12.0
 ROTATE_ABS_DEG_MAX = 22.5
-
-
-def _maybe_reexec_into_repo_venv() -> None:
-    target = REPO_VENV_PYTHON
-    if not target.exists():
-        return
-    try:
-        current = Path(sys.executable).resolve()
-        desired = target.resolve()
-        if current == desired:
-            return
-    except Exception:
-        desired = target
-    os.execv(str(target), [str(target), *sys.argv])
 
 
 from support.get_obs import (
@@ -1521,8 +1535,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    _maybe_reexec_into_repo_venv()
-
     from support.gripper_control import command_gripper_state
     from support.joint_control import build_joint_helper, move_to_joint_positions
     from support.pose_align import (

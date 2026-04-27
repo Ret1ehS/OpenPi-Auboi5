@@ -418,7 +418,7 @@ class TaskCompletionObserver:
             parts.append(f'gripper_contact_or_holding={contact}')
             if snapshot.gripper_contact_or_holding:
                 parts.append(
-                    'gripper_contact_or_holding means a close command stopped stably on an object'
+                    'gripper_contact_or_holding=true is serial evidence that a close command stopped stably on an object; for pick tasks, if the requested object is visible at, touching, or partly inside the gripper, answer complete=true even when the image looks like the object is merely near the gripper'
                 )
         return '; '.join(parts)
 
@@ -469,6 +469,9 @@ def worker_main(argv: list[str] | None = None) -> int:
             user_text = (
                 'You are a robot task completion observer. '
                 'Decide whether the current task is already complete from the images and context.\n\n'
+                'Use the robot state summary as sensor evidence. '
+                'For pick tasks, gripper_contact_or_holding=true can resolve visual ambiguity: '
+                'if the requested object is visible at, touching, or partly inside the gripper, treat it as held.\n\n'
                 f'Task prompt:\n{task_prompt}\n\n'
                 f'Completion rules:\n{task_spec or "Use the task prompt and visible scene to judge completion. If unsure, return complete=false."}\n\n'
                 f'Robot state summary:\n{state_summary}\n\n'

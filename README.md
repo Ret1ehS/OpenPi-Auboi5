@@ -1,151 +1,119 @@
-# OpenPI-AUBO i5 Scripts
+# OpenPI-AUBO i5
 
-这个仓库只包含机器人侧脚本，负责：
+Robot-side scripts for running OpenPI on an AUBO i5 robot.
 
-- 在线推理执行
-- 真机数据采集
-- 观测构建
-- AUBO 控制辅助逻辑
-- 任务完成判断
+This repository contains only the robot/runtime glue code. The OpenPI training
+repository, AUBO SDK, checkpoints, models, and device drivers are external
+dependencies configured through `config.yaml`.
 
-默认目录形态：
+## What Is Here
 
-```text
-openpi/
-├─ repo/            # OpenPI 主仓库
-├─ OpenPi-Auboi5/   # 当前仓库
-├─ aubo_sdk/
-└─ captures/
+- `main.py`: online inference entrypoint.
+- `data/collect_data.py`: real-robot data collection.
+- `data/check_data.py`: collected episode inspection.
+- `data/convert_data.py`: dataset conversion helpers.
+- `support/get_obs.py`: camera capture and OpenPI observation building.
+- `support/load_policy.py`: local or remote policy loading.
+- `support/gripper_control.py`: gripper serial control.
+- `support/task_observer.py`: optional task-completion observer.
+- `task/`: task utilities and observer completion rules.
+- `tools/doctor.py`: environment/config sanity checks.
+
+## Configuration
+
+Runtime config is loaded from root `config.yaml` by default.
+
+Use a private config file when running on another machine:
+
+```bash
+export OPENPI_CONFIG_FILE=/path/to/config.yaml
 ```
 
-## 仓库结构
-
-```text
-OpenPi-Auboi5/
-├─ config           # 根目录单文件配置
-├─ tools/
-├─ utils/
-├─ support/
-├─ task/
-├─ data/
-├─ main.py
-└─ collect_data.py
-```
-
-`utils/` 放环境、路径和通用工具。  
-`support/` 放机器人控制、策略加载、观测、TUI 和 observer 相关逻辑。
-
-## 快速开始
-
-1. 直接编辑根目录 `config`
-
-至少确认这些字段：
+Common fields to check:
 
 - `OPENPI_RUNTIME_PYTHON`
 - `OPENPI_SDK_ROOT`
 - `OPENPI_ROBOT_IP`
 - `OPENPI_CHECKPOINT_DIR`
-- `OPENPI_TASK_OBSERVER_PYTHON`
-- `OPENPI_TASK_OBSERVER_MODEL`
-- 串口相关配置
+- serial ports for the gripper and force sensor
+- policy backend/checkpoint settings
 
-2. 运行环境检查：
+`OPENPI_ENV_FILE` is still accepted for old env-style files, but new setups
+should use `config.yaml`.
+
+## Quick Start
+
+Check the environment:
 
 ```bash
 python3 tools/doctor.py
 ```
 
-只检查主运行环境：
-
-```bash
-python3 tools/doctor.py --section runtime
-```
-
-只检查 observer 环境：
-
-```bash
-python3 tools/doctor.py --section observer
-```
-
-3. 启动在线推理：
+Run online inference:
 
 ```bash
 python3 main.py
 ```
 
-4. 启动数据采集：
+Collect real-robot data:
 
 ```bash
-python3 collect_data.py
+python3 data/collect_data.py
 ```
 
-## 配置加载规则
+Check collected data:
 
-默认按下面顺序加载配置：
+```bash
+python3 data/check_data.py /path/to/dataset
+```
 
-1. `OPENPI_ENV_FILE` 指向的显式文件
-2. 仓库根目录下的 `config`
+## Task Observer
 
-现在不再使用 `config/` 目录存放 `.env` 模板。
+The task observer is optional. The robot can run inference and collect data
+without it.
 
-## 环境依赖
+Enable it only when you want the system to periodically judge whether the
+current task is complete from camera images and robot state:
 
-这个仓库不是完整单仓环境，运行前仍需要准备外部依赖。
+```yaml
+env:
+  OPENPI_TASK_OBSERVER_ENABLE: true
+  OPENPI_TASK_OBSERVER_PYTHON: /path/to/observer/python
+  OPENPI_TASK_OBSERVER_MODEL: /path/to/gemma/model
+  OPENPI_TASK_OBSERVER_SPEC_FILE: task/prompt.txt
+```
 
-### 目录依赖
+Observer completion rules live in `task/prompt.txt`.
 
-默认要求以下目录与当前仓库并列存在：
+If the observer is disabled or misconfigured, keep it disabled and run the main
+robot workflow first.
 
-- `../repo`
-- `../aubo_sdk`
+## Policy Modes
 
-### Python 环境
+Remote policy:
 
-推荐两套 Python：
+```yaml
+env:
+  OPENPI_POLICY_BACKEND: auto
+  OPENPI_K8S_NAMESPACE: ...
+  OPENPI_POLICY_LOCAL_PORT: 8000
+  OPENPI_POLICY_REMOTE_PORT: 8000
+```
 
-- OpenPI 主环境  
-  由 `OPENPI_RUNTIME_PYTHON` 指向
-- Observer / Gemma 环境  
-  由 `OPENPI_TASK_OBSERVER_PYTHON` 指向
+Local PyTorch policy:
 
-本地 PyTorch worker 也可以单独用一套环境，由 `OPENPI_PYTORCH_RUNTIME_PYTHON` 指向。
+```yaml
+env:
+  OPENPI_POLICY_BACKEND: pytorch
+  OPENPI_PYTORCH_RUNTIME_PYTHON: /path/to/torch/python
+  OPENPI_PYTORCH_CHECKPOINT_DIR: /path/to/pytorch/checkpoint
+  OPENPI_PYTORCH_DEVICE: cuda
+```
 
-### 系统和设备依赖
+## Notes
 
-运行前通常还需要：
-
-- Jetson + JetPack / CUDA
-- AUBO SDK
-- Orbbec Python SDK
-- 串口设备
-- Gemma 模型目录
-
-`tools/doctor.py` 会尽量提前暴露缺项，但不替代系统层安装。
-
-## 主要入口
-
-- `main.py`: 在线推理执行入口
-- `collect_data.py`: 真机数据采集入口
-- `support/load_policy.py`: 本地 / 远端策略统一加载
-- `support/get_obs.py`: 观测构建
-- `support/task_observer.py`: 任务完成判断
-
-## PyTorch Local Backend
-
-本地 PyTorch 推理当前通过独立 worker 进程运行：
-
-- 主进程继续负责相机、机器人和主控制逻辑
-- PyTorch policy worker 运行在 `OPENPI_PYTORCH_RUNTIME_PYTHON` 指向的环境
-- worker 环境需要能加载 CUDA Torch 和转换后的 `model.safetensors`
-
-常用变量：
-
-- `OPENPI_POLICY_BACKEND=pytorch`
-- `OPENPI_PYTORCH_CHECKPOINT_DIR=...`
-- `OPENPI_PYTORCH_RUNTIME_PYTHON=/home/niic/openpi/miniforge3/envs/openpi-py310-torch/bin/python`
-- `OPENPI_PYTORCH_DEVICE=cuda`
-- `OPENPI_SAMPLE_NUM_STEPS=5`
-
-## 兼容说明
-
-- `support/kubeconfig.yaml` 按敏感文件处理，默认不纳入 git
+- `support/kubeconfig.yaml` is treated as local sensitive config and should not
+  be committed.
+- `docs/` and `tests/` are local-only by default.
+- Use `tools/doctor.py --section runtime` or `tools/doctor.py --section observer`
+  for narrower checks.

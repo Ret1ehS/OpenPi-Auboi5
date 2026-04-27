@@ -1266,7 +1266,7 @@ def save_episode(
         "timestamp_mode": "env_step_times_control_dt",
         "timestamps_file": "timestamps.npy",
         "env_steps_file": "env_steps.npy",
-        "state_dim": len(state_schema),
+        "state_dim": len(state_names),
         "action_dim": 7,
         "state_schema": state_names,
         "action_schema": action_names,

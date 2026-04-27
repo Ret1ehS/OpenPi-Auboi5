@@ -1585,43 +1585,6 @@ def main() -> int:
             )
             continue
 
-        # --- Optional video recording (background thread) ---
-        if cfg.record:
-            import cv2
-            captures_dir = OPENPI_ROOT / "captures"
-            captures_dir.mkdir(parents=True, exist_ok=True)
-            timestamp_str = time.strftime("%Y%m%d_%H%M%S")
-            video_path = captures_dir / f"inference_{timestamp_str}.mp4"
-
-            def _record_loop():
-                writer = None
-                while not _rec_stop.is_set():
-                    try:
-                        main_bgr, wrist_bgr = obs_builder.grab_bgr_pair()
-                        if main_bgr is None or wrist_bgr is None:
-                            time.sleep(0.05)
-                            continue
-                        h, w = main_bgr.shape[:2]
-                        wh, ww = wrist_bgr.shape[:2]
-                        if wh != h:
-                            scale = h / wh
-                            wrist_bgr = cv2.resize(wrist_bgr, (int(ww * scale), h))
-                        concat = np.concatenate([main_bgr, wrist_bgr], axis=1)
-                        if writer is None:
-                            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                            writer = cv2.VideoWriter(str(video_path), fourcc, 15.0,
-                                                     (concat.shape[1], concat.shape[0]))
-                            print(f"  Recording video to {video_path}")
-                        writer.write(concat)
-                    except Exception:
-                        pass
-                    _rec_stop.wait(timeout=1.0 / 15.0)  # ~15 FPS
-                if writer is not None:
-                    writer.release()
-
-            _rec_thread = threading.Thread(target=_record_loop, daemon=True)
-            _rec_thread.start()
-
         def _stop_recording_video() -> None:
             nonlocal _rec_thread
             if _rec_thread is None:
@@ -1630,6 +1593,66 @@ def main() -> int:
             _rec_thread.join(timeout=3)
             print(f"  Video saved: {video_path}")
             _rec_thread = None
+
+        # --- Optional video recording (background thread) ---
+        try:
+            if cfg.record:
+                import cv2
+                captures_dir = OPENPI_ROOT / "captures"
+                captures_dir.mkdir(parents=True, exist_ok=True)
+                timestamp_str = time.strftime("%Y%m%d_%H%M%S")
+                video_path = captures_dir / f"inference_{timestamp_str}.mp4"
+
+                def _record_loop():
+                    writer = None
+                    while not _rec_stop.is_set():
+                        try:
+                            main_bgr, wrist_bgr = obs_builder.grab_bgr_pair()
+                            if main_bgr is None or wrist_bgr is None:
+                                time.sleep(0.05)
+                                continue
+                            h, w = main_bgr.shape[:2]
+                            wh, ww = wrist_bgr.shape[:2]
+                            if wh != h:
+                                scale = h / wh
+                                wrist_bgr = cv2.resize(wrist_bgr, (int(ww * scale), h))
+                            concat = np.concatenate([main_bgr, wrist_bgr], axis=1)
+                            if writer is None:
+                                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                                writer = cv2.VideoWriter(str(video_path), fourcc, 15.0,
+                                                         (concat.shape[1], concat.shape[0]))
+                                print(f"  Recording video to {video_path}")
+                            writer.write(concat)
+                        except Exception:
+                            pass
+                        _rec_stop.wait(timeout=1.0 / 15.0)  # ~15 FPS
+                    if writer is not None:
+                        writer.release()
+
+                _rec_thread = threading.Thread(target=_record_loop, daemon=True)
+                _rec_thread.start()
+        except Exception as exc:
+            task_observer.end_session()
+            print(f"\n  Recording setup failed: {type(exc).__name__}: {exc}")
+            print("  Stopping in-flight trajectory...")
+            if not executor.stop_streaming_and_reset():
+                print("  Warning: executor did not confirm servo stop after recording setup error.")
+            try:
+                policy.reset()
+            except Exception as reset_exc:
+                print(f"  Policy reset after recording setup error failed: {reset_exc}")
+            _append_infer_log(
+                {
+                    "event": "session_stop",
+                    "prompt": prompt,
+                    "steps": int(step),
+                    "reason": "recording_setup_exception",
+                    "exception_type": type(exc).__name__,
+                    "exception": str(exc),
+                }
+            )
+            _stop_recording_video()
+            continue
 
         def _apply_gripper_command(step_id: int, target_state: int) -> None:
             nonlocal last_gripper_state

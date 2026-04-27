@@ -332,8 +332,15 @@ class CameraPair:
         with self._lock:
             main = self._latest_frames["main"]
             wrist = self._latest_frames["wrist"]
-            main_img = (self._fallback_frame if main is None else main).copy()
-            wrist_img = (self._fallback_frame if wrist is None else wrist).copy()
+            missing = sorted(
+                role
+                for role, frame in (("main", main), ("wrist", wrist))
+                if frame is None
+            )
+            if missing:
+                raise RuntimeError(f"camera frames unavailable: {missing}")
+            main_img = main.copy()
+            wrist_img = wrist.copy()
         return main_img, wrist_img
 
     def stop(self) -> None:

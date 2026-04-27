@@ -29,12 +29,12 @@ def _env_int(name: str, default: int) -> int:
     return int(raw)
 
 
-def _env_path(name: str, default: Path, *, base: Path | None = None) -> Path:
+def _env_path(name: str, default: Path, *, base: Path | None = None, resolve: bool = True) -> Path:
     raw = os.environ.get(name, "").strip()
     path = Path(raw).expanduser() if raw else Path(default)
     if not path.is_absolute() and base is not None:
         path = base / path
-    return path.resolve()
+    return path.resolve() if resolve else path
 
 
 def _checkpoint_export_ready(path: Path) -> bool:
@@ -113,6 +113,7 @@ DEFAULT_OBSERVER_PYTHON = _env_path(
     "OPENPI_TASK_OBSERVER_PYTHON",
     Path("venvs") / "vllm-jp62-clean" / "bin" / "python",
     base=get_openpi_root(),
+    resolve=False,
 )
 DEFAULT_OBSERVER_MODEL = _env_path(
     "OPENPI_TASK_OBSERVER_MODEL",

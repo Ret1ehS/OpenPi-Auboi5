@@ -163,6 +163,7 @@ class TaskCompletionObserver:
         self._stderr_fh = open(self._config.log_path, 'a', encoding='utf-8')
         env = dict(os.environ)
         env['PYTHONUNBUFFERED'] = '1'
+        env['PYTHONNOUSERSITE'] = '1'
         self._proc = subprocess.Popen(
             [
                 str(self._config.python_bin),

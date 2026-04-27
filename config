@@ -62,11 +62,11 @@ OPENPI_KUBECONFIG=support/kubeconfig.yaml
 # Task observer
 OPENPI_TASK_OBSERVER_ENABLE=false
 OPENPI_TASK_OBSERVER_INTERVAL_S=5.0
-OPENPI_TASK_OBSERVER_PYTHON=/home/niic/openpi/venvs/vllm-jp62-clean/bin/python
-OPENPI_TASK_OBSERVER_MODEL=/home/niic/openpi/modelscope_models/google/gemma-4-E2B-it
+OPENPI_TASK_OBSERVER_PYTHON=/home/niic/venvs/vllm-jp62-clean/bin/python
+OPENPI_TASK_OBSERVER_MODEL=/home/niic/modelscope_models/google/gemma-4-E2B-it
 OPENPI_TASK_OBSERVER_MAX_NEW_TOKENS=96
 # OPENPI_TASK_OBSERVER_SPEC=
-# OPENPI_TASK_OBSERVER_SPEC_FILE=
+# OPENPI_TASK_OBSERVER_SPEC_FILE=prompts/task_observer/pick_up_blue_cube.txt
 
 # Remote keyboard relay
 OPENPI_REMOTE_KEYBOARD_TCP_PORT=28731

@@ -1,0 +1,7 @@
+Task: pick up the blue cube.
+
+Mark complete=true only when the blue cube is visibly grasped by the robot gripper or clearly lifted off the table by the robot.
+
+Mark complete=false when the blue cube is merely visible on the table, near the gripper, partially occluded, or when the gripper is open and not holding it.
+
+If the images are ambiguous, the cube is not visible, or you cannot tell whether the robot is holding the blue cube, return complete=false.

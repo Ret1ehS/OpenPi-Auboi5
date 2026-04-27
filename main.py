@@ -1190,7 +1190,7 @@ def main() -> int:
     from support.gripper_control import (
         command_gripper_state,
         get_gripper_status,
-        gripper_status_to_openpi_state,
+        infer_gripper_observation_state,
     )
     from support.joint_control import build_joint_helper, move_to_joint_positions
     from support.load_policy import PolicyLoadSpec, load_policy
@@ -1398,6 +1398,28 @@ def main() -> int:
     obs_builder = RealRobotOpenPIObservationBuilder(state_mode=obs_state_mode)
     cameras_ready = False
 
+    def _cache_gripper_status_for_observation(status) -> int | None:
+        observed_state, contact_or_holding = infer_gripper_observation_state(status)
+        obs_builder.set_gripper_readback(
+            position=status.position,
+            done=status.done,
+            unhomed=status.unhomed,
+            contact_or_holding=contact_or_holding,
+        )
+        if observed_state is not None:
+            obs_builder.set_gripper_open_scalar(float(observed_state))
+        return observed_state
+
+    def _refresh_gripper_observation_cache(*, step_id: int | None = None) -> int | None:
+        try:
+            return _cache_gripper_status_for_observation(get_gripper_status())
+        except Exception as exc:
+            if step_id is None:
+                print(f"  Gripper readback failed: {exc}")
+            else:
+                print(f"  [{step_id:4d}] Gripper readback failed: {exc}")
+            return None
+
     def ensure_cameras_ready() -> None:
         nonlocal cameras_ready
         if cameras_ready:
@@ -1487,6 +1509,10 @@ def main() -> int:
                 print("Opening gripper...")
                 ok = command_gripper_state(1, timeout_s=10.0)
                 print(f"  Gripper opened: {ok}")
+                observed_state = _refresh_gripper_observation_cache()
+                if observed_state is None and ok:
+                    obs_builder.set_gripper_open_scalar(1.0)
+                    obs_builder.set_gripper_readback(contact_or_holding=False)
             else:
                 print("  Skipped (dry-run)")
             continue
@@ -1496,6 +1522,10 @@ def main() -> int:
                 print("Closing gripper...")
                 ok = command_gripper_state(0, timeout_s=10.0)
                 print(f"  Gripper closed: {ok}")
+                observed_state = _refresh_gripper_observation_cache()
+                if observed_state is None and ok:
+                    obs_builder.set_gripper_open_scalar(0.0)
+                    obs_builder.set_gripper_readback(contact_or_holding=None)
             else:
                 print("  Skipped (dry-run)")
             continue
@@ -1549,7 +1579,11 @@ def main() -> int:
                     print(f"  Auto-init retry: ok={align_result.ok}, reason={align_result.reason}")
                 if align_result.ok:
                     print("Auto-init: opening gripper...")
-                    command_gripper_state(1, timeout_s=10.0)
+                    open_ok = command_gripper_state(1, timeout_s=10.0)
+                    observed_state = _refresh_gripper_observation_cache()
+                    if observed_state is None and open_ok:
+                        obs_builder.set_gripper_open_scalar(1.0)
+                        obs_builder.set_gripper_readback(contact_or_holding=False)
                     _calibrate_alignment(pose_frame=cfg.pose_frame)
                 else:
                     clear_runtime_alignment()
@@ -1562,7 +1596,10 @@ def main() -> int:
 
             ensure_cameras_ready()
             obs_builder.reset_pose_filter()
-            obs_builder.set_gripper_open_scalar(1.0)
+            observed_state = _refresh_gripper_observation_cache()
+            if observed_state is None:
+                obs_builder.set_gripper_open_scalar(1.0)
+                obs_builder.set_gripper_readback(contact_or_holding=None)
         except Exception as exc:
             task_observer.end_session()
             print(f"\n  Inference setup failed: {type(exc).__name__}: {exc}")
@@ -1669,18 +1706,18 @@ def main() -> int:
             )
             print(f"  [{step_id:4d}] Gripper {state_name}: {'ok' if ok else 'FAIL'}")
             if ok:
-                obs_builder.set_gripper_open_scalar(float(target_state))
-                last_gripper_state = target_state
+                observed_state = _refresh_gripper_observation_cache(step_id=step_id)
+                if observed_state is None:
+                    obs_builder.set_gripper_open_scalar(float(target_state))
+                    obs_builder.set_gripper_readback(contact_or_holding=None)
+                    last_gripper_state = target_state
+                else:
+                    last_gripper_state = observed_state
                 return
 
-            corrected_state = None
-            try:
-                corrected_state = gripper_status_to_openpi_state(get_gripper_status())
-            except Exception as exc:
-                print(f"  [{step_id:4d}] Gripper readback failed: {exc}")
+            corrected_state = _refresh_gripper_observation_cache(step_id=step_id)
             if corrected_state is not None:
                 corrected_name = "open" if corrected_state == 1 else "close"
-                obs_builder.set_gripper_open_scalar(float(corrected_state))
                 last_gripper_state = corrected_state
                 print(f"  [{step_id:4d}] Gripper cache corrected from serial: {corrected_name}")
             else:

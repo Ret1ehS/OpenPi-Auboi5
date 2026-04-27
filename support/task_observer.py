@@ -85,6 +85,10 @@ class _Snapshot:
     yaw_readback_scalar: float | None
     main_bgr: np.ndarray
     wrist_bgr: np.ndarray
+    gripper_readback_position: int | None = None
+    gripper_done: int | None = None
+    gripper_unhomed: int | None = None
+    gripper_contact_or_holding: bool | None = None
 
 
 def _extract_json(text: str) -> dict[str, object] | None:
@@ -241,6 +245,22 @@ class TaskCompletionObserver:
             yaw_readback_scalar=None if aligned_obs.yaw_readback_scalar is None else float(aligned_obs.yaw_readback_scalar),
             main_bgr=np.asarray(aligned_obs.main_frame.image_bgr).copy(),
             wrist_bgr=np.asarray(aligned_obs.wrist_frame.image_bgr).copy(),
+            gripper_readback_position=(
+                None
+                if getattr(aligned_obs, 'gripper_readback_position', None) is None
+                else int(getattr(aligned_obs, 'gripper_readback_position'))
+            ),
+            gripper_done=None if getattr(aligned_obs, 'gripper_done', None) is None else int(getattr(aligned_obs, 'gripper_done')),
+            gripper_unhomed=(
+                None
+                if getattr(aligned_obs, 'gripper_unhomed', None) is None
+                else int(getattr(aligned_obs, 'gripper_unhomed'))
+            ),
+            gripper_contact_or_holding=(
+                None
+                if getattr(aligned_obs, 'gripper_contact_or_holding', None) is None
+                else bool(getattr(aligned_obs, 'gripper_contact_or_holding'))
+            ),
         )
         with self._lock:
             if self._session_active:
@@ -381,12 +401,26 @@ class TaskCompletionObserver:
     def _build_state_summary(snapshot: _Snapshot) -> str:
         pose = [round(float(v), 4) for v in snapshot.tcp_pose_sim.tolist()]
         yaw_str = 'none' if snapshot.yaw_readback_scalar is None else f'{float(snapshot.yaw_readback_scalar):.4f}'
-        return (
-            f'step={snapshot.step}; '
-            f'gripper_open_scalar={snapshot.gripper_open_scalar:.3f}; '
-            f'yaw_readback={yaw_str}; '
-            f'tcp_pose_sim={pose}'
-        )
+        parts = [
+            f'step={snapshot.step}',
+            f'gripper_open_scalar={snapshot.gripper_open_scalar:.3f}',
+            f'yaw_readback={yaw_str}',
+            f'tcp_pose_sim={pose}',
+        ]
+        if snapshot.gripper_readback_position is not None:
+            parts.append(f'gripper_readback_position={snapshot.gripper_readback_position}')
+        if snapshot.gripper_done is not None:
+            parts.append(f'gripper_done={snapshot.gripper_done}')
+        if snapshot.gripper_unhomed is not None:
+            parts.append(f'gripper_unhomed={snapshot.gripper_unhomed}')
+        if snapshot.gripper_contact_or_holding is not None:
+            contact = 'true' if snapshot.gripper_contact_or_holding else 'false'
+            parts.append(f'gripper_contact_or_holding={contact}')
+            if snapshot.gripper_contact_or_holding:
+                parts.append(
+                    'gripper_contact_or_holding means a close command stopped stably on an object'
+                )
+        return '; '.join(parts)
 
 
 def worker_main(argv: list[str] | None = None) -> int:

@@ -365,6 +365,36 @@ def gripper_status_to_openpi_state(
     return None
 
 
+def infer_gripper_observation_state(
+    status: GripperStatus,
+    *,
+    position_tol: int = DEFAULT_POSITION_TOL,
+) -> tuple[int | None, bool | None]:
+    """Infer the state that should be exposed to policy/observer snapshots.
+
+    ``gripper_status_to_openpi_state`` intentionally only maps fully-open or
+    fully-closed positions. For observations, a close command can legitimately
+    stop at an intermediate, stable position when the fingers are holding an
+    object. The second return value marks that contact/holding case.
+    """
+    if status.unhomed not in (0, None) and int(status.unhomed) != 0:
+        return None, None
+
+    mapped = gripper_status_to_openpi_state(status, position_tol=position_tol)
+    if mapped is not None:
+        return mapped, False
+
+    if status.position is None:
+        return None, None
+    if status.done not in (1, None) and int(status.done) != 1:
+        return None, None
+
+    pos = int(status.position)
+    if pos < TARGET_OPEN - int(position_tol):
+        return OPENPI_CLOSE, True
+    return None, None
+
+
 def is_gripper_at_state(
     target_state: int,
     status: GripperStatus,
@@ -631,6 +661,7 @@ __all__ = [
     "ensure_tool_power_enabled",
     "get_gripper_status",
     "gripper_status_to_openpi_state",
+    "infer_gripper_observation_state",
     "is_gripper_at_state",
     "wait_gripper_done",
     "set_gripper_state",

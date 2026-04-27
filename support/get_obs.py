@@ -137,6 +137,10 @@ class AlignedObservation:
     main_frame: TimedFrame
     wrist_frame: TimedFrame
     image_pair_system_diff_us: int
+    gripper_readback_position: int | None = None
+    gripper_done: int | None = None
+    gripper_unhomed: int | None = None
+    gripper_contact_or_holding: bool | None = None
 
 
 def preprocess_image_for_openpi(image_bgr: np.ndarray, *, size: int = OPENPI_IMAGE_SIZE) -> np.ndarray:
@@ -363,6 +367,10 @@ class RealRobotOpenPIObservationBuilder:
         self._pool = ThreadPoolExecutor(max_workers=6)
         # Observation path uses the local cache as the authoritative gripper state.
         self._gripper_open_scalar: float = 1.0  # default: open
+        self._gripper_readback_position: int | None = None
+        self._gripper_done: int | None = None
+        self._gripper_unhomed: int | None = None
+        self._gripper_contact_or_holding: bool | None = None
         self.set_state_mode(state_mode)
 
     def _apply_camera_profile(self, role: str, dev) -> None:
@@ -371,6 +379,20 @@ class RealRobotOpenPIObservationBuilder:
     def set_gripper_open_scalar(self, value: float) -> None:
         """Update the locally-cached fallback gripper scalar (1.0=open, 0.0=closed)."""
         self._gripper_open_scalar = float(value)
+
+    def set_gripper_readback(
+        self,
+        *,
+        position: int | None = None,
+        done: int | None = None,
+        unhomed: int | None = None,
+        contact_or_holding: bool | None = None,
+    ) -> None:
+        """Attach raw gripper readback metadata to subsequent observations."""
+        self._gripper_readback_position = None if position is None else int(position)
+        self._gripper_done = None if done is None else int(done)
+        self._gripper_unhomed = None if unhomed is None else int(unhomed)
+        self._gripper_contact_or_holding = None if contact_or_holding is None else bool(contact_or_holding)
 
     def set_semantic_yaw_scalar(self, value: float | None) -> None:
         _ = value
@@ -533,6 +555,10 @@ class RealRobotOpenPIObservationBuilder:
         wrist_image = fut_wrist_img.result()
 
         gripper_open = self._gripper_open_scalar
+        gripper_readback_position = self._gripper_readback_position
+        gripper_done = self._gripper_done
+        gripper_unhomed = self._gripper_unhomed
+        gripper_contact_or_holding = self._gripper_contact_or_holding
 
         # Snapshot: should already be done (launched before camera capture).
         robot_snapshot = fut_snapshot.result()
@@ -565,6 +591,10 @@ class RealRobotOpenPIObservationBuilder:
             main_frame=main_frame,
             wrist_frame=wrist_frame,
             image_pair_system_diff_us=pair_diff_us,
+            gripper_readback_position=gripper_readback_position,
+            gripper_done=gripper_done,
+            gripper_unhomed=gripper_unhomed,
+            gripper_contact_or_holding=gripper_contact_or_holding,
         )
 
 

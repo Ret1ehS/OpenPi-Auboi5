@@ -32,6 +32,11 @@ UNIQUE_RATIO_WARN = 0.90
 UNIQUE_RATIO_FAIL = 0.75
 DUPLICATE_RUN_WARN = 5
 DUPLICATE_RUN_FAIL = 10
+GLOBAL_NEAR_DUPLICATE_POS_TOL_M = 5e-4
+GLOBAL_NEAR_DUPLICATE_ORI_TOL = 2e-3
+GLOBAL_NEAR_DUPLICATE_GRIP_TOL = 1e-6
+GLOBAL_NEAR_DUPLICATE_IMAGE_MAD = 1.5
+GLOBAL_NEAR_DUPLICATE_MAX_REPORTS = 10
 TIMESTAMP_GRID_WARN_S = 1e-4
 TIMESTAMP_GRID_FAIL_S = 1e-3
 QUAT_NORM_WARN = 1e-3
@@ -42,7 +47,7 @@ ACTION_ERR_FAIL = 1e-3
 STATE_MODE_YAW = "yaw"
 CHECK_PASSED_KEY = "check_data_passed"
 CHECKER_VERSION_KEY = "check_data_checker_version"
-CHECKER_VERSION = 1
+CHECKER_VERSION = 2
 
 
 @dataclass
@@ -174,6 +179,64 @@ def image_stream_metrics(arr: np.ndarray, *, saved_fps: float, raw_capture_fps: 
         "same_pairs": int(np.sum(same)),
         "longest_duplicate_run": longest_run,
     }
+
+
+def _image_mean_abs_diff(a: np.ndarray, b: np.ndarray) -> float:
+    lhs = np.asarray(a, dtype=np.int16)
+    rhs = np.asarray(b, dtype=np.int16)
+    return float(np.mean(np.abs(lhs - rhs)))
+
+
+def find_global_near_duplicate_frames(
+    states: np.ndarray,
+    main_images: np.ndarray,
+    wrist_images: np.ndarray,
+    *,
+    pos_tol_m: float = GLOBAL_NEAR_DUPLICATE_POS_TOL_M,
+    ori_tol: float = GLOBAL_NEAR_DUPLICATE_ORI_TOL,
+    grip_tol: float = GLOBAL_NEAR_DUPLICATE_GRIP_TOL,
+    image_mad: float = GLOBAL_NEAR_DUPLICATE_IMAGE_MAD,
+    max_reports: int = GLOBAL_NEAR_DUPLICATE_MAX_REPORTS,
+) -> list[dict[str, Any]]:
+    """Find non-adjacent frames that are nearly identical in state and images."""
+    states_arr = np.asarray(states, dtype=np.float64)
+    if states_arr.ndim != 2 or states_arr.shape[0] < 3 or states_arr.shape[1] < 7:
+        return []
+    if main_images.shape[:1] != (states_arr.shape[0],) or wrist_images.shape[:1] != (states_arr.shape[0],):
+        return []
+
+    reports: list[dict[str, Any]] = []
+    n_frames = int(states_arr.shape[0])
+    for i in range(n_frames - 2):
+        rest = states_arr[i + 2 :]
+        pos_delta = np.linalg.norm(rest[:, :3] - states_arr[i, :3], axis=1)
+        ori_delta = np.linalg.norm(rest[:, 3:6] - states_arr[i, 3:6], axis=1)
+        grip_delta = np.abs(rest[:, 6] - states_arr[i, 6])
+        candidate_offsets = np.flatnonzero(
+            (pos_delta <= float(pos_tol_m))
+            & (ori_delta <= float(ori_tol))
+            & (grip_delta <= float(grip_tol))
+        )
+        for offset in candidate_offsets:
+            j = int(i + 2 + offset)
+            main_mad = _image_mean_abs_diff(main_images[i], main_images[j])
+            wrist_mad = _image_mean_abs_diff(wrist_images[i], wrist_images[j])
+            if main_mad > float(image_mad) or wrist_mad > float(image_mad):
+                continue
+            reports.append(
+                {
+                    "frame_i": int(i),
+                    "frame_j": int(j),
+                    "state_pos_delta": float(pos_delta[int(offset)]),
+                    "state_ori_delta": float(ori_delta[int(offset)]),
+                    "state_grip_delta": float(grip_delta[int(offset)]),
+                    "main_image_mad": main_mad,
+                    "wrist_image_mad": wrist_mad,
+                }
+            )
+            if len(reports) >= int(max_reports):
+                return reports
+    return reports
 
 
 def inspect_episode(ep_dir: Path, *, raw_capture_fps: float, force_recheck: bool = False) -> EpisodeReport:
@@ -334,6 +397,20 @@ def inspect_episode(ep_dir: Path, *, raw_capture_fps: float, force_recheck: bool
         elif m["longest_duplicate_run"] > DUPLICATE_RUN_WARN:
             warnings.append(f"{key} longest exact duplicate run is elevated: {m['longest_duplicate_run']}")
 
+    global_duplicate_examples = find_global_near_duplicate_frames(states, main_images, wrist_images)
+    metrics["global_near_duplicate_examples"] = global_duplicate_examples
+    metrics["global_near_duplicate_count"] = len(global_duplicate_examples)
+    if global_duplicate_examples:
+        first = global_duplicate_examples[0]
+        errors.append(
+            "non-adjacent near-duplicate frames found: "
+            f"{first['frame_i']} and {first['frame_j']} "
+            f"(pos_delta={first['state_pos_delta']:.6g}, "
+            f"ori_delta={first['state_ori_delta']:.6g}, "
+            f"main_mad={first['main_image_mad']:.3f}, "
+            f"wrist_mad={first['wrist_image_mad']:.3f})"
+        )
+
     status = "ok"
     if errors:
         status = "fail"
@@ -442,6 +519,8 @@ def print_reports(reports: list[EpisodeReport]) -> tuple[int, int, int]:
                     f"ratio={metric['unique_ratio']:.3f} zero={metric['zero_frames']} "
                     f"dup_run={metric['longest_duplicate_run']}"
                 )
+        if report.metrics.get("global_near_duplicate_count"):
+            print(f"  global_near_duplicates={report.metrics['global_near_duplicate_count']}")
     return ok, warn, fail
 
 

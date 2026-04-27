@@ -111,6 +111,10 @@ from task.keyboard_teleop import (
     KeyboardTeleopConfig,
     run_session as kt_run_session,
 )
+from task.teach_pendant import (
+    TeachPendantConfig,
+    run_session as tp_run_session,
+)
 from task.pick_and_place import (
     OBJECT_ORDER,
     PlannerConfig,
@@ -1554,7 +1558,7 @@ def main() -> int:
         return 0
 
     selected_task = str(tui_cfg.task)
-    if selected_task in {"open_and_close", "keyboard_teleop", "storage"}:
+    if selected_task in {"open_and_close", "keyboard_teleop", "storage", "teach_pendant"}:
         tui_cfg.mode = "manual"
         tui_cfg.auto_episodes = 1
     auto_episodes = 0 if tui_cfg.mode == "manual" else int(tui_cfg.auto_episodes)
@@ -1571,7 +1575,7 @@ def main() -> int:
     print(f"  Pose Frame: {get_alignment_mode()}")
     print(f"  Speed:      {LINEAR_SPEED} m/s")
     print(f"  Dry-run:    {args.dry_run}")
-    if selected_task not in {"pick_and_place", "open_and_close", "keyboard_teleop", "storage"}:
+    if selected_task not in {"pick_and_place", "open_and_close", "keyboard_teleop", "storage", "teach_pendant"}:
         print(f"Unsupported task '{selected_task}'.")
         return 1
 
@@ -1616,6 +1620,9 @@ def main() -> int:
     elif selected_task == "keyboard_teleop":
         print("Prompt mode:  manual text prompt")
         print("Task mix:     operator-controlled keyboard teleop")
+    elif selected_task == "teach_pendant":
+        print("Prompt mode:  manual text prompt")
+        print("Task mix:     operator moves with teach pendant; recorder keeps changed 30Hz frames")
     else:
         print("Prompt mode:  fixed pair ('open the storage box' / 'close the storage box')")
         print("Task mix:     each cycle runs open, then close and saves two episodes")
@@ -1795,7 +1802,7 @@ def main() -> int:
             clear_storage_state(save_dir)
             storage_session = StorageSession(scene_state={})
             print("  Storage state cleared. Starting fresh.")
-    else:
+    elif selected_task == "open_and_close":
         open_close_session, should_clear_open_close_state = oc_restore_session(saved, resume_mode=resume_mode)
         if should_clear_open_close_state:
             clear_open_close_state(save_dir)
@@ -1820,6 +1827,28 @@ def main() -> int:
                 workspace_x_max=WORKSPACE_X_MAX,
                 workspace_y_min=WORKSPACE_Y_MIN,
                 workspace_y_max=WORKSPACE_Y_MAX,
+            ),
+            save_dir=save_dir,
+            save_episode_fn=save_episode,
+        )
+        cleanup_collection()
+        print("Done.")
+        return 0
+
+    if selected_task == "teach_pendant":
+        prompt_text = args.prompt.strip()
+        if not prompt_text:
+            prompt_text = input("Prompt: ").strip()
+        if not prompt_text:
+            print("Empty prompt. Exiting.")
+            cleanup_collection()
+            return 0
+        print(f"\nTeach pendant prompt: {prompt_text}")
+        tp_run_session(
+            runtime,
+            config=TeachPendantConfig(
+                prompt=prompt_text,
+                save_fps=save_fps,
             ),
             save_dir=save_dir,
             save_episode_fn=save_episode,

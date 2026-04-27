@@ -66,7 +66,7 @@ OPENPI_TASK_OBSERVER_PYTHON=/home/niic/venvs/vllm-jp62-clean/bin/python
 OPENPI_TASK_OBSERVER_MODEL=/home/niic/modelscope_models/google/gemma-4-E2B-it
 OPENPI_TASK_OBSERVER_MAX_NEW_TOKENS=96
 # OPENPI_TASK_OBSERVER_SPEC=
-# OPENPI_TASK_OBSERVER_SPEC_FILE=prompts/task_observer/pick_up_blue_cube.txt
+# OPENPI_TASK_OBSERVER_SPEC_FILE=task/prompt.txt
 
 # Remote keyboard relay
 OPENPI_REMOTE_KEYBOARD_TCP_PORT=28731

@@ -37,6 +37,7 @@ if str(_REPO_IMPORT_ROOT) not in sys.path:
 
 from utils.env_utils import load_default_env
 from utils.path_utils import get_openpi_root, get_repo_root
+from utils.run_lock import RuntimeLockError, acquire_camera_runtime_lock
 
 load_default_env()
 
@@ -1556,6 +1557,12 @@ def main() -> int:
     if args.speed <= 0:
         raise ValueError(f"--speed must be positive, got {args.speed}")
     LINEAR_SPEED = args.speed
+    try:
+        runtime_lock = acquire_camera_runtime_lock("data/collect_data.py")
+    except RuntimeLockError as exc:
+        print(f"\n{exc}")
+        return 1
+    atexit.register(runtime_lock.release)
 
     saved_state_preview = load_collect_state(save_dir)
     tui_cfg = run_collect_tui_config(

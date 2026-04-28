@@ -18,6 +18,7 @@ Inference loop:
 
 from __future__ import annotations
 
+import atexit
 from dataclasses import dataclass
 import json
 import os
@@ -31,6 +32,7 @@ from typing import Any
 import numpy as np
 from utils.env_utils import load_default_env
 from utils.path_utils import get_openpi_root, get_repo_root
+from utils.run_lock import RuntimeLockError, acquire_camera_runtime_lock
 
 load_default_env()
 
@@ -1216,6 +1218,13 @@ def main() -> int:
 
     initial_qpos_rad = REAL_INIT_QPOS_RAD.copy()
     initial_qpos_deg = np.degrees(initial_qpos_rad)
+
+    try:
+        runtime_lock = acquire_camera_runtime_lock("main.py")
+    except RuntimeLockError as exc:
+        print(f"\n{exc}")
+        return 1
+    atexit.register(runtime_lock.release)
 
     print("Compiling C++ helpers...")
     build_joint_helper()

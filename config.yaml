@@ -36,7 +36,7 @@ env:
   # OPENPI_DELTA_DIM: 7
 
   # PyTorch local backend
-  OPENPI_PYTORCH_CHECKPOINT_DIR: /home/niic/openpi/repo/checkpoints/pi05_aubo_agv_lora_pytorch_attnvecfix/my_eighth_run/29999
+  OPENPI_PYTORCH_CHECKPOINT_DIR: /home/niic/openpi/repo/checkpoints/pi05_aubo_agv_lora_pytorch_attnvecfix_float32/my_eighth_run/29999
   OPENPI_PYTORCH_DEVICE: cuda
   OPENPI_PYTORCH_TOKENIZER_MODEL: /home/niic/.cache/openpi/big_vision/paligemma_tokenizer.model
   OPENPI_PYTORCH_COMPILE_MODE: none

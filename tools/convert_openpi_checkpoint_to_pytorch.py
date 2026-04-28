@@ -239,7 +239,7 @@ def convert_checkpoint(
     checkpoint_dir: Path,
     config_name: str,
     output_path: Path,
-    precision: str = "bfloat16",
+    precision: str = "float32",
 ) -> None:
     import examples.convert_jax_model_to_pytorch as upstream
     import openpi.models.gemma
@@ -341,7 +341,7 @@ def main(
     checkpoint_dir: Path,
     config_name: str,
     output_path: Path,
-    precision: str = "bfloat16",
+    precision: str = "float32",
 ) -> None:
     repo_root = repo_root.expanduser().resolve()
     checkpoint_dir = checkpoint_dir.expanduser().resolve()
@@ -365,7 +365,7 @@ if __name__ == "__main__":
         parser.add_argument("--checkpoint_dir", type=Path, required=True)
         parser.add_argument("--config_name", type=str, required=True)
         parser.add_argument("--output_path", type=Path, required=True)
-        parser.add_argument("--precision", type=str, default="bfloat16")
+        parser.add_argument("--precision", type=str, default="float32")
         args = parser.parse_args()
         main(
             repo_root=args.repo_root,

@@ -1293,7 +1293,7 @@ def main() -> int:
     else:
         print(f"  Exec Speed: native (no retime)")
     print(f"  Record:     {cfg.record}")
-    print(f"  TRT Denoise:{'enabled' if cfg.trt_denoise else 'disabled'}")
+    print(f"  TRT:        {'enabled' if cfg.trt_denoise else 'disabled'}")
     print(f"  Observer:   {'enabled' if cfg.task_observer_enabled else 'disabled'}")
     if cfg.task_observer_enabled:
         print(f"  Observer Interval: {cfg.task_observer_interval_s} s")
@@ -1303,9 +1303,12 @@ def main() -> int:
         print(f"  Debug Dry Run: {cfg.dry_run}")
 
     # --- Load policy ---
-    trt_denoise_enabled = cfg.policy_location == "local" and cfg.trt_denoise
+    trt_enabled = cfg.policy_location == "local" and cfg.trt_denoise
+    trt_denoise_enabled = trt_enabled
+    trt_vision_enabled = trt_enabled
     os.environ["OPENPI_PYTORCH_TRT_DENOISE"] = "1" if trt_denoise_enabled else "0"
-    if trt_denoise_enabled:
+    os.environ["OPENPI_PYTORCH_TRT_VISION"] = "1" if trt_vision_enabled else "0"
+    if trt_enabled:
         os.environ["OPENPI_POLICY_BACKEND"] = "pytorch"
         pytorch_checkpoint_dir = _resolve_effective_pytorch_checkpoint_dir()
         os.environ["OPENPI_PYTORCH_CHECKPOINT_DIR"] = str(pytorch_checkpoint_dir)
@@ -1315,10 +1318,10 @@ def main() -> int:
         )
         missing = [path.name for path in required_files if not path.exists()]
         if missing:
-            print("\nPyTorch TRT denoise requires a converted PyTorch checkpoint.")
+            print("\nPyTorch TRT requires a converted PyTorch checkpoint.")
             print(f"OPENPI_PYTORCH_CHECKPOINT_DIR={pytorch_checkpoint_dir}")
             print(f"Missing: {', '.join(missing)}")
-            print("Disable `TRT Denoise` in TUI or point OPENPI_PYTORCH_CHECKPOINT_DIR at a converted export.")
+            print("Disable `TRT` in TUI or point OPENPI_PYTORCH_CHECKPOINT_DIR at a converted export.")
             return 1
 
     effective_remote = cfg.policy_location == "remote"
@@ -1442,13 +1445,29 @@ def main() -> int:
     infer_log_dir.mkdir(parents=True, exist_ok=True)
     infer_log_path = infer_log_dir / "main_inference.log"
 
+    def _json_safe(value: object) -> object:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {str(key): _json_safe(val) for key, val in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_json_safe(item) for item in value]
+        try:
+            if isinstance(value, np.ndarray):
+                return value.tolist()
+        except Exception:
+            pass
+        return str(value)
+
     def _append_infer_log(event: dict[str, object]) -> None:
         payload = {
             "ts_ms": int(time.time() * 1000),
             **event,
         }
         with open(infer_log_path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            fh.write(json.dumps(_json_safe(payload), ensure_ascii=False) + "\n")
 
     # --- Prompt input loop ---
     print("\n=== Ready. Enter a prompt to start inference. ===")
@@ -1559,6 +1578,20 @@ def main() -> int:
                     "pose_frame": str(get_alignment_mode()),
                     "speed_mode": str(cfg.speed_mode),
                     "exec_speed_mps": None if cfg.speed_mode == "native" else float(cfg.exec_speed_mps),
+                    "policy_class": type(policy).__name__,
+                    "policy_backend": infer_backend_label,
+                    "policy_load_s": float(policy_load_s),
+                    "policy_remote": bool(policy_spec.remote),
+                    "policy_spec_backend": str(policy_spec.backend),
+                    "checkpoint_dir": str(policy_spec.checkpoint_dir),
+                    "pytorch_checkpoint_dir": str(policy_spec.pytorch_checkpoint_dir),
+                    "pytorch_device": str(policy_spec.pytorch_device),
+                    "trt_denoise_requested": bool(cfg.trt_denoise),
+                    "trt_denoise_effective": bool(trt_denoise_enabled),
+                    "trt_vision_requested": bool(cfg.trt_denoise),
+                    "trt_vision_effective": bool(trt_vision_enabled),
+                    "sample_num_steps_env": os.environ.get("OPENPI_SAMPLE_NUM_STEPS", ""),
+                    "policy_metadata": dict(policy.metadata),
                 }
             )
 
@@ -1997,6 +2030,31 @@ def main() -> int:
 
                 gripper_changed = scheduled_gripper_state is not None
                 if remaining_steps <= 0:
+                    if gripper_changed:
+                        state_name = "open" if scheduled_gripper_state == 1 else "close"
+                        print(
+                            f"  [{step:4d}] Gripper {state_name} edge reached in expired prefix "
+                            f"(retimed={len(plan.steps)} stale={wall_clock_stale_steps} "
+                            f"dropped={dropped_stale_steps}); applying gripper now..."
+                        )
+                        _append_infer_log(
+                            {
+                                "event": "gripper_edge_expired",
+                                "step": int(step),
+                                "prompt": prompt,
+                                "observation_tick": int(observation_tick),
+                                "submit_observation_tick": int(submit_observation_tick),
+                                "retimed_step_count": int(len(plan.steps)),
+                                "stale_steps_before_submit": int(wall_clock_stale_steps),
+                                "dropped_stale_steps_before_submit": int(dropped_stale_steps),
+                                "scheduled_gripper_idx": int(scheduled_gripper_idx),
+                                "scheduled_gripper_state": int(scheduled_gripper_state),
+                            }
+                        )
+                        executor.clear_pending()
+                        executor.stop_streaming_and_reset()
+                        _apply_gripper_command(step, int(scheduled_gripper_state))
+                        continue
                     print(
                         f"  [{step:4d}] Chunk expired before execution "
                         f"(retimed={len(plan.steps)} stale={wall_clock_stale_steps} "

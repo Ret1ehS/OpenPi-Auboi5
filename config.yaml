@@ -55,7 +55,7 @@ env:
   # OPENPI_IMAGE_SIZE: 224
 
   # Remote policy forwarding
-  OPENPI_K8S_NAMESPACE: wangrui
+  OPENPI_K8S_NAMESPACE: <username>
   OPENPI_POLICY_LOCAL_PORT: 8000
   OPENPI_POLICY_REMOTE_PORT: 8000
   OPENPI_KUBECONFIG: support/kubeconfig.yaml

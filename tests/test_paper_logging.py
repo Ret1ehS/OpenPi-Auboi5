@@ -9,6 +9,15 @@ import main
 
 
 class PaperLoggingPayloadTest(unittest.TestCase):
+    def test_trial_id_increments_trailing_number_with_padding(self):
+        self.assertEqual(main.next_paper_trial_id("trial_001", 0), "trial_001")
+        self.assertEqual(main.next_paper_trial_id("trial_001", 1), "trial_002")
+        self.assertEqual(main.next_paper_trial_id("baseline-099", 2), "baseline-101")
+
+    def test_trial_id_appends_counter_when_no_trailing_number(self):
+        self.assertEqual(main.next_paper_trial_id("baseline", 0), "baseline_0001")
+        self.assertEqual(main.next_paper_trial_id("baseline", 1), "baseline_0002")
+
     def test_action_chunk_payload_contains_reconstructable_actions_and_context(self):
         raw_actions = np.arange(21, dtype=np.float32).reshape(3, 7)
         exec_actions = raw_actions[:2]

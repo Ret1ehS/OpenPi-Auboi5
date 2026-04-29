@@ -23,6 +23,7 @@ from dataclasses import dataclass
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -101,6 +102,19 @@ def _paper_noise_shape(noise: object) -> list[int] | None:
 
 def _paper_replan_idx(step: int) -> int:
     return max(0, int(step) - 1)
+
+
+def next_paper_trial_id(base_trial_id: str, completed_count: int) -> str:
+    base = str(base_trial_id).strip()
+    completed = max(0, int(completed_count))
+    if not base:
+        return ""
+    match = re.search(r"(\d+)$", base)
+    if match:
+        start = int(match.group(1))
+        width = len(match.group(1))
+        return f"{base[:match.start(1)]}{start + completed:0{width}d}"
+    return f"{base}_{completed + 1:04d}"
 
 
 def build_paper_action_chunk_log(
@@ -1666,6 +1680,7 @@ def main() -> int:
             f"noise_id={paper_noise_id or 'internal'}"
         )
     paper_session_counter = 0
+    paper_completed_trials = 0
 
     # --- Prompt input loop ---
     print("\n=== Ready. Enter a prompt to start inference. ===")
@@ -1764,7 +1779,9 @@ def main() -> int:
         step = 0
         paper_session_counter += 1
         paper_session_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}_{paper_session_counter:04d}"
-        paper_trial_id = paper_trial_id_env or paper_session_id
+        paper_trial_id = next_paper_trial_id(paper_trial_id_env, paper_completed_trials) if paper_trial_id_env else paper_session_id
+        if paper_log_enabled:
+            print(f"  Paper trial id: {paper_trial_id}")
         paper_outcome_logged = False
         last_gripper_state: int | None = None
         _rec_stop = threading.Event()
@@ -2069,6 +2086,10 @@ def main() -> int:
                     )
                     _append_paper_outcome(True, "task_observer", str(observer_result.reason))
                     _stop_recording_video()
+                    if paper_log_enabled:
+                        paper_completed_trials += 1
+                        if paper_trial_id_env:
+                            print(f"  Next paper trial id: {next_paper_trial_id(paper_trial_id_env, paper_completed_trials)}")
                     print(f"\n  Inference stopped after {step} steps.")
                     break
 
@@ -2434,6 +2455,10 @@ def main() -> int:
             else:
                 _append_paper_outcome(None, "keyboard_interrupt", "manual outcome disabled")
             _stop_recording_video()
+            if paper_log_enabled:
+                paper_completed_trials += 1
+                if paper_trial_id_env:
+                    print(f"  Next paper trial id: {next_paper_trial_id(paper_trial_id_env, paper_completed_trials)}")
             print(f"\n  Inference stopped after {step} steps.")
         except Exception as exc:
             task_observer.end_session()
@@ -2457,6 +2482,10 @@ def main() -> int:
             )
             _append_paper_outcome(False, "exception", str(exc))
             _stop_recording_video()
+            if paper_log_enabled:
+                paper_completed_trials += 1
+                if paper_trial_id_env:
+                    print(f"  Next paper trial id: {next_paper_trial_id(paper_trial_id_env, paper_completed_trials)}")
             print(f"\n  Inference stopped after {step} steps.")
 
     task_observer.stop()

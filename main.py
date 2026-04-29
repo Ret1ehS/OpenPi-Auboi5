@@ -66,6 +66,7 @@ EXECUTOR_STALL_WARN_S = 0.5
 EXECUTOR_STALL_RESET_S = 1.0
 EXECUTOR_STOP_WAIT_S = 2.0
 EXECUTOR_STOP_SETTLE_S = 0.25
+PAPER_ACTION_LOG_SCHEMA = "paper_action_log_v1"
 
 
 @dataclass
@@ -84,6 +85,175 @@ class ChunkSubmission:
     planned_step_count: int
     generation: int
     submit_ts: float
+
+
+def _paper_array_to_list(value: object) -> list | None:
+    if value is None:
+        return None
+    return np.asarray(value).tolist()
+
+
+def _paper_noise_shape(noise: object) -> list[int] | None:
+    if noise is None:
+        return None
+    return [int(dim) for dim in np.asarray(noise).shape]
+
+
+def _paper_replan_idx(step: int) -> int:
+    return max(0, int(step) - 1)
+
+
+def build_paper_action_chunk_log(
+    *,
+    session_id: str,
+    trial_id: str,
+    condition: str,
+    step: int,
+    prompt: str,
+    chunk_k: int,
+    raw_actions: object,
+    exec_actions: object,
+    tcp_deltas: object,
+    start_pose_sim: object,
+    observation_state: object,
+    observation_tick: int,
+    submit_observation_tick: int,
+    noise_seed: int | None = None,
+    noise_id: str | None = None,
+    noise: object | None = None,
+    context_id: str | None = None,
+) -> dict[str, object]:
+    return {
+        "event": "action_chunk",
+        "schema": PAPER_ACTION_LOG_SCHEMA,
+        "session_id": str(session_id),
+        "trial_id": str(trial_id),
+        "condition": str(condition),
+        "context_id": None if context_id is None else str(context_id),
+        "step": int(step),
+        "replan_idx": _paper_replan_idx(step),
+        "prompt": str(prompt),
+        "chunk_k": int(chunk_k),
+        "raw_actions": _paper_array_to_list(raw_actions),
+        "exec_actions": _paper_array_to_list(exec_actions),
+        "tcp_deltas": _paper_array_to_list(tcp_deltas),
+        "start_pose_sim": _paper_array_to_list(start_pose_sim),
+        "observation_state": _paper_array_to_list(observation_state),
+        "observation_tick": int(observation_tick),
+        "submit_observation_tick": int(submit_observation_tick),
+        "noise_seed": None if noise_seed is None else int(noise_seed),
+        "noise_id": None if noise_id is None else str(noise_id),
+        "noise_shape": _paper_noise_shape(noise),
+        "noise": _paper_array_to_list(noise),
+    }
+
+
+def build_paper_submitted_plan_log(
+    *,
+    session_id: str,
+    trial_id: str,
+    condition: str,
+    step: int,
+    prompt: str,
+    observation_tick: int,
+    submit_observation_tick: int,
+    steps: object,
+    context_id: str | None = None,
+) -> dict[str, object]:
+    submitted_plan = []
+    for plan_step in steps:
+        submitted_plan.append(
+            {
+                "pose_sim": _paper_array_to_list(getattr(plan_step, "pose_sim")),
+                "pose_real": _paper_array_to_list(getattr(plan_step, "pose_real")),
+                "source_action_index": int(getattr(plan_step, "source_action_index")),
+            }
+        )
+    return {
+        "event": "submitted_plan",
+        "schema": PAPER_ACTION_LOG_SCHEMA,
+        "session_id": str(session_id),
+        "trial_id": str(trial_id),
+        "condition": str(condition),
+        "context_id": None if context_id is None else str(context_id),
+        "step": int(step),
+        "replan_idx": _paper_replan_idx(step),
+        "prompt": str(prompt),
+        "observation_tick": int(observation_tick),
+        "submit_observation_tick": int(submit_observation_tick),
+        "submitted_plan": submitted_plan,
+    }
+
+
+def build_paper_session_outcome_log(
+    *,
+    session_id: str,
+    trial_id: str,
+    condition: str,
+    prompt: str,
+    steps: int,
+    success: bool | None,
+    outcome_source: str,
+    failure_reason: str = "",
+    context_id: str | None = None,
+) -> dict[str, object]:
+    return {
+        "event": "session_outcome",
+        "schema": PAPER_ACTION_LOG_SCHEMA,
+        "session_id": str(session_id),
+        "trial_id": str(trial_id),
+        "condition": str(condition),
+        "context_id": None if context_id is None else str(context_id),
+        "prompt": str(prompt),
+        "steps": int(steps),
+        "success": None if success is None else bool(success),
+        "outcome_source": str(outcome_source),
+        "failure_reason": str(failure_reason),
+    }
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    if not value:
+        return bool(default)
+    return value in {"1", "true", "yes", "on"}
+
+
+def _env_optional_int(name: str) -> int | None:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return None
+    return int(value)
+
+
+def _load_paper_noise_from_env() -> tuple[np.ndarray | None, str | None]:
+    path_raw = os.environ.get("OPENPI_PAPER_NOISE_NPY", "").strip()
+    if not path_raw:
+        return None, None
+    path = Path(path_raw).expanduser().resolve()
+    noise = np.load(path).astype(np.float32)
+    return noise, path.stem
+
+
+def _prompt_manual_paper_outcome() -> tuple[bool | None, str]:
+    while True:
+        try:
+            answer = input("  Paper outcome success? [y/n/skip]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None, "manual outcome prompt interrupted"
+        if answer in {"y", "yes", "1", "true"}:
+            return True, ""
+        if answer in {"n", "no", "0", "false"}:
+            try:
+                reason = input("  Failure reason (optional): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                reason = "manual failure reason prompt interrupted"
+            return False, reason
+        if answer in {"", "s", "skip"}:
+            return None, "manual outcome skipped"
+        print("  Please enter y, n, or skip.")
 
 
 def _prepend_env_path(name: str, paths: tuple[str, ...]) -> None:
@@ -1478,6 +1648,25 @@ def main() -> int:
         with open(infer_log_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(_json_safe(payload), ensure_ascii=False) + "\n")
 
+    paper_log_enabled = _env_bool("OPENPI_PAPER_LOG_ENABLE", True)
+    paper_chunk_k = int(os.environ.get("OPENPI_PAPER_CHUNK_K", "5").strip() or "5")
+    paper_condition = os.environ.get("OPENPI_PAPER_CONDITION", "baseline").strip() or "baseline"
+    paper_context_id = os.environ.get("OPENPI_PAPER_CONTEXT_ID", "").strip() or None
+    paper_trial_id_env = os.environ.get("OPENPI_PAPER_TRIAL_ID", "").strip()
+    paper_noise_seed = _env_optional_int("OPENPI_PAPER_NOISE_SEED")
+    paper_noise, paper_noise_id_from_path = _load_paper_noise_from_env()
+    paper_noise_id = os.environ.get("OPENPI_PAPER_NOISE_ID", "").strip() or paper_noise_id_from_path
+    paper_manual_outcome = _env_bool("OPENPI_PAPER_MANUAL_OUTCOME", True)
+    if paper_noise is not None and policy_spec.remote:
+        raise RuntimeError("OPENPI_PAPER_NOISE_NPY requires a local policy backend; remote policy does not accept explicit noise")
+    if paper_log_enabled:
+        print(
+            "Paper data logging enabled: "
+            f"condition={paper_condition} chunk_k={paper_chunk_k} "
+            f"noise_id={paper_noise_id or 'internal'}"
+        )
+    paper_session_counter = 0
+
     # --- Prompt input loop ---
     print("\n=== Ready. Enter a prompt to start inference. ===")
     print("  Type a prompt and press Enter to begin.")
@@ -1573,16 +1762,53 @@ def main() -> int:
         print(f"  Execute={execute}  PoseFrame={get_alignment_mode()}")
         print("  Press Ctrl+C to stop.\n")
         step = 0
+        paper_session_counter += 1
+        paper_session_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}_{paper_session_counter:04d}"
+        paper_trial_id = paper_trial_id_env or paper_session_id
+        paper_outcome_logged = False
         last_gripper_state: int | None = None
         _rec_stop = threading.Event()
         _rec_thread = None
         video_path = None
+
+        def _append_paper_outcome(
+            success: bool | None,
+            outcome_source: str,
+            failure_reason: str = "",
+        ) -> None:
+            nonlocal paper_outcome_logged
+            if not paper_log_enabled or paper_outcome_logged:
+                return
+            _append_infer_log(
+                build_paper_session_outcome_log(
+                    session_id=paper_session_id,
+                    trial_id=paper_trial_id,
+                    condition=paper_condition,
+                    context_id=paper_context_id,
+                    prompt=prompt,
+                    steps=int(step),
+                    success=success,
+                    outcome_source=outcome_source,
+                    failure_reason=failure_reason,
+                )
+            )
+            paper_outcome_logged = True
 
         try:
             _append_infer_log(
                 {
                     "event": "session_start",
                     "prompt": prompt,
+                    "paper_log_enabled": bool(paper_log_enabled),
+                    "paper_schema": PAPER_ACTION_LOG_SCHEMA,
+                    "paper_session_id": paper_session_id,
+                    "paper_trial_id": paper_trial_id,
+                    "paper_condition": paper_condition,
+                    "paper_context_id": paper_context_id,
+                    "paper_chunk_k": int(paper_chunk_k),
+                    "paper_noise_id": paper_noise_id,
+                    "paper_noise_seed": paper_noise_seed,
+                    "paper_noise_shape": _paper_noise_shape(paper_noise),
                     "execute": bool(execute),
                     "pose_frame": str(get_alignment_mode()),
                     "speed_mode": str(cfg.speed_mode),
@@ -1662,6 +1888,7 @@ def main() -> int:
                     "exception": str(exc),
                 }
             )
+            _append_paper_outcome(False, "setup_exception", str(exc))
             continue
 
         def _stop_recording_video() -> None:
@@ -1730,6 +1957,7 @@ def main() -> int:
                     "exception": str(exc),
                 }
             )
+            _append_paper_outcome(False, "recording_setup_exception", str(exc))
             _stop_recording_video()
             continue
 
@@ -1839,6 +2067,7 @@ def main() -> int:
                             "observer_reason": str(observer_result.reason),
                         }
                     )
+                    _append_paper_outcome(True, "task_observer", str(observer_result.reason))
                     _stop_recording_video()
                     print(f"\n  Inference stopped after {step} steps.")
                     break
@@ -1922,7 +2151,10 @@ def main() -> int:
                 observation_tick = int(obs_queue_state["current_tick"])
 
                 t_infer = time.monotonic()
-                action_result = policy.infer(obs)
+                if paper_noise is None:
+                    action_result = policy.infer(obs)
+                else:
+                    action_result = policy.infer(obs, noise=paper_noise)
                 infer_time = time.monotonic() - t_infer
                 policy_timing = action_result.get("policy_timing", {}) if isinstance(action_result, dict) else {}
                 policy_infer_ms = policy_timing.get("infer_ms") if isinstance(policy_timing, dict) else None
@@ -1999,6 +2231,28 @@ def main() -> int:
                     else:
                         dropped_stale_steps = int(wall_clock_stale_steps)
                 remaining_steps = max(0, len(rebased_plan.steps))
+                if paper_log_enabled:
+                    _append_infer_log(
+                        build_paper_action_chunk_log(
+                            session_id=paper_session_id,
+                            trial_id=paper_trial_id,
+                            condition=paper_condition,
+                            context_id=paper_context_id,
+                            step=step,
+                            prompt=prompt,
+                            chunk_k=paper_chunk_k,
+                            raw_actions=raw_actions,
+                            exec_actions=exec_actions,
+                            tcp_deltas=tcp_deltas,
+                            start_pose_sim=aligned_obs.aligned_tcp_pose_sim,
+                            observation_state=obs["observation/state"],
+                            observation_tick=observation_tick,
+                            submit_observation_tick=submit_observation_tick,
+                            noise_seed=paper_noise_seed,
+                            noise_id=paper_noise_id,
+                            noise=paper_noise,
+                        )
+                    )
                 _append_infer_log(
                     {
                         "event": "inference_chunk",
@@ -2099,6 +2353,20 @@ def main() -> int:
                         "queue_max_future_tick_after_submit": int(post_submit_queue_state["max_future_tick"]),
                     }
                 )
+                if paper_log_enabled:
+                    _append_infer_log(
+                        build_paper_submitted_plan_log(
+                            session_id=paper_session_id,
+                            trial_id=paper_trial_id,
+                            condition=paper_condition,
+                            context_id=paper_context_id,
+                            step=step,
+                            prompt=prompt,
+                            observation_tick=observation_tick,
+                            submit_observation_tick=submit_observation_tick,
+                            steps=rebased_plan.steps,
+                        )
+                    )
 
                 if gripper_changed:
                     state_name = "open" if scheduled_gripper_state == 1 else "close"
@@ -2160,6 +2428,11 @@ def main() -> int:
                     "reason": "keyboard_interrupt",
                 }
             )
+            if paper_log_enabled and paper_manual_outcome:
+                manual_success, manual_reason = _prompt_manual_paper_outcome()
+                _append_paper_outcome(manual_success, "manual", manual_reason)
+            else:
+                _append_paper_outcome(None, "keyboard_interrupt", "manual outcome disabled")
             _stop_recording_video()
             print(f"\n  Inference stopped after {step} steps.")
         except Exception as exc:
@@ -2182,6 +2455,7 @@ def main() -> int:
                     "exception": str(exc),
                 }
             )
+            _append_paper_outcome(False, "exception", str(exc))
             _stop_recording_video()
             print(f"\n  Inference stopped after {step} steps.")
 
